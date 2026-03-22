@@ -105,3 +105,37 @@ class UserSettings:
 
     def set_theme(self, name: str) -> None:
         self._s.setValue("theme", name)
+
+    # ---- Naming template ----
+
+    def naming_template(self) -> str:
+        return str(self._s.value("naming_template", "{name}_{profile}") or "{name}_{profile}")
+
+    def set_naming_template(self, template: str) -> None:
+        self._s.setValue("naming_template", template)
+
+    # ---- Notification preference ----
+
+    def notify_on_complete(self) -> bool:
+        val = self._s.value("notify_on_complete", True)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() == "true"
+        return True
+
+    def set_notify_on_complete(self, enabled: bool) -> None:
+        self._s.setValue("notify_on_complete", enabled)
+
+    # ---- Onboarding ----
+
+    def onboarding_shown(self) -> bool:
+        val = self._s.value("onboarding_shown", False)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() == "true"
+        return False
+
+    def set_onboarding_shown(self, shown: bool) -> None:
+        self._s.setValue("onboarding_shown", shown)

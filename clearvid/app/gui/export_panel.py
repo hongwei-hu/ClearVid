@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 from clearvid.app.gui._helpers import coerce_enum, populate_combo, set_combo_by_value
+from clearvid.app.gui.estimation import estimate_export
+from clearvid.app.gui.naming import DEFAULT_TEMPLATE, render_output_name
 from clearvid.app.gui.preset_cards import BUILTIN_PRESETS, Preset, PresetCardsWidget
 from clearvid.app.gui.widgets.collapsible import CollapsibleSection
 from clearvid.app.gui.widgets.hint_label import labeled_row_with_info
@@ -161,12 +163,14 @@ class ExportPanel(QWidget):
     """Right sidebar containing all export parameters in collapsible sections."""
 
     export_requested = Signal()
+    export_all_requested = Signal()  # queue all files in file list
     smart_params_requested = Signal()
     output_dir_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._sections: dict[str, CollapsibleSection] = {}
+        self._last_estimate: object | None = None
 
         # Outer layout: scrollable body + fixed bottom
         outer = QVBoxLayout(self)
@@ -232,6 +236,16 @@ class ExportPanel(QWidget):
         populate_combo(self.target_combo, TARGET_LABELS, TargetProfile, TargetProfile.FHD)
         lay.addLayout(_labeled_row("输出规格", self.target_combo, TOOLTIPS["target_profile"]))
         lay.addWidget(_hint("目标分辨率，480p\u21921080p / 720p\u21924K"))
+
+        # Naming template
+        self.naming_edit = QLineEdit()
+        self.naming_edit.setText(DEFAULT_TEMPLATE)
+        self.naming_edit.setPlaceholderText("{name}_{profile}")
+        lay.addLayout(_labeled_row(
+            "命名规则", self.naming_edit,
+            "支持变量: {name}=原文件名, {profile}=输出规格, {date}=日期, {time}=时间",
+        ))
+        lay.addWidget(_hint("{name}_{profile} → 视频名_fhd.mp4"))
 
         # Output path
         out_row = QHBoxLayout()
@@ -446,10 +460,19 @@ class ExportPanel(QWidget):
         self._sections["performance"] = sec
 
     def _build_bottom(self, outer: QVBoxLayout) -> None:
-        """Build the fixed bottom area: progress bar + export button."""
+        """Build the fixed bottom area: estimation, progress bar, export buttons."""
         bottom = QVBoxLayout()
         bottom.setContentsMargins(8, 8, 8, 8)
         bottom.setSpacing(6)
+
+        # Estimation label
+        self.estimation_label = QLabel("")
+        self.estimation_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.estimation_label.setStyleSheet(
+            "color: #81c784; font-size: 11px; padding: 2px;"
+        )
+        self.estimation_label.setVisible(False)
+        bottom.addWidget(self.estimation_label)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -466,6 +489,13 @@ class ExportPanel(QWidget):
         self.export_btn.setMinimumHeight(40)
         self.export_btn.clicked.connect(self.export_requested.emit)
         bottom.addWidget(self.export_btn)
+
+        # Queue export button
+        self.export_all_btn = QPushButton("📋  全部导出")
+        self.export_all_btn.setMinimumHeight(32)
+        self.export_all_btn.setToolTip("将文件列表中的所有视频排入队列依次处理")
+        self.export_all_btn.clicked.connect(self.export_all_requested.emit)
+        bottom.addWidget(self.export_all_btn)
 
         # Post-export action buttons (hidden until export completes)
         self._post_row = QHBoxLayout()
@@ -621,16 +651,44 @@ class ExportPanel(QWidget):
     def set_export_enabled(self, enabled: bool) -> None:
         self.export_btn.setEnabled(enabled)
 
-    def autofill_output(self, input_path: str) -> None:
-        """Auto-generate output path based on input file and target profile."""
+    def autofill_output(self, input_path: str, output_dir: str = "") -> None:
+        """Auto-generate output path using the naming template."""
         if not input_path:
             return
-        stem = Path(input_path).stem
         profile = coerce_enum(
             TargetProfile, self.target_combo.currentData(), TargetProfile.FHD
         )
-        suffix = profile.value if profile else "output"
-        self.output_edit.setText(str(Path.cwd() / "outputs" / f"{stem}_{suffix}.mp4"))
+        profile_val = profile.value if profile else "output"
+        template = self.naming_edit.text() or DEFAULT_TEMPLATE
+        filename = render_output_name(template, input_path, profile_val)
+        out_dir = output_dir or str(Path.cwd() / "outputs")
+        self.output_edit.setText(str(Path(out_dir) / filename))
+
+    def update_estimation(
+        self,
+        duration_sec: float,
+        total_frames: int,
+        source_size_bytes: int = 0,
+    ) -> None:
+        """Update the estimation label with rough time and size predictions."""
+        quality = coerce_enum(
+            QualityMode, self.quality_combo.currentData(), QualityMode.QUALITY
+        )
+        profile = coerce_enum(
+            TargetProfile, self.target_combo.currentData(), TargetProfile.FHD
+        )
+        crf_val = self.encoder_crf.value() if self.encoder_crf.value() > 0 else 18
+        est = estimate_export(
+            duration_sec=duration_sec,
+            total_frames=total_frames,
+            quality_mode=quality.value if quality else "quality",
+            target_profile=profile.value if profile else "fhd",
+            encoder_crf=crf_val,
+            source_size_bytes=source_size_bytes,
+        )
+        self.estimation_label.setText(f"📊 {est.description}")
+        self.estimation_label.setVisible(True)
+        self._last_estimate = est
 
     def show_post_export(self, output_path: str) -> None:
         """Show 'open folder' and 'play' buttons after successful export."""

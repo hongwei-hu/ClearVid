@@ -95,6 +95,10 @@ class PreviewPanel(QWidget):
             return self._slider.value() / 1000.0 * self._video_duration
         return 0.0
 
+    def current_timestamp(self) -> float:
+        """Alias for get_timestamp — used by auto-preview and shortcuts."""
+        return self.get_timestamp()
+
     # ---- Internal ----
 
     def _on_slider_moved(self, value: int) -> None:
