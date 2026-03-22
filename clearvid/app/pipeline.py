@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from clearvid.app.io.probe import collect_environment_info
 from clearvid.app.models.realesrgan_runner import validate_realesrgan_environment
 from clearvid.app.schemas.models import BackendType, EnhancementConfig, ExecutionPlan, TargetProfile, VideoMetadata
 
@@ -14,14 +15,18 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
         f"Backend: {config.backend.value}",
     ]
 
-    if config.backend == BackendType.BASELINE:
+    resolved_backend = resolve_backend(config.backend)
+    if resolved_backend != config.backend:
+        notes.append(f"Resolved backend: {resolved_backend.value}")
+
+    if resolved_backend == BackendType.BASELINE:
         command = build_baseline_command(config, output_width, output_height)
-        notes.append("Using FFmpeg baseline backend for end-to-end pipeline validation.")
+        notes.append("Using FFmpeg baseline backend.")
         return ExecutionPlan(
             command=command,
             output_width=output_width,
             output_height=output_height,
-            backend=config.backend,
+            backend=resolved_backend,
             notes=notes,
         )
 
@@ -30,6 +35,16 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
         raise RuntimeError(message)
 
     raise RuntimeError("Real-ESRGAN backend wiring is the next implementation step.")
+
+
+def resolve_backend(requested_backend: BackendType) -> BackendType:
+    if requested_backend != BackendType.AUTO:
+        return requested_backend
+
+    environment = collect_environment_info()
+    if environment.realesrgan_available:
+        return BackendType.REALESRGAN
+    return BackendType.BASELINE
 
 
 def build_baseline_command(config: EnhancementConfig, output_width: int, output_height: int) -> list[str]:

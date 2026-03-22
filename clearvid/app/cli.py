@@ -32,6 +32,11 @@ def env() -> None:
     table.add_row("gpu_name", environment.gpu_name or "n/a")
     table.add_row("gpu_driver", environment.gpu_driver_version or "n/a")
     table.add_row("gpu_memory_mb", str(environment.gpu_memory_mb or "n/a"))
+    table.add_row("torch_version", environment.torch_version or "n/a")
+    table.add_row("torch_cuda", str(environment.torch_cuda_available))
+    table.add_row("torch_gpu_compatible", str(environment.torch_gpu_compatible))
+    table.add_row("realesrgan_available", str(environment.realesrgan_available))
+    table.add_row("realesrgan_message", environment.realesrgan_message or "n/a")
     console.print(table)
 
 
@@ -46,7 +51,7 @@ def plan(
     input_path: Path,
     output_path: Path,
     target_profile: TargetProfile = typer.Option(TargetProfile.FHD),
-    backend: BackendType = typer.Option(BackendType.BASELINE),
+    backend: BackendType = typer.Option(BackendType.AUTO),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
 ) -> None:
     metadata = probe_video(input_path)
@@ -67,7 +72,7 @@ def run(
     input_path: Path,
     output_path: Path = typer.Option(..., "--output", help="Output video path"),
     target_profile: TargetProfile = typer.Option(TargetProfile.FHD),
-    backend: BackendType = typer.Option(BackendType.BASELINE),
+    backend: BackendType = typer.Option(BackendType.AUTO),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
     preserve_audio: bool = typer.Option(True),
     preserve_subtitles: bool = typer.Option(True),
@@ -96,7 +101,7 @@ def batch(
     input_dir: Path,
     output_dir: Path = typer.Option(..., "--output-dir", help="Batch output root"),
     target_profile: TargetProfile = typer.Option(TargetProfile.FHD),
-    backend: BackendType = typer.Option(BackendType.BASELINE),
+    backend: BackendType = typer.Option(BackendType.AUTO),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds of each file"),
     dry_run: bool = typer.Option(False),

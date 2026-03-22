@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from clearvid.app.models.realesrgan_runner import inspect_realesrgan_runtime
 from clearvid.app.schemas.models import EnvironmentInfo, StreamInfo, VideoMetadata
 
 
@@ -113,6 +114,11 @@ def collect_environment_info() -> EnvironmentInfo:
                 gpu_name, gpu_driver_version, memory_text = parts[:3]
                 gpu_memory_mb = _to_int(memory_text)
 
+    realtime_weights_path = Path.cwd() / "weights" / "realesrgan"
+    realesrgan_available, realesrgan_message, torch_version, torch_cuda_available, torch_gpu_compatible = (
+        inspect_realesrgan_runtime(realtime_weights_path)
+    )
+
     return EnvironmentInfo(
         ffmpeg_available=ffmpeg_available,
         ffprobe_available=ffprobe_available,
@@ -123,6 +129,12 @@ def collect_environment_info() -> EnvironmentInfo:
         gpu_name=gpu_name,
         gpu_driver_version=gpu_driver_version,
         gpu_memory_mb=gpu_memory_mb,
+        torch_version=torch_version,
+        torch_cuda_available=torch_cuda_available,
+        torch_gpu_compatible=torch_gpu_compatible,
+        preferred_backend=EnvironmentInfo.model_fields["preferred_backend"].annotation.REALESRGAN if realesrgan_available else EnvironmentInfo.model_fields["preferred_backend"].annotation.BASELINE,
+        realesrgan_available=realesrgan_available,
+        realesrgan_message=realesrgan_message,
     )
 
 
