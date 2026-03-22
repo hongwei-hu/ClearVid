@@ -1,4 +1,4 @@
-"""Center panel: video preview with Before/After comparison."""
+"""Center panel: video preview with split-line Before/After comparison."""
 
 from __future__ import annotations
 
@@ -17,9 +17,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from clearvid.app.gui.widgets.split_preview import SplitCompareWidget
+
 
 class PreviewPanel(QWidget):
-    """Center panel with Before/After frame preview and time slider."""
+    """Center panel with split-line Before/After comparison and time slider."""
 
     preview_requested = Signal(float)  # timestamp in seconds
 
@@ -43,62 +45,10 @@ class PreviewPanel(QWidget):
         self._info_label.setMaximumHeight(40)
         layout.addWidget(self._info_label)
 
-        # --- Before / After images ---
-        image_row = QHBoxLayout()
-
-        # Before column
-        before_col = QVBoxLayout()
-        before_title = QLabel("原始帧")
-        before_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        before_title.setStyleSheet(
-            "color: #9e9e9e; font-size: 11px; font-weight: bold;"
-        )
-        before_col.addWidget(before_title)
-
-        self._before_label = QLabel("拖入视频后\n点击「生成预览」")
-        self._before_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._before_label.setMinimumHeight(300)
-        self._before_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self._before_label.setStyleSheet(
-            "background: #111122; color: #555; border: 1px solid #2a3a5c; "
-            "border-radius: 4px;"
-        )
-        self._before_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._before_label.mouseDoubleClickEvent = (
-            lambda e: self._show_full_image(self._before_pixmap_full, "原始帧")
-        )
-        before_col.addWidget(self._before_label, 1)
-        image_row.addLayout(before_col, 1)
-
-        # After column
-        after_col = QVBoxLayout()
-        after_title = QLabel("增强帧")
-        after_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        after_title.setStyleSheet(
-            "color: #9e9e9e; font-size: 11px; font-weight: bold;"
-        )
-        after_col.addWidget(after_title)
-
-        self._after_label = QLabel("拖入视频后\n点击「生成预览」")
-        self._after_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._after_label.setMinimumHeight(300)
-        self._after_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self._after_label.setStyleSheet(
-            "background: #111122; color: #555; border: 1px solid #2a3a5c; "
-            "border-radius: 4px;"
-        )
-        self._after_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._after_label.mouseDoubleClickEvent = (
-            lambda e: self._show_full_image(self._after_pixmap_full, "增强帧")
-        )
-        after_col.addWidget(self._after_label, 1)
-        image_row.addLayout(after_col, 1)
-
-        layout.addLayout(image_row, 1)
+        # --- Split-line Before/After comparison ---
+        self._split_widget = SplitCompareWidget()
+        self._split_widget.setMinimumHeight(300)
+        layout.addWidget(self._split_widget, 1)
 
         # --- Time slider row ---
         slider_row = QHBoxLayout()
@@ -135,10 +85,10 @@ class PreviewPanel(QWidget):
     def update_preview(
         self, original_bgr: np.ndarray, enhanced_bgr: np.ndarray
     ) -> None:
-        """Display new before / after preview images."""
+        """Display new before / after preview images via split-line widget."""
         self._before_pixmap_full = self._numpy_to_pixmap(original_bgr)
         self._after_pixmap_full = self._numpy_to_pixmap(enhanced_bgr)
-        self._fit_pixmaps()
+        self._split_widget.set_images(self._before_pixmap_full, self._after_pixmap_full)
 
     def get_timestamp(self) -> float:
         if self._video_duration > 0:
@@ -156,30 +106,6 @@ class PreviewPanel(QWidget):
 
     def _request_preview(self) -> None:
         self.preview_requested.emit(self.get_timestamp())
-
-    def _fit_pixmaps(self) -> None:
-        """Scale stored full-res pixmaps to fit the current label size."""
-        for pixmap, label in [
-            (self._before_pixmap_full, self._before_label),
-            (self._after_pixmap_full, self._after_label),
-        ]:
-            if pixmap is None:
-                continue
-            w = label.width() - 4
-            h = label.height() - 4
-            if w > 0 and h > 0:
-                label.setPixmap(
-                    pixmap.scaled(
-                        w,
-                        h,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-
-    def resizeEvent(self, event: object) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self._fit_pixmaps()
 
     def _show_full_image(self, pixmap: QPixmap | None, title: str) -> None:
         """Open a dialog showing the full-resolution image with scroll support."""

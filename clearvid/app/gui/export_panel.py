@@ -25,7 +25,9 @@ from PySide6.QtWidgets import (
 )
 
 from clearvid.app.gui._helpers import coerce_enum, populate_combo, set_combo_by_value
+from clearvid.app.gui.preset_cards import BUILTIN_PRESETS, Preset, PresetCardsWidget
 from clearvid.app.gui.widgets.collapsible import CollapsibleSection
+from clearvid.app.gui.widgets.hint_label import labeled_row_with_info
 from clearvid.app.schemas.models import (
     BackendType,
     EnhancementConfig,
@@ -146,16 +148,8 @@ def _hint(text: str) -> QLabel:
 def _labeled_row(
     label_text: str, widget: QWidget, tooltip: str = ""
 ) -> QHBoxLayout:
-    """Create ``Label | Widget`` horizontal row with optional tooltip."""
-    row = QHBoxLayout()
-    lbl = QLabel(label_text)
-    lbl.setMinimumWidth(80)
-    if tooltip:
-        lbl.setToolTip(tooltip)
-        widget.setToolTip(tooltip)
-    row.addWidget(lbl)
-    row.addWidget(widget, 1)
-    return row
+    """Create ``Label | Widget | ℹ️`` horizontal row with optional tooltip and info button."""
+    return labeled_row_with_info(label_text, widget, tooltip=tooltip, detail=tooltip)
 
 
 # ===========================================================================
@@ -189,6 +183,7 @@ class ExportPanel(QWidget):
         self._layout.setSpacing(4)
 
         self._build_smart_section()
+        self._build_preset_section()
         self._build_output_section()
         self._build_encoding_section()
         self._build_enhancement_section()
@@ -217,6 +212,17 @@ class ExportPanel(QWidget):
         self._smart_btn.setToolTip("根据输入视频和硬件自动选择最佳处理参数")
         self._smart_btn.clicked.connect(self.smart_params_requested.emit)
         self._layout.addWidget(self._smart_btn)
+
+    def _build_preset_section(self) -> None:
+        label = QLabel("快速预设")
+        label.setStyleSheet(
+            "color: #4fc3f7; font-weight: bold; font-size: 12px; margin-top: 6px;"
+        )
+        self._layout.addWidget(label)
+
+        self._preset_cards = PresetCardsWidget()
+        self._preset_cards.preset_selected.connect(self._on_preset_selected)
+        self._layout.addWidget(self._preset_cards)
 
     def _build_output_section(self) -> None:
         sec = CollapsibleSection("输出设置", name="output", expanded=True)
@@ -479,6 +485,47 @@ class ExportPanel(QWidget):
 
     def get_sections(self) -> dict[str, CollapsibleSection]:
         return self._sections
+
+    def _on_preset_selected(self, preset: Preset) -> None:
+        """Apply a preset's parameter dict to the widget state."""
+        p = preset.params
+        if not p:
+            return  # "自定义" — do nothing
+
+        _COMBO_MAP = {
+            "quality_mode": (self.quality_combo, QualityMode),
+            "upscale_model": (self.upscale_model_combo, UpscaleModel),
+            "face_restore_model": (self.face_model_combo, FaceRestoreModel),
+        }
+        for key, (combo, _enum) in _COMBO_MAP.items():
+            if key in p:
+                set_combo_by_value(combo, p[key])
+
+        _CHECK_MAP = {
+            "face_restore_enabled": self.face_restore_enabled,
+            "face_poisson_blend": self.face_poisson_blend,
+            "sharpen_enabled": self.sharpen_enabled,
+            "temporal_stabilize_enabled": self.temporal_enabled,
+            "preprocess_denoise": self.preprocess_denoise,
+            "preprocess_deblock": self.preprocess_deblock,
+            "preprocess_deinterlace": self.preprocess_deinterlace,
+            "preprocess_colorspace": self.preprocess_colorspace,
+        }
+        for key, checkbox in _CHECK_MAP.items():
+            if key in p:
+                checkbox.setChecked(p[key])
+
+        _SPIN_MAP = {
+            "face_restore_strength": self.face_restore_strength,
+            "sharpen_strength": self.sharpen_strength,
+            "temporal_stabilize_strength": self.temporal_strength,
+        }
+        for key, spinbox in _SPIN_MAP.items():
+            if key in p:
+                spinbox.setValue(p[key])
+
+        if "encoder_crf" in p:
+            self.encoder_crf.setValue(p["encoder_crf"])
 
     def build_config(self, input_path: str) -> EnhancementConfig:
         """Build an EnhancementConfig from the current widget state."""
