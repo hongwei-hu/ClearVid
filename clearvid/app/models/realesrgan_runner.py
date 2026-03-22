@@ -832,7 +832,7 @@ def _process_frames_sync(
     encoder.stdin.close()
 
 
-_ENHANCED_QUEUE_DEPTH = 8
+_ENHANCED_QUEUE_DEPTH = 4
 
 
 def _process_frames_async(
@@ -849,24 +849,56 @@ def _process_frames_async(
     total_frames: int | None,
     progress_callback: Callable[[int, str], None] | None,
 ) -> None:
-    """3-stage async pipeline: decode thread → GPU inference (main) → write thread.
+    """4-stage async pipeline for maximum GPU utilisation.
 
-    Stage 1 (background thread): FFmpeg decode → raw_queue  (already running)
-    Stage 2 (main thread):       GPU inference + face restore + temporal
-                                  stabilize + sharpen → finalized_queue
-    Stage 3 (background thread): Resize + encode ← finalized_queue  (I/O only)
+    Stage 1 (thread):  FFmpeg decode → raw_queue          (already running)
+    Stage 2 (thread):  Super-resolution (GPU) → enhanced_queue
+    Stage 3 (main):    Face restore (GPU) + temporal stabilize (CPU async)
+                        + sharpen → finalized_queue
+    Stage 4 (thread):  Resize + encode ← finalized_queue  (I/O only)
 
-    All GPU-bound and compute-heavy work stays on the main thread (Stage 2)
-    so Stage 3 never blocks on GPU contention.
+    Stage 2 and Stage 3 run on separate threads, which means PyTorch
+    assigns them different CUDA streams.  While Stage 3 runs CPU-heavy
+    face detection, Stage 2's next super-res inference can execute on the
+    GPU concurrently — eliminating the idle gaps that cause sawtooth
+    utilisation patterns.
     """
+    enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+        maxsize=_ENHANCED_QUEUE_DEPTH,
+    )
     finalized_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
         maxsize=_ENHANCED_QUEUE_DEPTH,
     )
+    enhance_errors: list[BaseException] = []
     write_errors: list[BaseException] = []
     frames_written = [0]  # mutable counter shared with write thread
 
+    # -- Stage 2: super-resolution thread -----------------------------------
+    use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
+
+    def _enhance_loop() -> None:
+        """Pull raw frames and run super-res inference (own CUDA stream)."""
+        try:
+            while True:
+                enhanced_list = _fetch_enhanced_frames(
+                    raw_queue, use_batching, config.batch_size,
+                    metadata.height, metadata.width, upsampler, outscale,
+                )
+                if enhanced_list is None:
+                    break
+                enhanced_queue.put(enhanced_list)
+        except Exception as exc:  # noqa: BLE001
+            enhance_errors.append(exc)
+        finally:
+            enhanced_queue.put(None)  # sentinel
+
+    enhance_thread = threading.Thread(
+        target=_enhance_loop, daemon=True, name="sr-enhance",
+    )
+
+    # -- Stage 4: write thread -----------------------------------------------
     def _write_loop() -> None:
-        """Stage 3: resize finalized frames and write to encoder (pure I/O)."""
+        """Resize finalized frames and write to encoder (pure I/O)."""
         try:
             while True:
                 item = finalized_queue.get()
@@ -881,46 +913,43 @@ def _process_frames_async(
         finally:
             encoder.stdin.close()
 
-    write_thread = threading.Thread(target=_write_loop, daemon=True)
+    write_thread = threading.Thread(
+        target=_write_loop, daemon=True, name="frame-writer",
+    )
+
+    # -- Start background stages ---------------------------------------------
+    enhance_thread.start()
     write_thread.start()
 
-    # Stage 2 (main thread): GPU inference + all heavy post-processing
-    use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
+    # -- Stage 3 (main thread): face restore + stabilize + sharpen -----------
     sharpen_strength = config.sharpen_strength if config.sharpen_enabled else 0.0
     last_reported_progress = -1
 
+    # Overlap optical-flow (CPU) with next frame's GPU work.
+    _stab_pool: ThreadPoolExecutor | None = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="stabilizer")
+        if stabilizer is not None else None
+    )
+    _stab_future: Future[np.ndarray] | None = None
+
+    def _stabilize_and_sharpen(frame: np.ndarray) -> np.ndarray:
+        result = stabilizer.stabilize(frame)  # type: ignore[union-attr]
+        if sharpen_strength > 0:
+            result = apply_sharpening(result, sharpen_strength)
+        return result
+
     try:
-        # When temporal stabilizer is active, overlap its CPU-bound optical
-        # flow computation with the next frame's GPU inference by running
-        # stabilize + sharpen in a 1-thread pool.
-        _stab_pool: ThreadPoolExecutor | None = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="stabilizer")
-            if stabilizer is not None else None
-        )
-        _stab_future: Future[np.ndarray] | None = None
-
-        def _stabilize_and_sharpen(frame: np.ndarray) -> np.ndarray:
-            result = stabilizer.stabilize(frame)  # type: ignore[union-attr]
-            if sharpen_strength > 0:
-                result = apply_sharpening(result, sharpen_strength)
-            return result
-
         while True:
-            enhanced_list = _fetch_enhanced_frames(
-                raw_queue, use_batching, config.batch_size,
-                metadata.height, metadata.width, upsampler, outscale,
-            )
+            enhanced_list = enhanced_queue.get()
             if enhanced_list is None:
                 break
 
-            # Face restore (GPU) then submit stabilize (CPU) to overlap with
-            # the next iteration's GPU inference.
             finalized_list: list[np.ndarray] = []
             for enhanced in enhanced_list:
                 if codeformer_restorer is not None:
                     enhanced = codeformer_restorer.restore_faces(enhanced)
 
-                # Collect the previous frame's async stabilization result.
+                # Collect previous frame's async stabilisation result.
                 if _stab_future is not None:
                     finalized_list.append(_stab_future.result())
                     _stab_future = None
@@ -937,20 +966,24 @@ def _process_frames_async(
             if finalized_list:
                 finalized_queue.put(finalized_list)
 
-            # Report progress from write thread's counter
             last_reported_progress = _report_stream_progress(
-                frames_written[0], total_frames, last_reported_progress, progress_callback,
+                frames_written[0], total_frames, last_reported_progress,
+                progress_callback,
             )
 
-        # Flush the last pending stabilization.
+        # Flush last pending stabilisation.
         if _stab_future is not None:
             finalized_queue.put([_stab_future.result()])
     finally:
-        finalized_queue.put(None)  # signal write thread to stop
+        finalized_queue.put(None)  # signal write thread
         if _stab_pool is not None:
             _stab_pool.shutdown(wait=False)
 
+    # -- Join background threads ---------------------------------------------
+    enhance_thread.join()
     write_thread.join()
+    if enhance_errors:
+        raise enhance_errors[0]
     if write_errors:
         raise write_errors[0]
 
