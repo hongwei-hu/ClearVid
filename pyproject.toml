@@ -12,6 +12,20 @@ license = { text = "Proprietary" }
 authors = [
   { name = "ClearVid" },
 ]
+keywords = [
+  "video-enhancement",
+  "video-upscaling",
+  "super-resolution",
+  "real-esrgan",
+  "codeformer",
+  "face-restoration",
+  "ffmpeg",
+  "deep-learning",
+  "pytorch",
+  "nvidia",
+  "4k",
+  "ai-video",
+]
 dependencies = [
   "pydantic>=2.10,<3.0",
   "pyyaml>=6.0.2,<7.0",
