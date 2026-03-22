@@ -149,8 +149,14 @@ def _apply_quality_mode_overrides(config: EnhancementConfig) -> EnhancementConfi
     return config
 
 
-def _auto_batch_size(config: EnhancementConfig, width: int, height: int) -> int:
-    """Choose batch_size based on VRAM and input resolution when using defaults."""
+def _auto_batch_size(
+    config: EnhancementConfig, width: int, height: int, model_arch: str = "rrdb",
+) -> int:
+    """Choose batch_size based on VRAM, resolution, and model architecture.
+
+    RRDB is very VRAM-hungry (23 residual blocks) — keep batches small.
+    SRVGG is lightweight — moderate batches to balance latency vs throughput.
+    """
     if config.batch_size != 4:  # user explicitly set a custom value
         return config.batch_size
     try:
@@ -161,14 +167,19 @@ def _auto_batch_size(config: EnhancementConfig, width: int, height: int) -> int:
     except Exception:  # noqa: BLE001
         return config.batch_size
     megapixels = (width * height) / 1_000_000
-    # Scale batch size to utilise VRAM more aggressively
-    if vram_mb >= 24_000 and megapixels <= 1.0:
-        return 16
-    if vram_mb >= 16_000 and megapixels <= 1.0:
-        return 12
-    if vram_mb >= 12_000:
-        return 8
-    return config.batch_size
+    if model_arch == "srvgg":
+        # SRVGG is lightweight; keep batch small to reduce decode-wait latency
+        if vram_mb >= 16_000 and megapixels <= 1.0:
+            return 8
+        if vram_mb >= 8_000:
+            return 4
+        return 2
+    # RRDB: conservative — intermediate activations are VRAM-hungry
+    if vram_mb >= 24_000 and megapixels <= 0.5:
+        return 4
+    if vram_mb >= 16_000 and megapixels <= 0.5:
+        return 2
+    return 1
 
 
 def run_realesrgan_video(
@@ -179,13 +190,14 @@ def run_realesrgan_video(
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> None:
     config = _apply_quality_mode_overrides(config)
-    config = config.model_copy(update={
-        "batch_size": _auto_batch_size(config, metadata.width, metadata.height),
-    })
 
     _emit_progress(progress_callback, 6, "正在准备 Real-ESRGAN 权重")
     weights_dir = REALESRGAN_WEIGHTS_DIR
     model_key = resolve_upscale_model(config.upscale_model, config.quality_mode)
+    model_arch = _MODEL_REGISTRY[model_key]["arch"]
+    config = config.model_copy(update={
+        "batch_size": _auto_batch_size(config, metadata.width, metadata.height, model_arch),
+    })
     model_path = ensure_realesrgan_weights(weights_dir, model_key)
     model_label = _MODEL_REGISTRY[model_key]["filename"]
     _emit_progress(progress_callback, 10, f"正在初始化 Real-ESRGAN ({model_label})")
@@ -639,7 +651,7 @@ def _build_encode_command(
     return command
 
 
-_FRAME_QUEUE_DEPTH = 32
+_FRAME_QUEUE_DEPTH = 16
 
 
 def _resolve_tile_size(config_tile_size: int, width: int, height: int, fp16: bool) -> int:
@@ -686,11 +698,27 @@ def _start_decode_thread(
 
 
 def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
+    """Collect up to *batch_size* frames.
+
+    The first frame blocks indefinitely (waits for decode). Subsequent
+    frames are collected with a very short timeout so the GPU is not left
+    idle waiting for a full batch when decode is the bottleneck.
+    """
     batch: list[bytes] = []
-    for _ in range(batch_size):
-        raw = raw_queue.get()
+    # First frame: block until available
+    raw = raw_queue.get()
+    if raw is None:
+        raw_queue.put(None)
+        return batch
+    batch.append(raw)
+    # Remaining frames: grab whatever is already queued
+    for _ in range(batch_size - 1):
+        try:
+            raw = raw_queue.get_nowait()
+        except queue.Empty:
+            break
         if raw is None:
-            raw_queue.put(None)  # preserve sentinel for next caller
+            raw_queue.put(None)
             break
         batch.append(raw)
     return batch
@@ -881,7 +909,7 @@ def _process_frames_sync(
     encoder.stdin.close()
 
 
-_ENHANCED_QUEUE_DEPTH = 16
+_ENHANCED_QUEUE_DEPTH = 4
 
 
 def _process_frames_async(
