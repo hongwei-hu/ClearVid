@@ -1,0 +1,50 @@
+name: Set Repository Description and Topics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  set-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set repository description
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.repos.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              description: "AI-powered video enhancement toolkit: upscale 480p/720p footage to 1080p/4K with Real-ESRGAN super-resolution and CodeFormer face restoration on Windows."
+            });
+            console.log("Repository description updated.");
+
+      - name: Set repository topics
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.repos.replaceAllTopics({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              names: [
+                "video-enhancement",
+                "video-upscaling",
+                "super-resolution",
+                "real-esrgan",
+                "codeformer",
+                "face-restoration",
+                "ffmpeg",
+                "python",
+                "windows",
+                "deep-learning",
+                "pytorch",
+                "nvidia-gpu",
+                "4k-upscaling",
+                "ai-video"
+              ]
+            });
+            console.log("Repository topics updated.");
