@@ -184,13 +184,29 @@ def _get_or_build_engine(
 
     # Step 2: build TensorRT engine in ISOLATED SUBPROCESS
     # This prevents GPU-intensive TRT builder from freezing the main app.
+    # Dynamic timeout based on model complexity (RRDB ~16.7M params needs much more time)
+    param_count = sum(p.numel() for p in model.parameters())
+    if param_count > 10_000_000:      # RRDB-class models
+        build_timeout = 1800            # 30 min
+    elif param_count > 1_000_000:
+        build_timeout = 600             # 10 min
+    else:                               # SRVGGNetCompact etc.
+        build_timeout = 300             # 5 min
+    logger.info(
+        "模型参数量: %.2fM → TRT 构建超时: %ds",
+        param_count / 1e6, build_timeout,
+    )
     if progress_callback is not None:
-        progress_callback(11, "首次构建 TensorRT 引擎 (可能需要数分钟，后续秒级加载)...")
+        progress_callback(
+            11,
+            f"首次构建 TensorRT 引擎 ({param_count/1e6:.1f}M 参数, "
+            f"最长 {build_timeout//60} 分钟, 后续秒级加载)...",
+        )
     logger.info("正在构建 TensorRT 引擎 (首次构建, 子进程隔离) ...")
     _build_trt_engine_subprocess(
         onnx_path, engine_path,
         fp16=fp16, tile_size=tile_size, batch_size=batch_size,
-        timeout=600,
+        timeout=build_timeout,
         progress_callback=progress_callback,
     )
 

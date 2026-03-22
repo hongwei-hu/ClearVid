@@ -227,6 +227,13 @@ def run_realesrgan_video(
             progress_callback=progress_callback,
         )
         accel_actual = "TensorRT" if hasattr(upsampler.model, '_engine') else "PyTorch (回退)"
+        # When TRT is active, force tiling so input shapes stay within the
+        # TRT engine profile.  Whole-frame mode (tile=0) would send shapes
+        # like 854×480 that exceed the profile's max_hw.
+        if hasattr(upsampler.model, '_engine') and getattr(upsampler, 'tile', 0) == 0:
+            upsampler.tile = trt_tile
+            upsampler.tile_size = trt_tile
+            logger.info("TRT 激活: 强制 tiling=%d (整帧模式不兼容 TRT profile)", trt_tile)
         _emit_progress(
             progress_callback, 11,
             f"推理加速就绪: {accel_actual} ({time.perf_counter() - t_accel:.1f}s)",
@@ -239,7 +246,8 @@ def run_realesrgan_video(
 
     # Log pipeline configuration summary
     t_init = time.perf_counter() - t_start
-    batching = "整帧" if tile_size == 0 else f"tile={tile_size}"
+    actual_tile = getattr(upsampler, 'tile', tile_size)
+    batching = "整帧" if actual_tile == 0 else f"tile={actual_tile}"
     face_label = "关闭" if codeformer_restorer is None else type(codeformer_restorer).__name__
     _emit_progress(
         progress_callback, 15,
@@ -1137,7 +1145,10 @@ def _process_frames_async(
     _diag_enhance_wait_ms = [0.0]
     _diag_write_frames = [0]
     _diag_write_ms = [0.0]
-    _diag_batch_sizes: list[int] = []
+    _diag_batch_sizes: list[int] = []       # capped at 100 entries — see append below
+    _diag_face_frames = [0]                 # frames where faces were detected
+    _diag_face_total = [0]                  # total faces restored
+    _diag_postprocess_ms = [0.0]
 
     # -- Stage 2: super-resolution thread -----------------------------------
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
@@ -1159,6 +1170,8 @@ def _process_frames_async(
                 _diag_enhance_infer_ms[0] += (t_done - t_wait) * 1000
                 _diag_enhance_batches[0] += 1
                 _diag_enhance_frames[0] += n
+                if len(_diag_batch_sizes) >= 100:
+                    _diag_batch_sizes.pop(0)
                 _diag_batch_sizes.append(n)
                 if not _safe_put(enhanced_queue, enhanced_list):
                     break
@@ -1236,7 +1249,9 @@ def _process_frames_async(
                         if control is not None:
                             control.check()
                         if codeformer_restorer is not None:
+                            t_pp = time.perf_counter()
                             enhanced = codeformer_restorer.restore_faces(enhanced)
+                            _diag_postprocess_ms[0] += (time.perf_counter() - t_pp) * 1000
 
                         if _stab_future is not None:
                             finalized_list.append(_stab_future.result())
@@ -1311,15 +1326,20 @@ def _process_frames_async(
             )
             enh_fps = _diag_enhance_frames[0] / (now - _t_async_start) if now > _t_async_start else 0
             wr_fps = _diag_write_frames[0] / (now - _t_async_start) if now > _t_async_start else 0
+            pp_avg = (
+                _diag_postprocess_ms[0] / _diag_write_frames[0]
+                if _diag_write_frames[0] > 0 else 0
+            )
             queue_info = f"队列: 解码={rq}/{_FRAME_QUEUE_DEPTH}"
             if eq >= 0:
                 queue_info += f" 增强={eq}/{_ENHANCED_QUEUE_DEPTH}"
             queue_info += f" 写入={fq}/{_ENHANCED_QUEUE_DEPTH}"
+            pp_info = f" 后处理={pp_avg:.0f}ms/帧" if pp_avg > 0 else ""
             _emit_progress(
                 progress_callback,
                 last_reported_progress,
                 f"[诊断] {queue_info} | 增强 {enh_fps:.1f}fps 写入 {wr_fps:.1f}fps | "
-                f"平均batch={avg_batch:.1f}",
+                f"平均batch={avg_batch:.1f}{pp_info}",
             )
 
     _report_stream_progress(
@@ -1335,11 +1355,13 @@ def _process_frames_async(
         avg_batch = enh_frames / enh_batches if enh_batches else 0
         avg_infer_ms = _diag_enhance_infer_ms[0] / enh_batches if enh_batches else 0
         avg_write_ms = _diag_write_ms[0] / _diag_write_frames[0] if _diag_write_frames[0] else 0
+        avg_pp_ms = _diag_postprocess_ms[0] / _diag_write_frames[0] if _diag_write_frames[0] else 0
+        pp_part = f" 后处理: avg={avg_pp_ms:.0f}ms/帧 |" if avg_pp_ms > 0 else ""
         _emit_progress(
             progress_callback,
             last_reported_progress,
             f"[诊断汇总] 增强: {enh_frames}帧/{enh_batches}批 "
-            f"avg_batch={avg_batch:.1f} avg_infer={avg_infer_ms:.0f}ms/批 | "
+            f"avg_batch={avg_batch:.1f} avg_infer={avg_infer_ms:.0f}ms/批 |{pp_part} "
             f"写入: avg={avg_write_ms:.1f}ms/帧 | "
             f"总吞吐: {enh_frames / total_elapsed:.2f} fps",
         )
