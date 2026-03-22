@@ -430,6 +430,7 @@ class MainWindow(QMainWindow):
         self._worker.completed.connect(self._on_completed)
         self._worker.failed.connect(self._on_failed)
         self._worker.cancelled.connect(self._on_cancelled)
+        self._worker.preview_ready.connect(self._on_preview_ready)
         self._worker.start()
 
     def _on_progress(self, percent: int, message: str) -> None:
@@ -471,6 +472,10 @@ class MainWindow(QMainWindow):
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_progress(0, "导出已取消")
         self._log_message("导出已被用户取消")
+
+    def _on_preview_ready(self, preview_path: str) -> None:
+        self._export_panel.update_preview_progress(preview_path)
+        self._log_message("中途预览已更新，可点击按钮播放已完成部分")
 
     # ==================================================================
     # Export queue (all files in file list)

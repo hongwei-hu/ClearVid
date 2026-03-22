@@ -190,6 +190,7 @@ def run_realesrgan_video(
     output_height: int,
     progress_callback: Callable[[int, str], None] | None = None,
     control: ExportControl | None = None,
+    preview_callback: Callable[[str], None] | None = None,
 ) -> None:
     config = _apply_quality_mode_overrides(config)
 
@@ -224,6 +225,32 @@ def run_realesrgan_video(
 
     temp_root = Path(tempfile.mkdtemp(prefix="clearvid-realesrgan-"))
     temp_video_path = temp_root / "enhanced_video.mp4"
+    preview_path = temp_root / "preview.mp4"
+
+    # Build a mux trigger that creates a playable preview with audio
+    _preview_mux_lock = threading.Lock()
+    _preview_mux_thread: list[threading.Thread | None] = [None]
+
+    def _on_preview_mux_needed(frames_done: int) -> None:
+        """Called from monitor loop when enough new frames warrant a preview update."""
+        if preview_callback is None:
+            return
+        fps = metadata.fps or 30.0
+        duration_sec = frames_done / fps
+        if duration_sec < 10:  # not enough content yet
+            return
+        with _preview_mux_lock:
+            if _preview_mux_thread[0] is not None and _preview_mux_thread[0].is_alive():
+                return  # previous mux still running
+
+            def _do_mux() -> None:
+                ok = _mux_preview(config, temp_video_path, preview_path, duration_sec)
+                if ok and preview_callback is not None:
+                    preview_callback(str(preview_path))
+
+            t = threading.Thread(target=_do_mux, daemon=True, name="preview-mux")
+            _preview_mux_thread[0] = t
+            t.start()
 
     try:
         outscale = _resolve_outscale(metadata, output_width, output_height, config.target_profile)
@@ -239,7 +266,12 @@ def run_realesrgan_video(
             temp_video_path=temp_video_path,
             progress_callback=progress_callback,
             control=control,
+            preview_mux_trigger=_on_preview_mux_needed,
         )
+        # Wait for any in-flight preview mux before final mux
+        with _preview_mux_lock:
+            if _preview_mux_thread[0] is not None:
+                _preview_mux_thread[0].join(timeout=10)
         _emit_progress(progress_callback, 96, "正在封装音频与元数据")
         _mux_output(config, temp_video_path)
         _emit_progress(progress_callback, 100, "视频导出完成")
@@ -452,6 +484,7 @@ def _stream_process_video(
     temp_video_path: Path,
     progress_callback: Callable[[int, str], None] | None,
     control: ExportControl | None = None,
+    preview_mux_trigger: Callable[[int], None] | None = None,
 ) -> None:
     import subprocess
 
@@ -474,10 +507,46 @@ def _stream_process_video(
             encoder=encoder,
             progress_callback=progress_callback,
             control=control,
+            preview_mux_trigger=preview_mux_trigger,
         )
         _finalize_stream_processes(decoder, encoder)
     finally:
         _cleanup_stream_processes(decoder, encoder)
+
+
+def _mux_preview(
+    config: EnhancementConfig,
+    temp_video_path: Path,
+    preview_path: Path,
+    duration_sec: float,
+) -> bool:
+    """Create a quick mux of the temp video + original audio for mid-export preview.
+
+    Uses ``-t`` to limit the audio to the already-encoded video duration.
+    Returns True on success, False on any error (non-fatal).
+    """
+    command = [
+        ffmpeg_path() or "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(temp_video_path),
+        "-i", str(config.input_path),
+        "-t", f"{duration_sec:.3f}",
+        "-map", "0:v:0",
+        "-c:v", "copy",
+    ]
+    if config.preserve_audio:
+        command.extend(["-map", "1:a?", "-c:a", "copy"])
+    else:
+        command.append("-an")
+    command.extend(["-sn", "-map_metadata", "-1", "-shortest", str(preview_path)])
+    try:
+        import subprocess as _sp
+        _sp.run(command, capture_output=True, check=True, timeout=30)  # noqa: S603
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _mux_output(config: EnhancementConfig, temp_video_path: Path) -> None:
@@ -652,7 +721,10 @@ def _build_encode_command(
     else:
         command.extend(["-cq", "18"])
 
-    command.extend(["-pix_fmt", config.output_pixel_format, "-an", str(temp_video_path)])
+    command.extend(["-pix_fmt", config.output_pixel_format])
+    # Fragmented MP4: makes the temp file playable before encoding finishes
+    command.extend(["-movflags", "frag_keyframe+empty_moov"])
+    command.extend(["-an", str(temp_video_path)])
     return command
 
 
@@ -860,6 +932,7 @@ def _process_stream_frames(
     encoder: object,
     progress_callback: Callable[[int, str], None] | None,
     control: ExportControl | None = None,
+    preview_mux_trigger: Callable[[int], None] | None = None,
 ) -> None:
     frame_size = metadata.width * metadata.height * 3
     total_frames = _estimate_total_frames(metadata, config.preview_seconds)
@@ -881,12 +954,14 @@ def _process_stream_frames(
             upsampler, codeformer_restorer, stabilizer,
             raw_queue, encoder, total_frames, progress_callback,
             abort=abort, control=control,
+            preview_mux_trigger=preview_mux_trigger,
         )
     else:
         _process_frames_sync(
             config, metadata, output_width, output_height, outscale,
             upsampler, codeformer_restorer, stabilizer,
             raw_queue, encoder, total_frames, progress_callback,
+            preview_mux_trigger=preview_mux_trigger,
         )
 
     reader.join()
@@ -907,11 +982,15 @@ def _process_frames_sync(
     encoder: object,
     total_frames: int | None,
     progress_callback: Callable[[int, str], None] | None,
+    preview_mux_trigger: Callable[[int], None] | None = None,
 ) -> None:
     """Original synchronous processing: inference and encode on main thread."""
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
     processed_frames = 0
     last_reported_progress = -1
+    fps = metadata.fps or 30.0
+    _preview_interval_frames = int(fps * 60)  # ~60 seconds of video
+    _last_preview_at = 0
 
     while True:
         enhanced_list = _fetch_enhanced_frames(
@@ -926,6 +1005,9 @@ def _process_frames_sync(
         last_reported_progress = _report_stream_progress(
             processed_frames, total_frames, last_reported_progress, progress_callback,
         )
+        if preview_mux_trigger and processed_frames - _last_preview_at >= _preview_interval_frames:
+            _last_preview_at = processed_frames
+            preview_mux_trigger(processed_frames)
 
     encoder.stdin.close()
 
@@ -949,6 +1031,7 @@ def _process_frames_async(
     *,
     abort: threading.Event | None = None,
     control: ExportControl | None = None,
+    preview_mux_trigger: Callable[[int], None] | None = None,
 ) -> None:
     """Async pipeline with abort-safe queue operations.
 
@@ -1129,15 +1212,22 @@ def _process_frames_async(
         postprocess_thread.start()
     write_thread.start()
 
-    # -- Main thread: progress reporting only --------------------------------
+    # -- Main thread: progress reporting + periodic preview mux ---------------
     monitor_thread = postprocess_thread if postprocess_thread is not None else enhance_thread
     last_reported_progress = -1
+    fps = metadata.fps or 30.0
+    _preview_interval_frames = int(fps * 60)  # ~60 seconds of video
+    _last_preview_at = 0
     while monitor_thread.is_alive():
         monitor_thread.join(timeout=0.5)
+        current_written = frames_written[0]
         last_reported_progress = _report_stream_progress(
-            frames_written[0], total_frames, last_reported_progress,
+            current_written, total_frames, last_reported_progress,
             progress_callback,
         )
+        if preview_mux_trigger and current_written - _last_preview_at >= _preview_interval_frames:
+            _last_preview_at = current_written
+            preview_mux_trigger(current_written)
     _report_stream_progress(
         frames_written[0], total_frames, last_reported_progress,
         progress_callback,

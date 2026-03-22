@@ -16,6 +16,7 @@ class Worker(QThread):
     failed = Signal(str)
     cancelled = Signal()
     progress = Signal(int, str)
+    preview_ready = Signal(str)  # emitted with preview file path when mid-export preview is available
 
     def __init__(self, config: EnhancementConfig, control: ExportControl | None = None) -> None:
         super().__init__()
@@ -27,6 +28,7 @@ class Worker(QThread):
             result = Orchestrator().run_single(
                 self._config, progress_callback=self._emit_progress,
                 control=self._control,
+                preview_callback=self._emit_preview,
             )
             self.completed.emit(result.model_dump_json(indent=2))
         except ExportCancelled:
@@ -36,6 +38,9 @@ class Worker(QThread):
 
     def _emit_progress(self, percent: int, message: str) -> None:
         self.progress.emit(percent, message)
+
+    def _emit_preview(self, path: str) -> None:
+        self.preview_ready.emit(path)
 
 
 class PreviewWorker(QThread):

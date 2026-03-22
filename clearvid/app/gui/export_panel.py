@@ -535,6 +535,17 @@ class ExportPanel(QWidget):
         self.export_all_btn.clicked.connect(self.export_all_requested.emit)
         bottom.addWidget(self.export_all_btn)
 
+        # Mid-export preview button (hidden until preview is available)
+        self._preview_progress_btn = QPushButton("👁 预览已完成部分")
+        self._preview_progress_btn.setMinimumHeight(32)
+        self._preview_progress_btn.setToolTip(
+            "在系统播放器中播放已导出的视频片段（含音频）"
+        )
+        self._preview_progress_btn.setVisible(False)
+        self._preview_progress_path: str = ""
+        self._preview_progress_btn.clicked.connect(self._play_preview_progress)
+        bottom.addWidget(self._preview_progress_btn)
+
         # Post-export action buttons (hidden until export completes)
         self._post_row = QHBoxLayout()
         self._open_folder_btn = QPushButton("\U0001f4c2 打开文件夹")
@@ -758,6 +769,7 @@ class ExportPanel(QWidget):
 
     def show_post_export(self, output_path: str) -> None:
         """Show 'open folder' and 'play' buttons after successful export."""
+        self._preview_progress_btn.setVisible(False)  # hide mid-export preview
         self._open_folder_btn.setVisible(True)
         self._play_btn.setVisible(True)
         # Disconnect previous connections (safe even if none exist)
@@ -775,6 +787,14 @@ class ExportPanel(QWidget):
     def hide_post_export(self) -> None:
         self._open_folder_btn.setVisible(False)
         self._play_btn.setVisible(False)
+        self._preview_progress_btn.setVisible(False)
+        self._preview_progress_path = ""
+
+    def update_preview_progress(self, preview_path: str) -> None:
+        """Called when a mid-export preview file becomes available."""
+        self._preview_progress_path = preview_path
+        if not self._preview_progress_btn.isVisible():
+            self._preview_progress_btn.setVisible(True)
 
     # ------------------------------------------------------------------
     # Internal
@@ -806,3 +826,8 @@ class ExportPanel(QWidget):
     def _play_video(path: str) -> None:
         """Open the video file with the system default player."""
         os.startfile(path)  # noqa: S606  # Windows-specific
+
+    def _play_preview_progress(self) -> None:
+        """Open the mid-export preview video with the system default player."""
+        if self._preview_progress_path and os.path.isfile(self._preview_progress_path):
+            os.startfile(self._preview_progress_path)  # noqa: S606  # Windows-specific

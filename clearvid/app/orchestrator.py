@@ -37,6 +37,7 @@ class Orchestrator:
         config: EnhancementConfig,
         progress_callback: Callable[[int, str], None] | None = None,
         control: ExportControl | None = None,
+        preview_callback: Callable[[str], None] | None = None,
     ) -> BatchResult:
         _emit_progress(progress_callback, 2, "正在分析输入视频")
         metadata = probe_video(config.input_path)
@@ -62,6 +63,7 @@ class Orchestrator:
                 output_height=plan.output_height,
                 progress_callback=progress_callback,
                 control=control,
+                preview_callback=preview_callback,
             )
         else:
             run_ffmpeg_with_progress(
