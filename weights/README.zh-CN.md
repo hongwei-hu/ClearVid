@@ -1,48 +1,84 @@
-# ClearVid 模型权重说明
+# ClearVid 权重目录说明
 
-当前项目已经具备：
+本目录用于存放 ClearVid 运行时所需的模型权重，以及 TensorRT 相关缓存。
 
-- 5090 兼容的 PyTorch 运行环境
-- Real-ESRGAN、GFPGAN、CodeFormer 相关 Python 依赖
+仓库会保留目录结构和说明文件，但不应提交实际模型文件或本机生成缓存。
 
-如果 GUI 顶部状态显示 Real-ESRGAN 不可用，常见原因通常是运行时环境或依赖链异常。
+## 目录用途
 
-如果只是缺少默认权重，当前版本会在首次实际执行 Real-ESRGAN 导出时自动下载默认权重，不需要你手动放置。
+推荐目录结构如下：
 
-如果启用了人脸修复，当前版本也会在首次运行时自动下载 CodeFormer 和 facelib 所需权重。
+```text
+weights/
+  codeformer/
+  facelib/
+  gfpgan/
+  realesrgan/
+  trt_cache/
+```
 
-## 推荐目录
+各目录的用途：
 
-请将超分模型权重放到以下目录：
+- `weights/realesrgan/`: Real-ESRGAN 超分模型权重
+- `weights/codeformer/`: CodeFormer 人脸修复权重
+- `weights/gfpgan/`: GFPGAN 人脸修复权重
+- `weights/facelib/`: 人脸检测与解析辅助权重
+- `weights/trt_cache/`: TensorRT 引擎缓存和相关生成物
 
-- weights/realesrgan/
+## 自动下载行为
 
-人脸增强相关权重后续建议放到：
+当前版本支持按需自动下载常用权重。
 
-- weights/codeformer/
-- weights/facelib/
+首次实际执行导出时，如果缺少所需权重，程序会根据当前配置自动下载对应文件。
 
-## 当前建议优先准备的 Real-ESRGAN 权重
+当前会按需下载的常见文件包括：
 
-程序默认会优先使用以下权重之一：
+- `realesr-general-x4v3.pth`
+- `RealESRGAN_x4plus.pth`
+- `codeformer.pth`
+- `GFPGANv1.4.pth`
+- `detection_Resnet50_Final.pth`
+- `parsing_parsenet.pth`
 
-- RealESRGAN_x4plus.pth
-- realesr-general-x4v3.pth
+如果启用了 TensorRT，加速过程中还可能在 `weights/trt_cache/` 下生成本机相关缓存文件。
 
-放置示例：
+## 手动放置权重
+
+如果你希望提前准备权重，也可以手动放置到对应目录。
+
+示例：
 
 ```text
 weights/
   realesrgan/
+    realesr-general-x4v3.pth
     RealESRGAN_x4plus.pth
+  codeformer/
+    codeformer.pth
+  gfpgan/
+    GFPGANv1.4.pth
+  facelib/
+    detection_Resnet50_Final.pth
+    parsing_parsenet.pth
 ```
 
-## 当前状态说明
+## Git 提交策略
 
-当前版本的工作流是：
+建议提交到仓库的内容：
 
-1. 工具可以直接启动并通过 GUI 导出视频
-2. 自动后端在 Real-ESRGAN 可用时会优先选择 Real-ESRGAN
-3. 如果默认权重不存在，首次运行 Real-ESRGAN 时会自动下载 `realesr-general-x4v3.pth`
-4. 如果启用了人脸修复，首次运行时会自动下载 `weights/codeformer/codeformer.pth` 以及 `weights/facelib/` 下的人脸检测与解析权重
-5. 你也可以手动放入其他 `.pth` 权重文件覆盖默认选择
+- 本说明文件
+- 各子目录的占位文件
+
+不建议提交到仓库的内容：
+
+- `.pth` 模型权重
+- `.onnx` 文件
+- `.engine` 文件
+- `weights/trt_cache/` 下的缓存文件
+- 其他本机生成的中间产物
+
+## 相关说明
+
+项目总说明请查看仓库根目录下的 README。
+
+如果你只是普通使用者，通常不需要手动下载权重；保持目录结构存在即可，程序会在需要时自动补齐。

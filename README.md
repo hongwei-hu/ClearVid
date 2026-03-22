@@ -1,5 +1,7 @@
 # ClearVid
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 ClearVid is a Windows-first video enhancement toolkit for real-world footage. It is designed around 480p and 720p inputs, with practical output targets such as 1080p, 4K, 2x scale, and 4x scale.
 
 The project now includes a usable CLI, a desktop GUI, automatic environment/bootstrap logic, model weight management, and a modern Real-ESRGAN based processing path with optional face restoration and post-processing.
