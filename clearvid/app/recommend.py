@@ -83,11 +83,13 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
         notes.append("低显存，使用 128 分块尺寸")
 
     # --- Face restoration ---
-    face_restore_enabled = True
+    # FAST mode auto-disables in pipeline; here we set the GUI default.
+    face_restore_enabled = quality_mode != "fast"
     face_restore_model = "codeformer"
 
     # --- Temporal stabilization ---
-    temporal_stabilize_enabled = duration > 1.0
+    # FAST mode auto-disables in pipeline; here we set the GUI default.
+    temporal_stabilize_enabled = duration > 1.0 and quality_mode != "fast"
 
     # --- Sharpening ---
     sharpen_enabled = True

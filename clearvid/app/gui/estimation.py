@@ -15,10 +15,11 @@ class ExportEstimate:
 
 
 # Rough processing speed in frames-per-second by quality mode (GPU).
-# These are conservative estimates for a mid-range card (RTX 3070-class).
+# FAST skips face restore + temporal stabilize → much faster.
+# QUALITY uses RRDB x4plus (6x heavier) + full postprocessing.
 _FPS_BY_QUALITY: dict[str, float] = {
-    "fast": 8.0,
-    "balanced": 4.0,
+    "fast": 18.0,
+    "balanced": 6.0,
     "quality": 2.0,
 }
 

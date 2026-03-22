@@ -67,9 +67,9 @@ FACE_MODEL_LABELS = {
     FaceRestoreModel.GFPGAN: "GFPGAN",
 }
 QUALITY_LABELS = {
-    QualityMode.FAST: "快速",
+    QualityMode.FAST: "快速（无后处理）",
     QualityMode.BALANCED: "平衡",
-    QualityMode.QUALITY: "高质量",
+    QualityMode.QUALITY: "高质量（慢 6x）",
 }
 TARGET_LABELS = {
     TargetProfile.SOURCE: "保持原始分辨率",
@@ -90,9 +90,10 @@ TOOLTIPS: dict[str, str] = {
         "选「保持原始」则只做画质增强不改变大小"
     ),
     "quality_mode": (
-        "控制 AI 超分的精细程度。\n"
-        "高质量模式效果最好但速度较慢(约慢 3 倍)。\n"
-        "首次尝试建议先用快速模式确认效果"
+        "控制 AI 超分精度和后处理流程。\n"
+        "快速: 轻量模型 + 跳过人脸修复和时序稳定，速度最快\n"
+        "平衡: 轻量模型 + 完整后处理\n"
+        "高质量: 重型模型 + 完整后处理，效果最好但约慢 6 倍"
     ),
     "backend": (
         "Real-ESRGAN 是核心 AI 超分引擎，需要 NVIDIA 独显。\n"
@@ -130,6 +131,8 @@ TOOLTIPS: dict[str, str] = {
     "colorspace": "不同来源视频可能使用不同色彩标准(BT.601/709)，统一后 AI 模型处理效果更一致",
     "accelerator": "TensorRT 可将处理速度提升 2-4 倍，但首次使用需要编译引擎(约 3-10 分钟)",
     "async_pipeline": "让解码→AI增强→编码三步同时运行，可提速约 30-50%",
+    "batch_size": "每次送入 GPU 的帧数。0 = 根据显存自动选择。\n显存大可以调高(8-16)以提升吞吐量",
+    "tile_size": "分块尺寸。0 = 自动(整帧处理或根据显存分块)。\n显存不足时可设 256/512 降低峰值显存占用",
     "preserve_audio": "保留原视频的音频轨道。关闭后导出为纯视频（无声）",
     "preserve_subtitles": "保留嵌入的字幕轨道（如有）",
     "preserve_metadata": "保留拍摄日期、GPS 等元信息",
@@ -472,6 +475,25 @@ class ExportPanel(QWidget):
         lay.addWidget(self.async_pipeline)
         lay.addWidget(_hint("三级并行处理，提速约 30-50%"))
 
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(0, 64)
+        self.batch_size_spin.setValue(0)
+        self.batch_size_spin.setSpecialValueText("自动")
+        lay.addLayout(
+            _labeled_row("批处理帧数", self.batch_size_spin, TOOLTIPS["batch_size"])
+        )
+        lay.addWidget(_hint("0=自动，显存≥24GB 可尝试 8-16"))
+
+        self.tile_size_spin = QSpinBox()
+        self.tile_size_spin.setRange(0, 2048)
+        self.tile_size_spin.setSingleStep(128)
+        self.tile_size_spin.setValue(0)
+        self.tile_size_spin.setSpecialValueText("自动")
+        lay.addLayout(
+            _labeled_row("分块尺寸", self.tile_size_spin, TOOLTIPS["tile_size"])
+        )
+        lay.addWidget(_hint("0=自动，OOM 时可设 256/512"))
+
         self._layout.addWidget(sec)
         self._sections["performance"] = sec
 
@@ -596,6 +618,8 @@ class ExportPanel(QWidget):
                 InferenceAccelerator.AUTO,
             ),
             async_pipeline=self.async_pipeline.isChecked(),
+            batch_size=self.batch_size_spin.value() or 4,
+            tile_size=self.tile_size_spin.value(),
             face_restore_enabled=self.face_restore_enabled.isChecked(),
             face_restore_strength=self.face_restore_strength.value(),
             face_restore_model=coerce_enum(
