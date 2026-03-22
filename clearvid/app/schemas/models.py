@@ -92,7 +92,7 @@ class EnhancementConfig(BaseModel):
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
     denoise_strength: float = Field(default=0.08, ge=0.0, le=1.0)
     sharpen_strength: float = Field(default=0.12, ge=0.0, le=1.0)
-    tile_size: int = 512
+    tile_size: int = 0
     tile_pad: int = 16
     batch_size: int = 4
     fp16_enabled: bool = True
