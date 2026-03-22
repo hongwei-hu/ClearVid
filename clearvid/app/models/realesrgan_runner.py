@@ -652,17 +652,41 @@ def _write_enhanced_frames(
     encoder_stdin: object,
     sharpen_strength: float = 0.0,
 ) -> int:
-    """Post-process and write frames to encoder. Returns count written."""
+    """Post-process and write frames to encoder. Returns count written.
+
+    Used by the synchronous pipeline path.  The async pipeline uses
+    ``_write_finalized_frames`` instead (GPU work done in Stage 2).
+    """
     count = 0
     for enhanced in enhanced_list:
         if codeformer_restorer is not None:
             enhanced = codeformer_restorer.restore_faces(enhanced)
-        finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
         if stabilizer is not None:
-            finalized = stabilizer.stabilize(finalized)
+            enhanced = stabilizer.stabilize(enhanced)
         if sharpen_strength > 0:
-            finalized = apply_sharpening(finalized, sharpen_strength)
+            enhanced = apply_sharpening(enhanced, sharpen_strength)
+        finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
         encoder_stdin.write(np.ascontiguousarray(finalized).tobytes())
+        count += 1
+    return count
+
+
+def _write_finalized_frames(
+    finalized_list: list[np.ndarray],
+    output_width: int,
+    output_height: int,
+    target_profile: TargetProfile,
+    encoder_stdin: object,
+) -> int:
+    """Resize and write pre-processed frames to encoder (I/O only).
+
+    Used by the async pipeline Stage 3 — all GPU-heavy work (face restore,
+    temporal stabilize, sharpen) has already been done in Stage 2.
+    """
+    count = 0
+    for frame in finalized_list:
+        resized = _resize_for_target(frame, output_width, output_height, target_profile)
+        encoder_stdin.write(np.ascontiguousarray(resized).tobytes())
         count += 1
     return count
 
@@ -682,7 +706,6 @@ def _process_stream_frames(
 ) -> None:
     frame_size = metadata.width * metadata.height * 3
     total_frames = _estimate_total_frames(metadata, config.preview_seconds)
-    use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
 
     assert decoder.stdout is not None
     assert encoder.stdin is not None
@@ -744,7 +767,7 @@ def _process_frames_sync(
     encoder.stdin.close()
 
 
-_ENHANCED_QUEUE_DEPTH = 4
+_ENHANCED_QUEUE_DEPTH = 8
 
 
 def _process_frames_async(
@@ -764,29 +787,29 @@ def _process_frames_async(
     """3-stage async pipeline: decode thread → GPU inference (main) → write thread.
 
     Stage 1 (background thread): FFmpeg decode → raw_queue  (already running)
-    Stage 2 (main thread):       GPU inference → enhanced_queue
-    Stage 3 (background thread): Post-process + encode ← enhanced_queue
+    Stage 2 (main thread):       GPU inference + face restore + temporal
+                                  stabilize + sharpen → finalized_queue
+    Stage 3 (background thread): Resize + encode ← finalized_queue  (I/O only)
 
-    This overlaps GPU computation with CPU post-processing and I/O encoding.
+    All GPU-bound and compute-heavy work stays on the main thread (Stage 2)
+    so Stage 3 never blocks on GPU contention.
     """
-    enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+    finalized_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
         maxsize=_ENHANCED_QUEUE_DEPTH,
     )
     write_errors: list[BaseException] = []
     frames_written = [0]  # mutable counter shared with write thread
 
     def _write_loop() -> None:
-        """Stage 3: consume enhanced frames, post-process, and write to encoder."""
+        """Stage 3: resize finalized frames and write to encoder (pure I/O)."""
         try:
             while True:
-                item = enhanced_queue.get()
+                item = finalized_queue.get()
                 if item is None:
                     break
-                frames_written[0] += _write_enhanced_frames(
-                    item, codeformer_restorer, stabilizer,
-                    output_width, output_height, config.target_profile,
-                    encoder.stdin,
-                    sharpen_strength=config.sharpen_strength if config.sharpen_enabled else 0.0,
+                frames_written[0] += _write_finalized_frames(
+                    item, output_width, output_height,
+                    config.target_profile, encoder.stdin,
                 )
         except Exception as exc:  # noqa: BLE001
             write_errors.append(exc)
@@ -796,8 +819,9 @@ def _process_frames_async(
     write_thread = threading.Thread(target=_write_loop, daemon=True)
     write_thread.start()
 
-    # Stage 2 (main thread): GPU inference — feeds enhanced_queue
+    # Stage 2 (main thread): GPU inference + all heavy post-processing
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
+    sharpen_strength = config.sharpen_strength if config.sharpen_enabled else 0.0
     last_reported_progress = -1
 
     try:
@@ -808,14 +832,26 @@ def _process_frames_async(
             )
             if enhanced_list is None:
                 break
-            enhanced_queue.put(enhanced_list)
+
+            # Face restore + temporal stabilize + sharpen on main GPU thread
+            finalized_list: list[np.ndarray] = []
+            for enhanced in enhanced_list:
+                if codeformer_restorer is not None:
+                    enhanced = codeformer_restorer.restore_faces(enhanced)
+                if stabilizer is not None:
+                    enhanced = stabilizer.stabilize(enhanced)
+                if sharpen_strength > 0:
+                    enhanced = apply_sharpening(enhanced, sharpen_strength)
+                finalized_list.append(enhanced)
+
+            finalized_queue.put(finalized_list)
 
             # Report progress from write thread's counter
             last_reported_progress = _report_stream_progress(
                 frames_written[0], total_frames, last_reported_progress, progress_callback,
             )
     finally:
-        enhanced_queue.put(None)  # signal write thread to stop
+        finalized_queue.put(None)  # signal write thread to stop
 
     write_thread.join()
     if write_errors:
