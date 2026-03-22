@@ -59,7 +59,7 @@ class SplitCompareWidget(QWidget):
         if not self.has_images():
             painter.fillRect(0, 0, w, h, QColor("#111122"))
             painter.setPen(QColor("#555"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "拖入视频后\n点击「生成预览」")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "拖入视频后\n勾选「自动生成预览」或按 Space")
             painter.end()
             return
 

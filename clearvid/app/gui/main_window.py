@@ -260,8 +260,13 @@ class MainWindow(QMainWindow):
             )
             # Auto-preview at slider position when enabled
             if self._preview_panel.is_auto_preview():
-                ts = self._preview_panel.current_timestamp()
-                self._run_preview(ts)
+                # Use singleShot so the file-selection flow finishes first.
+                QTimer.singleShot(
+                    100,
+                    lambda: self._run_preview(
+                        self._preview_panel.current_timestamp(),
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001
             self._preview_panel.set_video_info(f"\u26a0 无法解析: {exc}", 0)
             self._log_message(f"视频探测失败: {exc}")

@@ -73,12 +73,9 @@ class PreviewPanel(QWidget):
         self._auto_preview_cb.setToolTip(
             "勾选后，选择视频或拖动进度条后自动生成预览图"
         )
+        self._auto_preview_cb.setFixedWidth(120)
         self._auto_preview_cb.toggled.connect(self.auto_preview_changed.emit)
         slider_row.addWidget(self._auto_preview_cb)
-
-        self._preview_status = QLabel("")
-        self._preview_status.setStyleSheet("color: #9e9e9e; font-size: 11px;")
-        slider_row.addWidget(self._preview_status)
 
         layout.addLayout(slider_row)
 
@@ -91,7 +88,7 @@ class PreviewPanel(QWidget):
 
     def set_preview_loading(self, loading: bool) -> None:
         self._auto_preview_cb.setEnabled(not loading)
-        self._preview_status.setText("预览生成中..." if loading else "")
+        self._auto_preview_cb.setText("预览生成中..." if loading else "自动生成预览")
 
     def update_preview(
         self, original_bgr: np.ndarray, enhanced_bgr: np.ndarray
