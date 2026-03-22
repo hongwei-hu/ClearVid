@@ -701,8 +701,8 @@ def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
     """Collect up to *batch_size* frames.
 
     The first frame blocks indefinitely (waits for decode). Subsequent
-    frames are collected with a very short timeout so the GPU is not left
-    idle waiting for a full batch when decode is the bottleneck.
+    frames use a short timeout so the GPU gets a reasonably full batch
+    without waiting an entire decode cycle when frames trickle in slowly.
     """
     batch: list[bytes] = []
     # First frame: block until available
@@ -711,10 +711,10 @@ def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
         raw_queue.put(None)
         return batch
     batch.append(raw)
-    # Remaining frames: grab whatever is already queued
+    # Remaining frames: short timeout to allow a few more frames to arrive
     for _ in range(batch_size - 1):
         try:
-            raw = raw_queue.get_nowait()
+            raw = raw_queue.get(timeout=0.005)
         except queue.Empty:
             break
         if raw is None:
@@ -851,7 +851,11 @@ def _process_stream_frames(
 
     assert decoder.stdout is not None
     assert encoder.stdin is not None
-    _emit_progress(progress_callback, 18, "正在流式处理视频帧")
+    _emit_progress(
+        progress_callback, 18,
+        f"正在流式处理视频帧 (batch={config.batch_size}, "
+        f"{'async' if config.async_pipeline else 'sync'})",
+    )
 
     raw_queue, decode_errors, reader = _start_decode_thread(decoder.stdout, frame_size)
 
@@ -909,7 +913,7 @@ def _process_frames_sync(
     encoder.stdin.close()
 
 
-_ENHANCED_QUEUE_DEPTH = 4
+_ENHANCED_QUEUE_DEPTH = 8
 
 
 def _process_frames_async(
@@ -926,26 +930,40 @@ def _process_frames_async(
     total_frames: int | None,
     progress_callback: Callable[[int, str], None] | None,
 ) -> None:
-    """4-stage async pipeline for maximum GPU utilisation.
+    """Async pipeline for maximum GPU utilisation.
 
-    Stage 1 (thread):  FFmpeg decode → raw_queue          (already running)
-    Stage 2 (thread):  Super-resolution (GPU) → enhanced_queue
-    Stage 3 (main):    Face restore (GPU) + temporal stabilize (CPU async)
-                        + sharpen → finalized_queue
-    Stage 4 (thread):  Resize + encode ← finalized_queue  (I/O only)
+    When postprocessing is needed (face restore / stabilize / sharpen):
+      Stage 1 (thread):  FFmpeg decode → raw_queue
+      Stage 2 (thread):  Super-resolution (GPU) → enhanced_queue
+      Stage 3 (thread):  Face restore + stabilize + sharpen → finalized_queue
+      Stage 4 (thread):  Resize + encode ← finalized_queue
 
-    Stage 2 and Stage 3 run on separate threads, which means PyTorch
-    assigns them different CUDA streams.  While Stage 3 runs CPU-heavy
-    face detection, Stage 2's next super-res inference can execute on the
-    GPU concurrently — eliminating the idle gaps that cause sawtooth
-    utilisation patterns.
+    When postprocessing is completely disabled (FAST mode):
+      Stage 1 (thread):  FFmpeg decode → raw_queue
+      Stage 2 (thread):  Super-resolution (GPU) → finalized_queue  (direct)
+      Stage 4 (thread):  Resize + encode ← finalized_queue
+      (Stage 3 is skipped — no intermediate queue, no extra thread hop)
     """
-    enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
-        maxsize=_ENHANCED_QUEUE_DEPTH,
+    sharpen_strength = config.sharpen_strength if config.sharpen_enabled else 0.0
+    postprocess_needed = (
+        codeformer_restorer is not None
+        or stabilizer is not None
+        or sharpen_strength > 0
     )
-    finalized_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
-        maxsize=_ENHANCED_QUEUE_DEPTH,
-    )
+
+    # When postprocessing is a no-op, Stage 2 writes directly to
+    # finalized_queue, eliminating one queue + one thread.
+    if postprocess_needed:
+        enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+            maxsize=_ENHANCED_QUEUE_DEPTH,
+        )
+        finalized_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+            maxsize=_ENHANCED_QUEUE_DEPTH,
+        )
+    else:
+        finalized_queue = queue.Queue(maxsize=_ENHANCED_QUEUE_DEPTH)
+        enhanced_queue = finalized_queue  # alias — Stage 2 writes here directly
+
     enhance_errors: list[BaseException] = []
     write_errors: list[BaseException] = []
     frames_written = [0]  # mutable counter shared with write thread
@@ -995,77 +1013,76 @@ def _process_frames_async(
     )
 
     # -- Stage 3 (thread): face restore + stabilize + sharpen ----------------
-    sharpen_strength = config.sharpen_strength if config.sharpen_enabled else 0.0
     stage3_errors: list[BaseException] = []
+    postprocess_thread: threading.Thread | None = None
 
-    def _postprocess_loop() -> None:
-        """Face restore + temporal stabilize + sharpen, in its own thread.
+    if postprocess_needed:
+        def _postprocess_loop() -> None:
+            """Face restore + temporal stabilize + sharpen."""
+            _stab_pool: ThreadPoolExecutor | None = (
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix="stabilizer")
+                if stabilizer is not None else None
+            )
+            _stab_future: Future[np.ndarray] | None = None
 
-        Running Stage 3 as a thread instead of on the main thread allows
-        Python to interleave its CPU work with Stage 2's GPU work more
-        freely, reducing the sawtooth GPU utilisation pattern.
-        """
-        _stab_pool: ThreadPoolExecutor | None = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="stabilizer")
-            if stabilizer is not None else None
+            def _stabilize_and_sharpen(frame: np.ndarray) -> np.ndarray:
+                result = stabilizer.stabilize(frame)  # type: ignore[union-attr]
+                if sharpen_strength > 0:
+                    result = apply_sharpening(result, sharpen_strength)
+                return result
+
+            try:
+                while True:
+                    enhanced_list = enhanced_queue.get()
+                    if enhanced_list is None:
+                        break
+
+                    finalized_list: list[np.ndarray] = []
+                    for enhanced in enhanced_list:
+                        if codeformer_restorer is not None:
+                            enhanced = codeformer_restorer.restore_faces(enhanced)
+
+                        if _stab_future is not None:
+                            finalized_list.append(_stab_future.result())
+                            _stab_future = None
+
+                        if _stab_pool is not None:
+                            _stab_future = _stab_pool.submit(
+                                _stabilize_and_sharpen, enhanced,
+                            )
+                        else:
+                            if sharpen_strength > 0:
+                                enhanced = apply_sharpening(enhanced, sharpen_strength)
+                            finalized_list.append(enhanced)
+
+                    if finalized_list:
+                        finalized_queue.put(finalized_list)
+
+                if _stab_future is not None:
+                    finalized_queue.put([_stab_future.result()])
+            except Exception as exc:  # noqa: BLE001
+                stage3_errors.append(exc)
+            finally:
+                finalized_queue.put(None)
+                if _stab_pool is not None:
+                    _stab_pool.shutdown(wait=False)
+
+        postprocess_thread = threading.Thread(
+            target=_postprocess_loop, daemon=True, name="postprocess",
         )
-        _stab_future: Future[np.ndarray] | None = None
-
-        def _stabilize_and_sharpen(frame: np.ndarray) -> np.ndarray:
-            result = stabilizer.stabilize(frame)  # type: ignore[union-attr]
-            if sharpen_strength > 0:
-                result = apply_sharpening(result, sharpen_strength)
-            return result
-
-        try:
-            while True:
-                enhanced_list = enhanced_queue.get()
-                if enhanced_list is None:
-                    break
-
-                finalized_list: list[np.ndarray] = []
-                for enhanced in enhanced_list:
-                    if codeformer_restorer is not None:
-                        enhanced = codeformer_restorer.restore_faces(enhanced)
-
-                    if _stab_future is not None:
-                        finalized_list.append(_stab_future.result())
-                        _stab_future = None
-
-                    if _stab_pool is not None:
-                        _stab_future = _stab_pool.submit(
-                            _stabilize_and_sharpen, enhanced,
-                        )
-                    else:
-                        if sharpen_strength > 0:
-                            enhanced = apply_sharpening(enhanced, sharpen_strength)
-                        finalized_list.append(enhanced)
-
-                if finalized_list:
-                    finalized_queue.put(finalized_list)
-
-            if _stab_future is not None:
-                finalized_queue.put([_stab_future.result()])
-        except Exception as exc:  # noqa: BLE001
-            stage3_errors.append(exc)
-        finally:
-            finalized_queue.put(None)
-            if _stab_pool is not None:
-                _stab_pool.shutdown(wait=False)
-
-    postprocess_thread = threading.Thread(
-        target=_postprocess_loop, daemon=True, name="postprocess",
-    )
 
     # -- Start background stages ---------------------------------------------
     enhance_thread.start()
-    postprocess_thread.start()
+    if postprocess_thread is not None:
+        postprocess_thread.start()
     write_thread.start()
 
     # -- Main thread: progress reporting only --------------------------------
+    # Wait on the last producer thread (postprocess or enhance)
+    monitor_thread = postprocess_thread if postprocess_thread is not None else enhance_thread
     last_reported_progress = -1
-    while postprocess_thread.is_alive():
-        postprocess_thread.join(timeout=0.5)
+    while monitor_thread.is_alive():
+        monitor_thread.join(timeout=0.5)
         last_reported_progress = _report_stream_progress(
             frames_written[0], total_frames, last_reported_progress,
             progress_callback,
@@ -1078,7 +1095,8 @@ def _process_frames_async(
 
     # -- Join background threads ---------------------------------------------
     enhance_thread.join()
-    postprocess_thread.join()
+    if postprocess_thread is not None:
+        postprocess_thread.join()
     write_thread.join()
     if enhance_errors:
         raise enhance_errors[0]
