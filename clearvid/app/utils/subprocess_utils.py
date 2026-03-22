@@ -15,6 +15,8 @@ def run_command(command: list[str], cwd: Path | None = None) -> subprocess.Compl
         cwd=str(cwd) if cwd else None,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if completed.returncode != 0:

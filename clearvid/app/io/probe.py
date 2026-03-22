@@ -6,6 +6,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from clearvid.app.bootstrap.paths import (
+    REALESRGAN_WEIGHTS_DIR,
+    ffmpeg_path as _ffmpeg_path,
+    ffprobe_path as _ffprobe_path,
+)
 from clearvid.app.models.realesrgan_runner import inspect_realesrgan_runtime
 from clearvid.app.schemas.models import EnvironmentInfo, StreamInfo, VideoMetadata
 
@@ -15,19 +20,22 @@ def _which(binary_name: str) -> str | None:
 
 
 def _run_text(command: list[str]) -> str:
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    completed = subprocess.run(
+        command, capture_output=True, text=True, check=False,
+        encoding="utf-8", errors="replace",
+    )
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip() or completed.stderr.strip()
 
 
 def probe_video(input_path: Path) -> VideoMetadata:
-    ffprobe_path = _which("ffprobe")
-    if not ffprobe_path:
+    fp = _ffprobe_path() or _which("ffprobe")
+    if not fp:
         raise RuntimeError("ffprobe is not available on PATH")
 
     command = [
-        ffprobe_path,
+        fp,
         "-v",
         "error",
         "-show_format",
@@ -82,19 +90,21 @@ def probe_video(input_path: Path) -> VideoMetadata:
 
 
 def collect_environment_info() -> EnvironmentInfo:
-    ffmpeg_available = _which("ffmpeg") is not None
-    ffprobe_available = _which("ffprobe") is not None
+    ffmpeg_bin = _ffmpeg_path() or _which("ffmpeg")
+    ffprobe_bin = _ffprobe_path() or _which("ffprobe")
+    ffmpeg_available = ffmpeg_bin is not None
+    ffprobe_available = ffprobe_bin is not None
     nvidia_smi_available = _which("nvidia-smi") is not None
 
     ffmpeg_version = None
     ffmpeg_hwaccels: list[str] = []
     ffmpeg_encoders: list[str] = []
     if ffmpeg_available:
-        version_text = _run_text(["ffmpeg", "-hide_banner", "-version"])
+        version_text = _run_text([ffmpeg_bin, "-hide_banner", "-version"])
         ffmpeg_version = version_text.splitlines()[0] if version_text else None
-        hwaccel_text = _run_text(["ffmpeg", "-hide_banner", "-hwaccels"])
+        hwaccel_text = _run_text([ffmpeg_bin, "-hide_banner", "-hwaccels"])
         ffmpeg_hwaccels = _parse_hwaccels(hwaccel_text)
-        encoder_text = _run_text(["ffmpeg", "-hide_banner", "-encoders"])
+        encoder_text = _run_text([ffmpeg_bin, "-hide_banner", "-encoders"])
         ffmpeg_encoders = _parse_nvenc_encoders(encoder_text)
 
     gpu_name = None
@@ -115,7 +125,7 @@ def collect_environment_info() -> EnvironmentInfo:
                 gpu_name, gpu_driver_version, memory_text = parts[:3]
                 gpu_memory_mb = _to_int(memory_text)
 
-    realtime_weights_path = Path.cwd() / "weights" / "realesrgan"
+    realtime_weights_path = REALESRGAN_WEIGHTS_DIR
     realesrgan_available, realesrgan_message, torch_version, torch_cuda_available, torch_gpu_compatible = (
         inspect_realesrgan_runtime(realtime_weights_path)
     )
