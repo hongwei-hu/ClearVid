@@ -1,55 +1,111 @@
 # ClearVid
 
-ClearVid is a Windows-first Python project for enhancing real-world character video, targeting 480p and 720p sources and outputting 1080p or 4K results.
+ClearVid is a Windows-first video enhancement toolkit for real-world footage. It is designed around 480p and 720p inputs, with practical output targets such as 1080p, 4K, 2x scale, and 4x scale.
+
+The project now includes a usable CLI, a desktop GUI, automatic environment/bootstrap logic, model weight management, and a modern Real-ESRGAN based processing path with optional face restoration and post-processing.
 
 ## Current status
 
-- Project skeleton is in place.
-- FFmpeg and hardware capability probing are implemented.
-- CLI and a simple desktop GUI are implemented.
-- Batch job discovery and task planning are implemented.
-- Baseline FFmpeg enhancement backend is implemented for end-to-end validation.
-- Real-ESRGAN true backend is implemented and validated on the sample video.
-- CodeFormer face restoration is integrated into the Real-ESRGAN pipeline.
-- GUI now shows real processing stage and percentage progress during export.
-- Real-ESRGAN and CodeFormer video processing now uses a streaming raw-frame pipeline to reduce disk I/O without lowering output quality.
-- The GUI is directly launchable from Windows with the provided starter script.
-- Real-ESRGAN runtime detection is implemented, with automatic fallback to the baseline backend when the model runtime is unavailable.
+What is implemented in the current repository state:
+
+- Windows-first workflow for development and end-user launch.
+- CLI commands for environment inspection, probing, planning, single-file runs, batch runs, and GUI startup.
+- PySide6 desktop GUI with file management, preview, export queue, presets, history, environment diagnostics, and progress reporting.
+- Smart recommendation flow for target profile, quality mode, model, encoder, accelerator, and tile suggestions.
+- Automatic backend selection with fallback to baseline processing when model runtime is unavailable.
+- Real-ESRGAN backend with two upscale model paths: `general_v3` and `x4plus`.
+- Optional face restoration using either CodeFormer or GFPGAN.
+- Preprocessing controls for denoise, deblock, deinterlace, and colorspace normalization.
+- Post-processing controls for sharpening and optical-flow temporal stabilization.
+- 8-bit and 10-bit export pixel formats including `yuv420p`, `yuv420p10le`, and `p010le`.
+- Streaming raw-frame pipeline between FFmpeg and Python to reduce disk I/O without lowering export quality.
+- Async multi-stage processing pipeline with dynamic batching and TensorRT engine cache support.
+- First-run bootstrap flow for portable distributions, including dependency installation into `lib/`.
+- Weight download management for Real-ESRGAN, CodeFormer, GFPGAN, and facelib dependencies.
+
+Out of scope for the current version:
+
+- Frame interpolation is not implemented.
 
 ## Recommended environment
 
 - Windows 11
-- Python 3.11 or 3.12 recommended
-- FFmpeg with NVENC and NVDEC support available on PATH
-- NVIDIA GPU with recent drivers
+- Python 3.11 to 3.13
+- FFmpeg and FFprobe available either in the project root or on `PATH`
+- NVIDIA GPU with recent drivers for the Real-ESRGAN path
+- CUDA-capable PyTorch environment for GPU inference
 
-The currently configured project `.venv` is using Python 3.13 on this machine and is already working with the installed CUDA-compatible PyTorch build.
+The repository `pyproject.toml` currently supports Python `>=3.11,<3.14`.
 
-## Install
+## Installation
 
-Install the base toolchain:
+### Source install
+
+Create a virtual environment and install the base package:
 
 ```powershell
 py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install -e .
+```
+
+Install optional features as needed:
+
+```powershell
 python -m pip install -e .[gui,media]
-```
-
-When you are ready to integrate model inference:
-
-```powershell
 python -m pip install -e .[inference]
+python -m pip install -e .[acceleration]
+python -m pip install -e .[dev]
 ```
 
-## Commands
+Typical combinations:
 
-Probe a sample video:
+- CLI only: base package
+- GUI without AI inference: `.[gui,media]`
+- Full local workstation setup: `.[gui,media,inference,acceleration]`
+
+### Portable distribution build
+
+The repository includes a distribution builder for a self-contained Windows package:
 
 ```powershell
-clearvid probe samples\sample.mp4
+.\scripts\build_dist.ps1
 ```
+
+This creates a portable ZIP containing:
+
+- Python embeddable runtime
+- ClearVid source code
+- launcher scripts
+- FFmpeg binaries if found
+- placeholder `lib/`, `outputs/`, `weights/`, and `samples/` directories
+
+On first launch, the bootstrap launcher installs dependencies into `lib/` and then starts the GUI.
+
+## Launching
+
+### CLI entry points
+
+After installation, the following entry points are available:
+
+- `clearvid`
+- `clearvid-gui`
+
+### Windows launcher script
+
+The repository also includes a double-click launcher:
+
+```powershell
+.\Start_ClearVid_GUI.bat
+```
+
+That script automatically detects whether it should start in:
+
+- portable launcher mode, or
+- development GUI mode
+
+## CLI commands
 
 Inspect the local environment:
 
@@ -57,77 +113,129 @@ Inspect the local environment:
 clearvid env
 ```
 
-Run the baseline enhancement backend:
+Probe a video file:
 
 ```powershell
-clearvid run samples\sample.mp4 --target-profile fhd --backend baseline --output outputs\sample_fhd.mp4
+clearvid probe samples\sample.mp4
 ```
 
-Run a quick 20-second validation pass on a long sample:
+Generate an execution plan and smart recommendation:
 
 ```powershell
-clearvid run samples\sample.mp4 --target-profile fhd --backend baseline --preview-seconds 20 --output outputs\sample_fhd_preview.mp4
+clearvid plan samples\sample.mp4 outputs\sample_plan.mp4 --target-profile fhd --backend auto --quality-mode quality
 ```
 
-Batch a directory:
+Run a baseline validation export:
 
 ```powershell
-clearvid batch samples --target-profile fhd --backend baseline --output-dir outputs
+clearvid run samples\sample.mp4 --target-profile fhd --backend baseline --output outputs\sample_fhd_baseline.mp4
 ```
 
-Run a quick Real-ESRGAN + CodeFormer preview:
+Run a quick preview pass on the first 20 seconds:
 
 ```powershell
-clearvid run samples\sample.mp4 --target-profile fhd --backend realesrgan --preview-seconds 1 --output outputs\sample_fhd_realesrgan_codeformer_preview.mp4
+clearvid run samples\sample.mp4 --target-profile fhd --backend auto --preview-seconds 20 --output outputs\sample_preview.mp4
 ```
 
-Launch the GUI:
+Run Real-ESRGAN with the higher-quality `x4plus` model, GFPGAN face restoration, TensorRT, and 10-bit output:
+
+```powershell
+clearvid run samples\sample.mp4 --target-profile fhd --backend realesrgan --upscale-model x4plus --face-restore-model gfpgan --inference-accelerator tensorrt --output-pixel-format yuv420p10le --output outputs\sample_fhd_x4plus_10bit.mp4
+```
+
+Run a batch job for a folder:
+
+```powershell
+clearvid batch samples --target-profile fhd --backend auto --quality-mode balanced --output-dir outputs
+```
+
+Launch the GUI from the CLI:
 
 ```powershell
 clearvid gui
 ```
 
-Or on Windows, just run:
+Or directly:
 
 ```powershell
-.\Start_ClearVid_GUI.bat
+clearvid-gui
 ```
 
-## Current model runtime note
+## Model and runtime behavior
 
-The `.venv` environment in this repository is prepared for RTX 5090 compatible PyTorch, and the Real-ESRGAN true backend is available.
+### Available backends
 
-What is already ready:
+- `auto`: prefer Real-ESRGAN when the runtime is available, otherwise fall back
+- `realesrgan`: main quality path
+- `baseline`: FFmpeg-based validation/fallback path
 
-- `.venv` contains a CUDA-compatible PyTorch build with `sm_120` support.
-- ClearVid GUI and core dependencies are installed in `.venv`.
-- Real-ESRGAN related Python packages are installed in `.venv`.
-- ClearVid can auto-download the default `realesr-general-x4v3.pth` weight on first Real-ESRGAN run.
-- ClearVid can auto-download `codeformer.pth` and required facelib detection/parsing weights on first face-restoration run.
-- Auto backend selection now prefers Real-ESRGAN when the runtime is available.
+### Available upscale models
 
-Optional manual setup:
+- `general_v3`: lighter default path
+- `x4plus`: higher-quality RRDB path with heavier compute cost
 
-- You can still place custom Real-ESRGAN weights under [weights/README.zh-CN.md](weights/README.zh-CN.md)
-- You can also pre-place CodeFormer and facelib weights under [weights/README.zh-CN.md](weights/README.zh-CN.md)
-- The baseline backend remains available as a fallback path from both CLI and GUI
+### Available face restoration models
 
-Run a quick Real-ESRGAN preview:
+- `codeformer`: natural-looking restoration with fidelity control
+- `gfpgan`: stronger beautification/restoration alternative
+
+### Auto-downloaded weights
+
+ClearVid can download the following weights on demand:
+
+- `realesr-general-x4v3.pth`
+- `RealESRGAN_x4plus.pth`
+- `codeformer.pth`
+- `GFPGANv1.4.pth`
+- `detection_Resnet50_Final.pth`
+- `parsing_parsenet.pth`
+
+If you prefer to place weights manually, see [weights/README.zh-CN.md](weights/README.zh-CN.md).
+
+## GUI highlights
+
+The current GUI includes:
+
+- three-column main window with file list, preview, and export panel
+- built-in presets and smart parameter recommendations
+- queue export and batch export
+- live stage/progress updates during processing
+- history dialog and recent-file tracking
+- environment diagnostics and log panel
+- output naming and export configuration import/export
+- performance controls for accelerator selection, tile size, and batch size
+
+## Performance notes
+
+The current optimization strategy focuses on throughput without changing the final quality path.
+
+Notable implemented optimizations:
+
+- raw-frame streaming between FFmpeg and Python instead of PNG sequence round-trips
+- async three-stage processing pipeline
+- dynamic batch-size selection based on VRAM and model path
+- dedicated TensorRT engine cache directory under `weights/trt_cache`
+- GPU-first path with baseline fallback when inference runtime is not ready
+
+The `fast` quality mode is intentionally more aggressive about disabling expensive post-processing to improve throughput.
+
+## Project commands for contributors
+
+Run tests:
 
 ```powershell
-clearvid run samples\sample.mp4 --target-profile fhd --backend realesrgan --preview-seconds 2 --output outputs\sample_fhd_realesrgan_preview.mp4
+pytest
 ```
 
-## What the baseline backend does
+Run Ruff:
 
-The baseline backend is intentionally simple. It uses FFmpeg scaling and mild cleanup so the pipeline can be validated on a real sample before model integration.
+```powershell
+ruff check .
+```
 
-It is not the final quality path.
+## Notes
 
-The current final quality path is the Real-ESRGAN backend with optional CodeFormer face restoration. GUI and CLI both expose the face restoration switch and strength.
-
-## Performance note
-
-The current performance optimization does not trade away export quality.
-
-The quality path still uses the same enhancement models and the same output encoder settings. The optimization is in the transport layer: video frames are now streamed as raw frames between FFmpeg and Python instead of being written out as temporary PNG sequences. This reduces disk pressure and processing overhead while keeping the enhanced frame data lossless before final encoding.
+- This repository is Windows-first.
+- FFmpeg must be reachable for both CLI and GUI workflows.
+- The baseline backend remains useful as a diagnostic and fallback path, but it is not the primary quality target.
+- The main quality path in the current codebase is Real-ESRGAN with optional face restoration and post-processing.
