@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from pathlib import Path
 
 import cv2
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def validate_codeformer_environment(weights_path: Path | None = None) -> tuple[bool, str]:
@@ -38,10 +42,13 @@ class CodeFormerRestorer:
         fidelity_weight: float,
         upscale_factor: float,
         weights_root: Path,
+        *,
+        use_poisson_blend: bool = False,
     ) -> None:
         self._weights_root = weights_root
         self._fidelity_weight = fidelity_weight
         self._upscale_factor = upscale_factor
+        self._use_poisson_blend = use_poisson_blend
 
         torch, normalize, img2tensor, tensor2img, face_restore_helper_cls, codeformer_cls = (
             _load_codeformer_components()
@@ -90,24 +97,86 @@ class CodeFormerRestorer:
             return frame
 
         self._face_helper.align_warp_face()
-        for cropped_face in self._face_helper.cropped_faces:
-            cropped_face_t = self._img2tensor(cropped_face / 255.0, bgr2rgb=True, float32=True)
-            self._normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
-            cropped_face_t = cropped_face_t.unsqueeze(0).to(self._device)
 
-            try:
-                with self._torch.inference_mode():
-                    output = self._model(cropped_face_t, w=self._fidelity_weight, adain=True)[0]
-                    restored_face = self._tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
-                del output
-            except Exception:  # noqa: BLE001
-                restored_face = self._tensor2img(cropped_face_t, rgb2bgr=True, min_max=(-1, 1))
+        # --- Batch inference: stack all cropped faces into one tensor ---
+        cropped_list = self._face_helper.cropped_faces
+        batch_tensors = []
+        for cropped_face in cropped_list:
+            t = self._img2tensor(cropped_face / 255.0, bgr2rgb=True, float32=True)
+            self._normalize(t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+            batch_tensors.append(t)
 
-            self._face_helper.add_restored_face(restored_face.astype("uint8"))
+        batch = self._torch.stack(batch_tensors).to(self._device)
+
+        try:
+            with self._torch.inference_mode():
+                outputs = self._model(batch, w=self._fidelity_weight, adain=True)[0]
+            for i in range(outputs.shape[0]):
+                restored_face = self._tensor2img(
+                    outputs[i:i+1], rgb2bgr=True, min_max=(-1, 1),
+                )
+                self._face_helper.add_restored_face(restored_face.astype("uint8"))
+            del outputs
+        except Exception:  # noqa: BLE001
+            # Fallback: process one-by-one if batch fails (e.g. OOM)
+            for cropped_face_t in batch_tensors:
+                cropped_face_t = cropped_face_t.unsqueeze(0).to(self._device)
+                try:
+                    with self._torch.inference_mode():
+                        output = self._model(cropped_face_t, w=self._fidelity_weight, adain=True)[0]
+                        restored_face = self._tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
+                    del output
+                except Exception:  # noqa: BLE001
+                    restored_face = self._tensor2img(cropped_face_t, rgb2bgr=True, min_max=(-1, 1))
+                self._face_helper.add_restored_face(restored_face.astype("uint8"))
 
         self._face_helper.get_inverse_affine(None)
         restored_frame = self._face_helper.paste_faces_to_input_image(upsample_img=frame)
+
+        # --- Poisson blending for smoother face boundaries ---
+        if self._use_poisson_blend:
+            restored_frame = _poisson_blend_faces(frame, restored_frame, self._face_helper)
+
         return restored_frame
+
+
+def _poisson_blend_faces(
+    original: np.ndarray,
+    pasted: np.ndarray,
+    face_helper: object,
+) -> np.ndarray:
+    """Apply Poisson seamless-clone blending at each detected face location.
+
+    Falls back to *pasted* if blending fails (e.g. face near image border).
+    """
+    result = pasted.copy()
+    h, w = result.shape[:2]
+
+    for inv_affine in getattr(face_helper, "inverse_affine_matrices", []):
+        # Estimate face center from the inverse affine matrix
+        # Face region in 512x512 crop space → map center to output space
+        face_center_crop = np.array([[256.0, 256.0, 1.0]])
+        mapped = (inv_affine @ face_center_crop.T).T[0]
+        cx, cy = int(mapped[0]), int(mapped[1])
+        cx = max(1, min(cx, w - 2))
+        cy = max(1, min(cy, h - 2))
+
+        # Build an elliptical mask covering the face region
+        face_size = int(256 * np.linalg.norm(inv_affine[:, 0]))
+        face_size = max(20, min(face_size, min(h, w) // 2))
+        mask = np.zeros((h, w, 3), dtype=np.uint8)
+        cv2.ellipse(
+            mask, (cx, cy), (face_size, int(face_size * 1.3)),
+            0, 0, 360, (255, 255, 255), -1,
+        )
+
+        try:
+            result = cv2.seamlessClone(pasted, result, mask, (cx, cy), cv2.NORMAL_CLONE)
+        except cv2.error:
+            # Blending can fail if center is too close to border
+            pass
+
+    return result
 
 
 def ensure_codeformer_weights(weights_path: Path) -> Path:

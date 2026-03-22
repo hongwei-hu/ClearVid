@@ -39,6 +39,11 @@ class InferenceAccelerator(str, Enum):
     TENSORRT = "tensorrt"
 
 
+class FaceRestoreModel(str, Enum):
+    CODEFORMER = "codeformer"
+    GFPGAN = "gfpgan"
+
+
 class HardwareProfile(str, Enum):
     AUTO = "auto"
     HIGH_END = "high_end"
@@ -105,6 +110,8 @@ class EnhancementConfig(BaseModel):
     upscale_model: UpscaleModel = UpscaleModel.AUTO
     face_restore_enabled: bool = True
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
+    face_restore_model: FaceRestoreModel = FaceRestoreModel.CODEFORMER
+    face_poisson_blend: bool = False
     temporal_stabilize_enabled: bool = True
     temporal_stabilize_strength: float = Field(default=0.6, ge=0.0, le=1.0)
     preprocess_denoise: bool = True
@@ -112,7 +119,9 @@ class EnhancementConfig(BaseModel):
     preprocess_deinterlace: str = Field(default="auto", pattern=r"^(auto|off)$")
     preprocess_colorspace_normalize: bool = True
     denoise_strength: float = Field(default=0.08, ge=0.0, le=1.0)
+    sharpen_enabled: bool = True
     sharpen_strength: float = Field(default=0.12, ge=0.0, le=1.0)
+    color_correction_enabled: bool = False
     tile_size: int = 0
     tile_pad: int = 16
     batch_size: int = 4
@@ -124,7 +133,9 @@ class EnhancementConfig(BaseModel):
     preserve_metadata: bool = True
     encoder: str = "hevc_nvenc"
     encoder_preset: str = "p5"
+    encoder_crf: int | None = None
     video_bitrate: str | None = None
+    output_pixel_format: str = "yuv420p"
     hardware_profile: HardwareProfile = HardwareProfile.AUTO
     preview_seconds: int | None = None
     dry_run: bool = False
