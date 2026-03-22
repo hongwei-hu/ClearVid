@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import queue
 import shutil
 import tempfile
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -96,7 +98,7 @@ def run_realesrgan_video(
     weights_dir = Path.cwd() / "weights" / "realesrgan"
     model_path = ensure_realesrgan_weights(weights_dir)
     _emit_progress(progress_callback, 10, "正在初始化 Real-ESRGAN")
-    upsampler = _build_upsampler(config, model_path)
+    upsampler = _build_upsampler(config, model_path, metadata.width, metadata.height)
     _emit_progress(progress_callback, 14, "正在初始化人脸修复")
     codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
 
@@ -153,7 +155,9 @@ def _load_runtime_components() -> tuple[type, type, object]:
     return realesrgan_utils.RealESRGANer, srvgg_arch.SRVGGNetCompact, download_util.load_file_from_url
 
 
-def _build_upsampler(config: EnhancementConfig, model_path: Path) -> object:
+def _build_upsampler(
+    config: EnhancementConfig, model_path: Path, input_width: int, input_height: int,
+) -> object:
     real_esrganer_cls, srvgg_cls, _ = _load_runtime_components()
     model = srvgg_cls(
         num_in_ch=3,
@@ -163,11 +167,12 @@ def _build_upsampler(config: EnhancementConfig, model_path: Path) -> object:
         upscale=DEFAULT_MODEL_SCALE,
         act_type="prelu",
     )
+    tile = _resolve_tile_size(config.tile_size, input_width, input_height, config.fp16_enabled)
     return real_esrganer_cls(
         scale=DEFAULT_MODEL_SCALE,
         model_path=str(model_path),
         model=model,
-        tile=config.tile_size,
+        tile=tile,
         tile_pad=config.tile_pad,
         pre_pad=0,
         half=config.fp16_enabled,
@@ -388,6 +393,142 @@ def _build_encode_command(
     return command
 
 
+_FRAME_QUEUE_DEPTH = 8
+
+
+def _resolve_tile_size(config_tile_size: int, width: int, height: int, fp16: bool) -> int:
+    """Return effective tile size. 0 = auto based on VRAM."""
+    if config_tile_size > 0:
+        return config_tile_size
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 512
+        vram_mb = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return 512
+    megapixels = (width * height) / 1_000_000
+    estimated_mb = int(megapixels * (2000 if fp16 else 4000))
+    if estimated_mb < vram_mb * 0.5:
+        return 0
+    return 512
+
+
+def _start_decode_thread(
+    decoder_stdout: object,
+    frame_size: int,
+) -> tuple[queue.Queue, list[BaseException], threading.Thread]:
+    raw_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_FRAME_QUEUE_DEPTH)
+    errors: list[BaseException] = []
+
+    def _loop() -> None:
+        try:
+            while True:
+                raw = _read_exact_bytes(decoder_stdout, frame_size)
+                if raw is None:
+                    break
+                raw_queue.put(raw)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            raw_queue.put(None)
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return raw_queue, errors, thread
+
+
+def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
+    batch: list[bytes] = []
+    for _ in range(batch_size):
+        raw = raw_queue.get()
+        if raw is None:
+            raw_queue.put(None)  # preserve sentinel for next caller
+            break
+        batch.append(raw)
+    return batch
+
+
+def _enhance_frames_batch(
+    frames: list[np.ndarray],
+    upsampler: object,
+    outscale: float,
+) -> list[np.ndarray]:
+    """Batch-enhance multiple frames bypassing per-frame overhead."""
+    import torch
+
+    tensors = []
+    for frame in frames:
+        img = frame.astype(np.float32) / 255.0
+        tensors.append(torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float())
+
+    batch = torch.stack(tensors).to(upsampler.device)
+    if upsampler.half:
+        batch = batch.half()
+
+    with torch.inference_mode():
+        output = upsampler.model(batch)
+
+    results: list[np.ndarray] = []
+    factor = outscale / upsampler.scale
+    need_resize = abs(factor - 1.0) > 1e-6
+    for i in range(output.shape[0]):
+        out = output[i].float().cpu().clamp_(0, 1).numpy()
+        out = np.transpose(out[[2, 1, 0], :, :], (1, 2, 0))
+        if need_resize:
+            h, w = out.shape[:2]
+            out = cv2.resize(
+                out, (max(1, round(w * factor)), max(1, round(h * factor))), interpolation=cv2.INTER_LANCZOS4,
+            )
+        results.append((out * 255.0).round().astype(np.uint8))
+    return results
+
+
+def _fetch_enhanced_frames(
+    raw_queue: queue.Queue,
+    use_batching: bool,
+    batch_size: int,
+    height: int,
+    width: int,
+    upsampler: object,
+    outscale: float,
+) -> list[np.ndarray] | None:
+    """Fetch and enhance the next frame(s). Returns None at end of stream."""
+    if use_batching:
+        batch_raw = _collect_batch(raw_queue, batch_size)
+        if not batch_raw:
+            return None
+        images = [np.frombuffer(r, dtype=np.uint8).reshape((height, width, 3)) for r in batch_raw]
+        return _enhance_frames_batch(images, upsampler, outscale)
+
+    raw_frame = raw_queue.get()
+    if raw_frame is None:
+        return None
+    image = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width, 3))
+    enhanced, _ = upsampler.enhance(image, outscale=outscale)
+    return [enhanced]
+
+
+def _write_enhanced_frames(
+    enhanced_list: list[np.ndarray],
+    codeformer_restorer: CodeFormerRestorer | None,
+    output_width: int,
+    output_height: int,
+    target_profile: TargetProfile,
+    encoder_stdin: object,
+) -> int:
+    """Post-process and write frames to encoder. Returns count written."""
+    count = 0
+    for enhanced in enhanced_list:
+        if codeformer_restorer is not None:
+            enhanced = codeformer_restorer.restore_faces(enhanced)
+        finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
+        encoder_stdin.write(np.ascontiguousarray(finalized).tobytes())
+        count += 1
+    return count
+
+
 def _process_stream_frames(
     config: EnhancementConfig,
     metadata: VideoMetadata,
@@ -402,34 +543,33 @@ def _process_stream_frames(
 ) -> None:
     frame_size = metadata.width * metadata.height * 3
     total_frames = _estimate_total_frames(metadata, config.preview_seconds)
-    processed_frames = 0
-    last_reported_progress = -1
+    use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
 
     assert decoder.stdout is not None
     assert encoder.stdin is not None
     _emit_progress(progress_callback, 18, "正在流式处理视频帧")
 
+    raw_queue, decode_errors, reader = _start_decode_thread(decoder.stdout, frame_size)
+    processed_frames = 0
+    last_reported_progress = -1
+
     while True:
-        raw_frame = _read_exact_bytes(decoder.stdout, frame_size)
-        if raw_frame is None:
+        enhanced_list = _fetch_enhanced_frames(
+            raw_queue, use_batching, config.batch_size, metadata.height, metadata.width, upsampler, outscale,
+        )
+        if enhanced_list is None:
             break
-
-        image = np.frombuffer(raw_frame, dtype=np.uint8).reshape((metadata.height, metadata.width, 3))
-        enhanced, _ = upsampler.enhance(image, outscale=outscale)
-        if codeformer_restorer is not None:
-            enhanced = codeformer_restorer.restore_faces(enhanced)
-        finalized = _resize_for_target(enhanced, output_width, output_height, config.target_profile)
-        encoder.stdin.write(np.ascontiguousarray(finalized).tobytes())
-
-        processed_frames += 1
+        processed_frames += _write_enhanced_frames(
+            enhanced_list, codeformer_restorer, output_width, output_height, config.target_profile, encoder.stdin,
+        )
         last_reported_progress = _report_stream_progress(
-            processed_frames,
-            total_frames,
-            last_reported_progress,
-            progress_callback,
+            processed_frames, total_frames, last_reported_progress, progress_callback,
         )
 
     encoder.stdin.close()
+    reader.join()
+    if decode_errors:
+        raise decode_errors[0]
 
 
 def _report_stream_progress(

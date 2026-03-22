@@ -96,7 +96,7 @@ class CodeFormerRestorer:
             cropped_face_t = cropped_face_t.unsqueeze(0).to(self._device)
 
             try:
-                with self._torch.no_grad():
+                with self._torch.inference_mode():
                     output = self._model(cropped_face_t, w=self._fidelity_weight, adain=True)[0]
                     restored_face = self._tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
                 del output
@@ -107,7 +107,6 @@ class CodeFormerRestorer:
 
         self._face_helper.get_inverse_affine(None)
         restored_frame = self._face_helper.paste_faces_to_input_image(upsample_img=frame)
-        self._torch.cuda.empty_cache()
         return restored_frame
 
 
