@@ -10,7 +10,7 @@ from rich.table import Table
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.pipeline import build_execution_plan
-from clearvid.app.schemas.models import BackendType, EnhancementConfig, QualityMode, TargetProfile
+from clearvid.app.schemas.models import BackendType, EnhancementConfig, QualityMode, TargetProfile, UpscaleModel
 from clearvid.app.task_queue import discover_video_files
 
 app = typer.Typer(help="ClearVid command line interface")
@@ -73,6 +73,7 @@ def run(
     output_path: Path = typer.Option(..., "--output", help="Output video path"),
     target_profile: TargetProfile = typer.Option(TargetProfile.FHD),
     backend: BackendType = typer.Option(BackendType.AUTO),
+    upscale_model: UpscaleModel = typer.Option(UpscaleModel.AUTO, help="Super-resolution model (auto/general_v3/x4plus)"),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
     preserve_audio: bool = typer.Option(True),
     preserve_subtitles: bool = typer.Option(True),
@@ -89,6 +90,7 @@ def run(
         output_path=output_path,
         target_profile=target_profile,
         backend=backend,
+        upscale_model=upscale_model,
         quality_mode=quality_mode,
         preserve_audio=preserve_audio,
         preserve_subtitles=preserve_subtitles,
@@ -110,6 +112,7 @@ def batch(
     output_dir: Path = typer.Option(..., "--output-dir", help="Batch output root"),
     target_profile: TargetProfile = typer.Option(TargetProfile.FHD),
     backend: BackendType = typer.Option(BackendType.AUTO),
+    upscale_model: UpscaleModel = typer.Option(UpscaleModel.AUTO, help="Super-resolution model (auto/general_v3/x4plus)"),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
     face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
@@ -127,6 +130,7 @@ def batch(
         output_path=output_dir / files[0].with_suffix(".mp4").name,
         target_profile=target_profile,
         backend=backend,
+        upscale_model=upscale_model,
         quality_mode=quality_mode,
         face_restore_enabled=face_restore_enabled,
         face_restore_strength=face_restore_strength,

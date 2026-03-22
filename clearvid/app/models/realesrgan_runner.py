@@ -13,12 +13,33 @@ import numpy as np
 
 from clearvid.app.models.codeformer_runner import CodeFormerRestorer
 from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
-from clearvid.app.schemas.models import EnhancementConfig, TargetProfile, VideoMetadata
+from clearvid.app.schemas.models import EnhancementConfig, QualityMode, TargetProfile, UpscaleModel, VideoMetadata
 from clearvid.app.utils.subprocess_utils import run_command
 
-DEFAULT_MODEL_FILENAME = "realesr-general-x4v3.pth"
-DEFAULT_MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
 DEFAULT_MODEL_SCALE = 4
+
+# ---------------------------------------------------------------------------
+# Model registry — each entry describes architecture, weights, and download URL
+# ---------------------------------------------------------------------------
+
+_MODEL_REGISTRY: dict[str, dict] = {
+    "general_v3": {
+        "filename": "realesr-general-x4v3.pth",
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        "arch": "srvgg",
+        "scale": 4,
+    },
+    "x4plus": {
+        "filename": "RealESRGAN_x4plus.pth",
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "arch": "rrdb",
+        "scale": 4,
+    },
+}
+
+# Backward-compatible aliases
+DEFAULT_MODEL_FILENAME = _MODEL_REGISTRY["general_v3"]["filename"]
+DEFAULT_MODEL_URL = _MODEL_REGISTRY["general_v3"]["url"]
 
 
 def find_realesrgan_weights(weights_path: Path | None) -> list[Path]:
@@ -97,9 +118,11 @@ def run_realesrgan_video(
 ) -> None:
     _emit_progress(progress_callback, 6, "正在准备 Real-ESRGAN 权重")
     weights_dir = Path.cwd() / "weights" / "realesrgan"
-    model_path = ensure_realesrgan_weights(weights_dir)
-    _emit_progress(progress_callback, 10, "正在初始化 Real-ESRGAN")
-    upsampler = _build_upsampler(config, model_path, metadata.width, metadata.height)
+    model_key = resolve_upscale_model(config.upscale_model, config.quality_mode)
+    model_path = ensure_realesrgan_weights(weights_dir, model_key)
+    model_label = _MODEL_REGISTRY[model_key]["filename"]
+    _emit_progress(progress_callback, 10, f"正在初始化 Real-ESRGAN ({model_label})")
+    upsampler = _build_upsampler(config, model_path, model_key, metadata.width, metadata.height)
     _emit_progress(progress_callback, 12, "正在初始化人脸修复")
     codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
     _emit_progress(progress_callback, 14, "正在初始化时序稳定器")
@@ -129,22 +152,30 @@ def run_realesrgan_video(
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def ensure_realesrgan_weights(weights_path: Path) -> Path:
+def ensure_realesrgan_weights(weights_path: Path, model_key: str = "general_v3") -> Path:
+    """Ensure weights for *model_key* exist, downloading if needed."""
     weights_path.mkdir(parents=True, exist_ok=True)
-    discovered = find_realesrgan_weights(weights_path)
-    if discovered:
-        return discovered[0]
+    entry = _MODEL_REGISTRY[model_key]
+    target = weights_path / entry["filename"]
+    if target.exists():
+        return target
 
-    _, _, load_file_from_url = _load_runtime_components()
+    # Fallback: check for any .pth already present (backward compat)
+    discovered = find_realesrgan_weights(weights_path)
+    for p in discovered:
+        if p.name == entry["filename"]:
+            return p
+
+    _, _, _, load_file_from_url = _load_runtime_components()
     try:
         downloaded_path = load_file_from_url(
-            url=DEFAULT_MODEL_URL,
+            url=entry["url"],
             model_dir=str(weights_path),
             progress=True,
-            file_name=DEFAULT_MODEL_FILENAME,
+            file_name=entry["filename"],
         )
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"自动下载 Real-ESRGAN 权重失败: {exc}") from exc
+        raise RuntimeError(f"自动下载 Real-ESRGAN 权重失败 ({entry['filename']}): {exc}") from exc
 
     model_path = Path(downloaded_path)
     if not model_path.exists():
@@ -152,28 +183,57 @@ def ensure_realesrgan_weights(weights_path: Path) -> Path:
     return model_path
 
 
-def _load_runtime_components() -> tuple[type, type, object]:
+def _load_runtime_components() -> tuple[type, type, type, object]:
     realesrgan_utils = importlib.import_module("realesrgan.utils")
     srvgg_arch = importlib.import_module("realesrgan.archs.srvgg_arch")
+    rrdb_arch = importlib.import_module("basicsr.archs.rrdbnet_arch")
     download_util = importlib.import_module("basicsr.utils.download_util")
-    return realesrgan_utils.RealESRGANer, srvgg_arch.SRVGGNetCompact, download_util.load_file_from_url
+    return (
+        realesrgan_utils.RealESRGANer,
+        srvgg_arch.SRVGGNetCompact,
+        rrdb_arch.RRDBNet,
+        download_util.load_file_from_url,
+    )
+
+
+def resolve_upscale_model(upscale_model: UpscaleModel, quality_mode: QualityMode) -> str:
+    """Resolve AUTO to a concrete model key based on quality mode."""
+    if upscale_model != UpscaleModel.AUTO:
+        return upscale_model.value
+    if quality_mode == QualityMode.QUALITY:
+        return "x4plus"
+    return "general_v3"
 
 
 def _build_upsampler(
-    config: EnhancementConfig, model_path: Path, input_width: int, input_height: int,
+    config: EnhancementConfig, model_path: Path, model_key: str,
+    input_width: int, input_height: int,
 ) -> object:
-    real_esrganer_cls, srvgg_cls, _ = _load_runtime_components()
-    model = srvgg_cls(
-        num_in_ch=3,
-        num_out_ch=3,
-        num_feat=64,
-        num_conv=32,
-        upscale=DEFAULT_MODEL_SCALE,
-        act_type="prelu",
-    )
+    real_esrganer_cls, srvgg_cls, rrdb_cls, _ = _load_runtime_components()
+    entry = _MODEL_REGISTRY[model_key]
+
+    if entry["arch"] == "rrdb":
+        model = rrdb_cls(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=entry["scale"],
+        )
+    else:
+        model = srvgg_cls(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_conv=32,
+            upscale=entry["scale"],
+            act_type="prelu",
+        )
+
     tile = _resolve_tile_size(config.tile_size, input_width, input_height, config.fp16_enabled)
     return real_esrganer_cls(
-        scale=DEFAULT_MODEL_SCALE,
+        scale=entry["scale"],
         model_path=str(model_path),
         model=model,
         tile=tile,
