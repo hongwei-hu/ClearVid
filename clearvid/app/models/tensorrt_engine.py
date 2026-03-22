@@ -36,6 +36,7 @@ def accelerate_model(
     *,
     fp16: bool = True,
     tile_size: int = 512,
+    batch_size: int = 1,
     cache_dir: Path | None = None,
 ) -> object:
     """Wrap *model* with the requested accelerator.  Returns the (possibly
@@ -51,7 +52,7 @@ def accelerate_model(
         return _apply_torch_compile(model)
 
     if accelerator == InferenceAccelerator.TENSORRT:
-        return _apply_tensorrt(model, fp16=fp16, tile_size=tile_size, cache_dir=cache_dir)
+        return _apply_tensorrt(model, fp16=fp16, tile_size=tile_size, batch_size=batch_size, cache_dir=cache_dir)
 
     return model
 
@@ -93,6 +94,7 @@ def _apply_tensorrt(
     *,
     fp16: bool,
     tile_size: int,
+    batch_size: int = 1,
     cache_dir: Path | None,
 ) -> object:
     """Export to ONNX, then build/load a TensorRT engine."""
@@ -109,12 +111,14 @@ def _apply_tensorrt(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        engine_path = _get_or_build_engine(model, fp16=fp16, tile_size=tile_size, cache_dir=cache_dir)
+        engine_path = _get_or_build_engine(
+            model, fp16=fp16, tile_size=tile_size, batch_size=batch_size, cache_dir=cache_dir,
+        )
         wrapper = _TensorRTModelWrapper(engine_path, fp16=fp16)
         logger.info("已启用 TensorRT 加速 (engine: %s)", engine_path.name)
         return wrapper
     except Exception as exc:  # noqa: BLE001
-        logger.warning("TensorRT 引擎构建失败，回退到标准推理: %s", exc)
+        logger.warning("TensorRT 引擎构建失败，回退到标准推理: %s", exc, exc_info=True)
         return model
 
 
@@ -123,13 +127,14 @@ def _get_or_build_engine(
     *,
     fp16: bool,
     tile_size: int,
+    batch_size: int = 1,
     cache_dir: Path,
 ) -> Path:
     """Return path to a cached TRT engine, building one if necessary."""
     import torch
 
     # Deterministic cache key from model state + build params
-    key_data = f"tile{tile_size}_fp16{fp16}"
+    key_data = f"tile{tile_size}_fp16{fp16}_batch{batch_size}"
     state_bytes = str(sum(p.numel() for p in model.parameters())).encode()
     digest = hashlib.sha256(state_bytes + key_data.encode()).hexdigest()[:16]
     engine_path = cache_dir / f"realesrgan_{digest}.engine"
@@ -141,8 +146,8 @@ def _get_or_build_engine(
     # Step 1: export ONNX
     onnx_path = cache_dir / f"realesrgan_{digest}.onnx"
     if not onnx_path.exists():
-        logger.info("正在导出 ONNX 模型 (tile=%d) ...", tile_size)
-        dummy = torch.randn(1, 3, tile_size, tile_size).to(next(model.parameters()).device)
+        logger.info("正在导出 ONNX 模型 (tile=%d, batch=%d) ...", tile_size, batch_size)
+        dummy = torch.randn(batch_size, 3, tile_size, tile_size).to(next(model.parameters()).device)
         if fp16:
             dummy = dummy.half()
             model = model.half()
@@ -153,13 +158,16 @@ def _get_or_build_engine(
             opset_version=17,
             input_names=["input"],
             output_names=["output"],
-            dynamic_axes={"input": {2: "h", 3: "w"}, "output": {2: "h4", 3: "w4"}},
+            dynamic_axes={
+                "input": {0: "batch", 2: "h", 3: "w"},
+                "output": {0: "batch", 2: "h4", 3: "w4"},
+            },
         )
         logger.info("ONNX 导出完成: %s", onnx_path.name)
 
     # Step 2: build TensorRT engine
     logger.info("正在构建 TensorRT 引擎 (首次可能需要几分钟) ...")
-    _build_trt_engine(onnx_path, engine_path, fp16=fp16, tile_size=tile_size)
+    _build_trt_engine(onnx_path, engine_path, fp16=fp16, tile_size=tile_size, batch_size=batch_size)
     logger.info("TensorRT 引擎构建完成: %s", engine_path.name)
     return engine_path
 
@@ -170,6 +178,7 @@ def _build_trt_engine(
     *,
     fp16: bool,
     tile_size: int,
+    batch_size: int = 1,
 ) -> None:
     """Build a TensorRT engine from an ONNX model."""
     import tensorrt as trt
@@ -185,20 +194,21 @@ def _build_trt_engine(
             raise RuntimeError(f"ONNX 解析失败:\n{errors}")
 
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1 GB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4 GB
 
     if fp16:
         config.set_flag(trt.BuilderFlag.FP16)
 
-    # Dynamic shape profile
+    # Dynamic shape profile — support variable batch, height, width
     profile = builder.create_optimization_profile()
     min_hw = max(64, tile_size // 4)
     max_hw = tile_size * 2
+    max_batch = max(batch_size * 2, 32)
     profile.set_shape(
         "input",
         min=(1, 3, min_hw, min_hw),
-        opt=(1, 3, tile_size, tile_size),
-        max=(1, 3, max_hw, max_hw),
+        opt=(batch_size, 3, tile_size, tile_size),
+        max=(max_batch, 3, max_hw, max_hw),
     )
     config.add_optimization_profile(profile)
 

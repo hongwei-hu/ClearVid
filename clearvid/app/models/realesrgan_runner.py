@@ -215,16 +215,20 @@ def run_realesrgan_video(
     if accel != InferenceAccelerator.NONE:
         _emit_progress(progress_callback, 11, f"正在应用推理加速: {accel_label}")
         t_accel = time.perf_counter()
+        # tile_size=0 means whole-frame; use input size for TRT engine shape
+        trt_tile = config.tile_size if config.tile_size > 0 else max(metadata.width, metadata.height)
         upsampler.model = accelerate_model(
             upsampler.model,
             accel,
             fp16=config.fp16_enabled,
-            tile_size=config.tile_size or 512,
+            tile_size=trt_tile,
+            batch_size=config.batch_size,
             cache_dir=TRT_CACHE_DIR,
         )
+        accel_actual = "TensorRT" if hasattr(upsampler.model, '_engine') else "PyTorch (回退)"
         _emit_progress(
             progress_callback, 11,
-            f"推理加速就绪: {accel_label} ({time.perf_counter() - t_accel:.1f}s)",
+            f"推理加速就绪: {accel_actual} ({time.perf_counter() - t_accel:.1f}s)",
         )
 
     _emit_progress(progress_callback, 12, "正在初始化人脸修复")
@@ -698,6 +702,8 @@ def _build_decode_command(config: EnhancementConfig, metadata: VideoMetadata) ->
         "error",
         "-hwaccel",
         "auto",
+        "-threads",
+        "0",
         "-i",
         str(config.input_path),
     ]
@@ -761,7 +767,7 @@ def _build_encode_command(
     return command
 
 
-_FRAME_QUEUE_DEPTH = 16
+_FRAME_QUEUE_DEPTH = 64
 
 
 def _resolve_tile_size(config_tile_size: int, width: int, height: int, fp16: bool) -> int:
@@ -851,24 +857,29 @@ def _enhance_frames_batch(
     """Batch-enhance multiple frames bypassing per-frame overhead."""
     import torch
 
+    # Vectorized CPU preprocessing: BGR→RGB, HWC→CHW, normalize, stack
     tensors = []
     for frame in frames:
-        img = frame.astype(np.float32) / 255.0
-        tensors.append(torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float())
+        img = frame[:, :, ::-1].astype(np.float32) * (1.0 / 255.0)  # BGR→RGB + normalize
+        tensors.append(torch.from_numpy(np.ascontiguousarray(img).transpose(2, 0, 1)))
 
-    batch = torch.stack(tensors).to(upsampler.device)
+    batch = torch.stack(tensors)
     if upsampler.half:
         batch = batch.half()
+    batch = batch.to(upsampler.device, non_blocking=True)
 
     with torch.inference_mode():
         output = upsampler.model(batch)
 
+    # Batch GPU→CPU transfer (single DMA instead of per-frame)
+    output_cpu = output.float().cpu().clamp_(0, 1)
+
     results: list[np.ndarray] = []
     factor = outscale / upsampler.scale
     need_resize = abs(factor - 1.0) > 1e-6
-    for i in range(output.shape[0]):
-        out = output[i].float().cpu().clamp_(0, 1).numpy()
-        out = np.transpose(out[[2, 1, 0], :, :], (1, 2, 0))
+    for i in range(output_cpu.shape[0]):
+        out = output_cpu[i].numpy()
+        out = np.ascontiguousarray(out[[2, 1, 0], :, :].transpose(1, 2, 0))  # RGB CHW→BGR HWC
         if need_resize:
             h, w = out.shape[:2]
             out = cv2.resize(
@@ -1047,7 +1058,7 @@ def _process_frames_sync(
     encoder.stdin.close()
 
 
-_ENHANCED_QUEUE_DEPTH = 8
+_ENHANCED_QUEUE_DEPTH = 16
 
 
 def _process_frames_async(
@@ -1118,6 +1129,15 @@ def _process_frames_async(
     write_errors: list[BaseException] = []
     frames_written = [0]
 
+    # -- Diagnostics counters (shared across threads) -----------------------
+    _diag_enhance_batches = [0]
+    _diag_enhance_frames = [0]
+    _diag_enhance_infer_ms = [0.0]
+    _diag_enhance_wait_ms = [0.0]
+    _diag_write_frames = [0]
+    _diag_write_ms = [0.0]
+    _diag_batch_sizes: list[int] = []
+
     # -- Stage 2: super-resolution thread -----------------------------------
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
 
@@ -1126,12 +1146,19 @@ def _process_frames_async(
             while not abort.is_set():
                 if control is not None:
                     control.check()
+                t_wait = time.perf_counter()
                 enhanced_list = _fetch_enhanced_frames(
                     raw_queue, use_batching, config.batch_size,
                     metadata.height, metadata.width, upsampler, outscale,
                 )
+                t_done = time.perf_counter()
                 if enhanced_list is None:
                     break
+                n = len(enhanced_list)
+                _diag_enhance_infer_ms[0] += (t_done - t_wait) * 1000
+                _diag_enhance_batches[0] += 1
+                _diag_enhance_frames[0] += n
+                _diag_batch_sizes.append(n)
                 if not _safe_put(enhanced_queue, enhanced_list):
                     break
         except ExportCancelled:
@@ -1156,10 +1183,14 @@ def _process_frames_async(
                 ok, item = _safe_get(finalized_queue)
                 if not ok or item is None:
                     break
-                frames_written[0] += _write_finalized_frames(
+                t_w = time.perf_counter()
+                n = _write_finalized_frames(
                     item, output_width, output_height,
                     config.target_profile, encoder.stdin,
                 )
+                _diag_write_ms[0] += (time.perf_counter() - t_w) * 1000
+                _diag_write_frames[0] += n
+                frames_written[0] += n
         except Exception as exc:  # noqa: BLE001
             write_errors.append(exc)
             abort.set()
@@ -1254,9 +1285,12 @@ def _process_frames_async(
     _preview_interval_frames = int(fps * 60)  # ~60 seconds of video
     _last_preview_at = 0
     _t_async_start = time.perf_counter()
+    _last_diag_time = _t_async_start
+    _DIAG_INTERVAL = 10.0  # log diagnostics every 10 seconds
     while monitor_thread.is_alive():
         monitor_thread.join(timeout=0.5)
         current_written = frames_written[0]
+        now = time.perf_counter()
         last_reported_progress = _report_stream_progress(
             current_written, total_frames, last_reported_progress,
             progress_callback, start_time=_t_async_start,
@@ -1264,10 +1298,50 @@ def _process_frames_async(
         if preview_mux_trigger and current_written - _last_preview_at >= _preview_interval_frames:
             _last_preview_at = current_written
             preview_mux_trigger(current_written)
+        # Periodic diagnostics
+        if now - _last_diag_time >= _DIAG_INTERVAL and progress_callback:
+            _last_diag_time = now
+            rq = raw_queue.qsize()
+            eq = enhanced_queue.qsize() if enhanced_queue is not finalized_queue else -1
+            fq = finalized_queue.qsize()
+            avg_batch = (
+                sum(_diag_batch_sizes[-20:]) / len(_diag_batch_sizes[-20:])
+                if _diag_batch_sizes else 0
+            )
+            enh_fps = _diag_enhance_frames[0] / (now - _t_async_start) if now > _t_async_start else 0
+            wr_fps = _diag_write_frames[0] / (now - _t_async_start) if now > _t_async_start else 0
+            queue_info = f"队列: 解码={rq}/{_FRAME_QUEUE_DEPTH}"
+            if eq >= 0:
+                queue_info += f" 增强={eq}/{_ENHANCED_QUEUE_DEPTH}"
+            queue_info += f" 写入={fq}/{_ENHANCED_QUEUE_DEPTH}"
+            _emit_progress(
+                progress_callback,
+                last_reported_progress,
+                f"[诊断] {queue_info} | 增强 {enh_fps:.1f}fps 写入 {wr_fps:.1f}fps | "
+                f"平均batch={avg_batch:.1f}",
+            )
+
     _report_stream_progress(
         frames_written[0], total_frames, last_reported_progress,
         progress_callback, start_time=_t_async_start,
     )
+
+    # Final diagnostics summary
+    total_elapsed = time.perf_counter() - _t_async_start
+    if progress_callback and total_elapsed > 0:
+        enh_batches = _diag_enhance_batches[0]
+        enh_frames = _diag_enhance_frames[0]
+        avg_batch = enh_frames / enh_batches if enh_batches else 0
+        avg_infer_ms = _diag_enhance_infer_ms[0] / enh_batches if enh_batches else 0
+        avg_write_ms = _diag_write_ms[0] / _diag_write_frames[0] if _diag_write_frames[0] else 0
+        _emit_progress(
+            progress_callback,
+            last_reported_progress,
+            f"[诊断汇总] 增强: {enh_frames}帧/{enh_batches}批 "
+            f"avg_batch={avg_batch:.1f} avg_infer={avg_infer_ms:.0f}ms/批 | "
+            f"写入: avg={avg_write_ms:.1f}ms/帧 | "
+            f"总吞吐: {enh_frames / total_elapsed:.2f} fps",
+        )
 
     # -- Join background threads (with timeout to prevent hang) ---------------
     for t in (enhance_thread, postprocess_thread, write_thread):
