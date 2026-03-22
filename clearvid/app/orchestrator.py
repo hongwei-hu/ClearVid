@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from clearvid.app.models.realesrgan_runner import run_realesrgan_video
@@ -7,11 +8,16 @@ from clearvid.app.io.probe import probe_video
 from clearvid.app.pipeline import build_execution_plan
 from clearvid.app.schemas.models import BatchResult, EnhancementConfig
 from clearvid.app.task_queue import discover_video_files
-from clearvid.app.utils.subprocess_utils import run_command
+from clearvid.app.utils.subprocess_utils import run_command, run_ffmpeg_with_progress
 
 
 class Orchestrator:
-    def run_single(self, config: EnhancementConfig) -> BatchResult:
+    def run_single(
+        self,
+        config: EnhancementConfig,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> BatchResult:
+        _emit_progress(progress_callback, 2, "正在分析输入视频")
         metadata = probe_video(config.input_path)
         plan = build_execution_plan(config, metadata)
 
@@ -27,15 +33,25 @@ class Orchestrator:
             )
 
         if plan.backend.value == "realesrgan":
+            _emit_progress(progress_callback, 5, "正在加载 Real-ESRGAN 与 CodeFormer")
             run_realesrgan_video(
                 config=config,
                 metadata=metadata,
                 output_width=plan.output_width,
                 output_height=plan.output_height,
+                progress_callback=progress_callback,
             )
         else:
-            run_command(plan.command)
+            run_ffmpeg_with_progress(
+                plan.command,
+                duration_seconds=config.preview_seconds or metadata.duration_seconds,
+                progress_callback=progress_callback,
+                progress_message="正在执行基线增强",
+                progress_start=5,
+                progress_end=100,
+            )
 
+        _emit_progress(progress_callback, 100, "导出完成")
         return BatchResult(
             input_path=config.input_path,
             output_path=config.output_path,
@@ -66,3 +82,12 @@ class Orchestrator:
                 )
 
         return results
+
+
+def _emit_progress(
+    progress_callback: Callable[[int, str], None] | None,
+    percent: int,
+    message: str,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(percent, message)
