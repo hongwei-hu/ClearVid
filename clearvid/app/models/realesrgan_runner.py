@@ -5,6 +5,7 @@ import queue
 import shutil
 import tempfile
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
 
@@ -889,6 +890,21 @@ def _process_frames_async(
     last_reported_progress = -1
 
     try:
+        # When temporal stabilizer is active, overlap its CPU-bound optical
+        # flow computation with the next frame's GPU inference by running
+        # stabilize + sharpen in a 1-thread pool.
+        _stab_pool: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="stabilizer")
+            if stabilizer is not None else None
+        )
+        _stab_future: Future[np.ndarray] | None = None
+
+        def _stabilize_and_sharpen(frame: np.ndarray) -> np.ndarray:
+            result = stabilizer.stabilize(frame)  # type: ignore[union-attr]
+            if sharpen_strength > 0:
+                result = apply_sharpening(result, sharpen_strength)
+            return result
+
         while True:
             enhanced_list = _fetch_enhanced_frames(
                 raw_queue, use_batching, config.batch_size,
@@ -897,25 +913,42 @@ def _process_frames_async(
             if enhanced_list is None:
                 break
 
-            # Face restore + temporal stabilize + sharpen on main GPU thread
+            # Face restore (GPU) then submit stabilize (CPU) to overlap with
+            # the next iteration's GPU inference.
             finalized_list: list[np.ndarray] = []
             for enhanced in enhanced_list:
                 if codeformer_restorer is not None:
                     enhanced = codeformer_restorer.restore_faces(enhanced)
-                if stabilizer is not None:
-                    enhanced = stabilizer.stabilize(enhanced)
-                if sharpen_strength > 0:
-                    enhanced = apply_sharpening(enhanced, sharpen_strength)
-                finalized_list.append(enhanced)
 
-            finalized_queue.put(finalized_list)
+                # Collect the previous frame's async stabilization result.
+                if _stab_future is not None:
+                    finalized_list.append(_stab_future.result())
+                    _stab_future = None
+
+                if _stab_pool is not None:
+                    _stab_future = _stab_pool.submit(
+                        _stabilize_and_sharpen, enhanced,
+                    )
+                else:
+                    if sharpen_strength > 0:
+                        enhanced = apply_sharpening(enhanced, sharpen_strength)
+                    finalized_list.append(enhanced)
+
+            if finalized_list:
+                finalized_queue.put(finalized_list)
 
             # Report progress from write thread's counter
             last_reported_progress = _report_stream_progress(
                 frames_written[0], total_frames, last_reported_progress, progress_callback,
             )
+
+        # Flush the last pending stabilization.
+        if _stab_future is not None:
+            finalized_queue.put([_stab_future.result()])
     finally:
         finalized_queue.put(None)  # signal write thread to stop
+        if _stab_pool is not None:
+            _stab_pool.shutdown(wait=False)
 
     write_thread.join()
     if write_errors:

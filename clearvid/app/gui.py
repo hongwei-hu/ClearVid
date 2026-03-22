@@ -96,6 +96,7 @@ def _load_qt() -> dict[str, object]:
             QApplication,
             QCheckBox,
             QComboBox,
+            QDialog,
             QDoubleSpinBox,
             QFileDialog,
             QGridLayout,
@@ -108,6 +109,8 @@ def _load_qt() -> dict[str, object]:
             QPlainTextEdit,
             QProgressBar,
             QPushButton,
+            QScrollArea,
+            QSizePolicy,
             QSlider,
             QSpinBox,
             QVBoxLayout,
@@ -120,6 +123,7 @@ def _load_qt() -> dict[str, object]:
         "QApplication": QApplication,
         "QCheckBox": QCheckBox,
         "QComboBox": QComboBox,
+        "QDialog": QDialog,
         "QDoubleSpinBox": QDoubleSpinBox,
         "QFileDialog": QFileDialog,
         "QGridLayout": QGridLayout,
@@ -134,6 +138,8 @@ def _load_qt() -> dict[str, object]:
         "QPlainTextEdit": QPlainTextEdit,
         "QProgressBar": QProgressBar,
         "QPushButton": QPushButton,
+        "QScrollArea": QScrollArea,
+        "QSizePolicy": QSizePolicy,
         "QSlider": QSlider,
         "QSpinBox": QSpinBox,
         "QThread": QThread,
@@ -206,6 +212,9 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type, preview
     q_push_button = qt["QPushButton"]
     q_slider = qt["QSlider"]
     q_spin_box = qt["QSpinBox"]
+    q_dialog = qt["QDialog"]
+    q_scroll_area = qt["QScrollArea"]
+    q_size_policy = qt["QSizePolicy"]
     q_vbox_layout = qt["QVBoxLayout"]
     q_widget = qt["QWidget"]
     qt_ns = qt["Qt"]
@@ -214,10 +223,12 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type, preview
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("ClearVid 视频清晰度增强")
-            self.resize(920, 720)
+            self.resize(1200, 850)
             self._worker: object | None = None
             self._preview_worker: object | None = None
             self._last_progress_message = ""
+            self._before_pixmap_full: object | None = None
+            self._after_pixmap_full: object | None = None
             self._environment = collect_environment_info()
             self._video_duration: float = 0.0
 
@@ -404,19 +415,25 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type, preview
 
             # Before / After image row
             image_row = q_hbox_layout()
-            self.before_label = q_label("原始帧")
+            self.before_label = q_label("原始帧 (双击放大)")
             self.before_label.setAlignment(qt_ns.AlignCenter)
-            self.before_label.setMinimumHeight(180)
+            self.before_label.setMinimumHeight(260)
+            self.before_label.setSizePolicy(q_size_policy.Policy.Expanding, q_size_policy.Policy.Expanding)
             self.before_label.setStyleSheet("background: #1a1a1a; color: #888; border: 1px solid #333;")
-            self.after_label = q_label("增强帧")
+            self.before_label.setCursor(qt_ns.PointingHandCursor)
+            self.before_label.mouseDoubleClickEvent = lambda e: self._show_full_image(self._before_pixmap_full, "原始帧")
+            self.after_label = q_label("增强帧 (双击放大)")
             self.after_label.setAlignment(qt_ns.AlignCenter)
-            self.after_label.setMinimumHeight(180)
+            self.after_label.setMinimumHeight(260)
+            self.after_label.setSizePolicy(q_size_policy.Policy.Expanding, q_size_policy.Policy.Expanding)
             self.after_label.setStyleSheet("background: #1a1a1a; color: #888; border: 1px solid #333;")
-            image_row.addWidget(self.before_label)
-            image_row.addWidget(self.after_label)
-            preview_layout.addLayout(image_row)
+            self.after_label.setCursor(qt_ns.PointingHandCursor)
+            self.after_label.mouseDoubleClickEvent = lambda e: self._show_full_image(self._after_pixmap_full, "增强帧")
+            image_row.addWidget(self.before_label, 1)
+            image_row.addWidget(self.after_label, 1)
+            preview_layout.addLayout(image_row, 1)
 
-            layout.addWidget(preview_group)
+            layout.addWidget(preview_group, 1)
 
             buttons = q_hbox_layout()
             plan_button = q_push_button("自动生成输出路径")
@@ -554,18 +571,56 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type, preview
             self.preview_button.setEnabled(True)
             self.preview_button.setText("生成预览")
 
-            def _numpy_to_pixmap(bgr_array: np.ndarray, max_width: int = 440) -> object:
+            def _numpy_to_pixmap(bgr_array: np.ndarray) -> object:
                 rgb = bgr_array[:, :, ::-1].copy()
                 h, w, ch = rgb.shape
                 image = q_image(rgb.data, w, h, ch * w, q_image.Format.Format_RGB888)
-                pix = q_pixmap.fromImage(image)
-                if pix.width() > max_width:
-                    pix = pix.scaledToWidth(max_width, qt_ns.SmoothTransformation)
-                return pix
+                return q_pixmap.fromImage(image)
 
-            self.before_label.setPixmap(_numpy_to_pixmap(original))
-            self.after_label.setPixmap(_numpy_to_pixmap(enhanced))
-            self.log.appendPlainText("预览帧已生成")
+            self._before_pixmap_full = _numpy_to_pixmap(original)
+            self._after_pixmap_full = _numpy_to_pixmap(enhanced)
+            self._update_preview_display()
+            self.log.appendPlainText("预览帧已生成 — 双击图片可放大查看")
+
+        def _update_preview_display(self) -> None:
+            """Scale stored full-res pixmaps to fit the current label size."""
+            for pixmap, label in [
+                (self._before_pixmap_full, self.before_label),
+                (self._after_pixmap_full, self.after_label),
+            ]:
+                if pixmap is None:
+                    continue
+                w = label.width() - 4
+                h = label.height() - 4
+                if w > 0 and h > 0:
+                    label.setPixmap(
+                        pixmap.scaled(w, h, qt_ns.KeepAspectRatio, qt_ns.SmoothTransformation)
+                    )
+
+        def resizeEvent(self, event: object) -> None:  # noqa: N802
+            super().resizeEvent(event)
+            self._update_preview_display()
+
+        def _show_full_image(self, pixmap: object, title: str) -> None:
+            """Open a dialog showing the full-resolution image with scroll support."""
+            if pixmap is None:
+                return
+            dlg = q_dialog(self)
+            dlg.setWindowTitle(f"ClearVid — {title} (100%)")
+            dlg.resize(
+                min(pixmap.width() + 40, 1600),
+                min(pixmap.height() + 60, 950),
+            )
+            dlg_layout = q_vbox_layout(dlg)
+            dlg_layout.setContentsMargins(4, 4, 4, 4)
+            scroll = q_scroll_area()
+            scroll.setWidgetResizable(True)
+            img_label = q_label()
+            img_label.setPixmap(pixmap)
+            img_label.setAlignment(qt_ns.AlignCenter)
+            scroll.setWidget(img_label)
+            dlg_layout.addWidget(scroll)
+            dlg.exec()
 
         def _on_preview_failed(self, message: str) -> None:
             self.preview_button.setEnabled(True)
