@@ -217,6 +217,15 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             self.temporal_stabilize_strength.setSingleStep(0.05)
             self.temporal_stabilize_strength.setValue(0.6)
 
+            self.preprocess_denoise = q_check_box("预处理降噪")
+            self.preprocess_denoise.setChecked(True)
+            self.preprocess_deblock = q_check_box("预处理去块")
+            self.preprocess_deblock.setChecked(True)
+            self.preprocess_deinterlace = q_check_box("自动去隔行")
+            self.preprocess_deinterlace.setChecked(True)
+            self.preprocess_colorspace = q_check_box("色彩空间归一化")
+            self.preprocess_colorspace.setChecked(True)
+
             inspect_button = q_push_button("分析视频")
             inspect_button.clicked.connect(self._inspect_input)
 
@@ -251,11 +260,19 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             form_layout.addWidget(self.temporal_stabilize_strength, 8, 1)
             form_layout.addWidget(self.temporal_stabilize_enabled, 8, 2)
 
+            preprocess_row = q_hbox_layout()
+            preprocess_row.addWidget(self.preprocess_denoise)
+            preprocess_row.addWidget(self.preprocess_deblock)
+            preprocess_row.addWidget(self.preprocess_deinterlace)
+            preprocess_row.addWidget(self.preprocess_colorspace)
+            form_layout.addWidget(q_label("预处理选项"), 9, 0)
+            form_layout.addLayout(preprocess_row, 9, 1, 1, 2)
+
             checkbox_row = q_hbox_layout()
             checkbox_row.addWidget(self.preserve_audio)
             checkbox_row.addWidget(self.preserve_subtitles)
             checkbox_row.addWidget(self.preserve_metadata)
-            form_layout.addLayout(checkbox_row, 9, 0, 1, 3)
+            form_layout.addLayout(checkbox_row, 10, 0, 1, 3)
 
             layout.addWidget(form_group)
 
@@ -387,6 +404,10 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 face_restore_strength=self.face_restore_strength.value(),
                 temporal_stabilize_enabled=self.temporal_stabilize_enabled.isChecked(),
                 temporal_stabilize_strength=self.temporal_stabilize_strength.value(),
+                preprocess_denoise=self.preprocess_denoise.isChecked(),
+                preprocess_deblock=self.preprocess_deblock.isChecked(),
+                preprocess_deinterlace="auto" if self.preprocess_deinterlace.isChecked() else "off",
+                preprocess_colorspace_normalize=self.preprocess_colorspace.isChecked(),
                 preserve_audio=self.preserve_audio.isChecked(),
                 preserve_subtitles=self.preserve_subtitles.isChecked(),
                 preserve_metadata=self.preserve_metadata.isChecked(),

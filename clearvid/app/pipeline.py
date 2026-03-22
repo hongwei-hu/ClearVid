@@ -4,6 +4,7 @@ from pathlib import Path
 
 from clearvid.app.io.probe import collect_environment_info
 from clearvid.app.models.realesrgan_runner import resolve_upscale_model, validate_realesrgan_environment
+from clearvid.app.preprocess.filters import build_preprocess_filters
 from clearvid.app.schemas.models import BackendType, EnhancementConfig, ExecutionPlan, TargetProfile, VideoMetadata
 
 
@@ -39,6 +40,11 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
     notes.append(f"Upscale model: {resolved_model}")
     if config.temporal_stabilize_enabled:
         notes.append(f"Temporal stabilization: ON (strength={config.temporal_stabilize_strength:.2f})")
+    preprocess_filters = build_preprocess_filters(config, metadata)
+    if preprocess_filters:
+        notes.append(f"Preprocess filters: {', '.join(preprocess_filters)}")
+    else:
+        notes.append("Preprocess filters: none")
     return ExecutionPlan(
         output_width=output_width,
         output_height=output_height,

@@ -76,6 +76,7 @@ def probe_video(input_path: Path) -> VideoMetadata:
         audio_codec=audio_streams[0].get("codec_name") if audio_streams else None,
         audio_streams=len(audio_streams),
         subtitle_streams=len(subtitle_streams),
+        is_interlaced=_detect_interlaced(video_stream),
         streams=normalized_streams,
     )
 
@@ -164,3 +165,18 @@ def _to_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _detect_interlaced(video_stream: dict) -> bool:
+    """Detect interlaced content from ffprobe stream metadata."""
+    field_order = (video_stream.get("field_order") or "").lower()
+    if field_order in {"tt", "bb", "tb", "bt"}:
+        return True
+    if field_order == "progressive":
+        return False
+    # Fallback: check codec-level flags
+    coded_height = _to_int(video_stream.get("coded_height")) or 0
+    height = _to_int(video_stream.get("height")) or 0
+    if coded_height > 0 and height > 0 and coded_height != height:
+        return True
+    return False

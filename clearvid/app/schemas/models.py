@@ -62,6 +62,7 @@ class VideoMetadata(BaseModel):
     audio_codec: str | None = None
     audio_streams: int = 0
     subtitle_streams: int = 0
+    is_interlaced: bool = False
     streams: list[StreamInfo] = Field(default_factory=list)
 
     @computed_field
@@ -99,6 +100,10 @@ class EnhancementConfig(BaseModel):
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
     temporal_stabilize_enabled: bool = True
     temporal_stabilize_strength: float = Field(default=0.6, ge=0.0, le=1.0)
+    preprocess_denoise: bool = True
+    preprocess_deblock: bool = True
+    preprocess_deinterlace: str = Field(default="auto", pattern=r"^(auto|off)$")
+    preprocess_colorspace_normalize: bool = True
     denoise_strength: float = Field(default=0.08, ge=0.0, le=1.0)
     sharpen_strength: float = Field(default=0.12, ge=0.0, le=1.0)
     tile_size: int = 0

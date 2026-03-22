@@ -82,6 +82,10 @@ def run(
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
     temporal_stabilize_enabled: bool = typer.Option(True, help="Enable optical-flow temporal stabilization"),
     temporal_stabilize_strength: float = typer.Option(0.6, min=0.0, max=1.0, help="Temporal stabilization strength"),
+    preprocess_denoise: bool = typer.Option(True, help="Enable nlmeans denoise preprocessing"),
+    preprocess_deblock: bool = typer.Option(True, help="Enable deblock preprocessing for low-bitrate H.264"),
+    preprocess_deinterlace: str = typer.Option("auto", help="Deinterlace mode (auto/off)"),
+    preprocess_colorspace_normalize: bool = typer.Option(True, help="Normalize colorspace to BT.709"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -99,6 +103,10 @@ def run(
         face_restore_strength=face_restore_strength,
         temporal_stabilize_enabled=temporal_stabilize_enabled,
         temporal_stabilize_strength=temporal_stabilize_strength,
+        preprocess_denoise=preprocess_denoise,
+        preprocess_deblock=preprocess_deblock,
+        preprocess_deinterlace=preprocess_deinterlace,
+        preprocess_colorspace_normalize=preprocess_colorspace_normalize,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
@@ -118,6 +126,10 @@ def batch(
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
     temporal_stabilize_enabled: bool = typer.Option(True, help="Enable optical-flow temporal stabilization"),
     temporal_stabilize_strength: float = typer.Option(0.6, min=0.0, max=1.0, help="Temporal stabilization strength"),
+    preprocess_denoise: bool = typer.Option(True, help="Enable nlmeans denoise preprocessing"),
+    preprocess_deblock: bool = typer.Option(True, help="Enable deblock preprocessing for low-bitrate H.264"),
+    preprocess_deinterlace: str = typer.Option("auto", help="Deinterlace mode (auto/off)"),
+    preprocess_colorspace_normalize: bool = typer.Option(True, help="Normalize colorspace to BT.709"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds of each file"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -136,6 +148,10 @@ def batch(
         face_restore_strength=face_restore_strength,
         temporal_stabilize_enabled=temporal_stabilize_enabled,
         temporal_stabilize_strength=temporal_stabilize_strength,
+        preprocess_denoise=preprocess_denoise,
+        preprocess_deblock=preprocess_deblock,
+        preprocess_deinterlace=preprocess_deinterlace,
+        preprocess_colorspace_normalize=preprocess_colorspace_normalize,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
