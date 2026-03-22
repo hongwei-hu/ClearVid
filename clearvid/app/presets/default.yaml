@@ -16,6 +16,8 @@ tile_size: 512
 tile_pad: 16
 batch_size: 4
 fp16_enabled: true
+inference_accelerator: auto
+async_pipeline: true
 preserve_audio: true
 preserve_subtitles: true
 preserve_metadata: true

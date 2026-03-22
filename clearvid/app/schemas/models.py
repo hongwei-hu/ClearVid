@@ -32,6 +32,13 @@ class UpscaleModel(str, Enum):
     X4PLUS = "x4plus"
 
 
+class InferenceAccelerator(str, Enum):
+    NONE = "none"
+    AUTO = "auto"
+    COMPILE = "compile"
+    TENSORRT = "tensorrt"
+
+
 class HardwareProfile(str, Enum):
     AUTO = "auto"
     HIGH_END = "high_end"
@@ -110,6 +117,8 @@ class EnhancementConfig(BaseModel):
     tile_pad: int = 16
     batch_size: int = 4
     fp16_enabled: bool = True
+    inference_accelerator: InferenceAccelerator = InferenceAccelerator.AUTO
+    async_pipeline: bool = True
     preserve_audio: bool = True
     preserve_subtitles: bool = True
     preserve_metadata: bool = True

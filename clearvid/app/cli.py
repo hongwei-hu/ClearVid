@@ -10,7 +10,7 @@ from rich.table import Table
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.pipeline import build_execution_plan
-from clearvid.app.schemas.models import BackendType, EnhancementConfig, QualityMode, TargetProfile, UpscaleModel
+from clearvid.app.schemas.models import BackendType, EnhancementConfig, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
 from clearvid.app.task_queue import discover_video_files
 
 app = typer.Typer(help="ClearVid command line interface")
@@ -86,6 +86,8 @@ def run(
     preprocess_deblock: bool = typer.Option(True, help="Enable deblock preprocessing for low-bitrate H.264"),
     preprocess_deinterlace: str = typer.Option("auto", help="Deinterlace mode (auto/off)"),
     preprocess_colorspace_normalize: bool = typer.Option(True, help="Normalize colorspace to BT.709"),
+    inference_accelerator: InferenceAccelerator = typer.Option(InferenceAccelerator.AUTO, help="Inference accelerator (none/auto/compile/tensorrt)"),
+    async_pipeline: bool = typer.Option(True, "--async-pipeline/--no-async-pipeline", help="Enable 3-stage async pipeline"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -107,6 +109,8 @@ def run(
         preprocess_deblock=preprocess_deblock,
         preprocess_deinterlace=preprocess_deinterlace,
         preprocess_colorspace_normalize=preprocess_colorspace_normalize,
+        inference_accelerator=inference_accelerator,
+        async_pipeline=async_pipeline,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
@@ -130,6 +134,8 @@ def batch(
     preprocess_deblock: bool = typer.Option(True, help="Enable deblock preprocessing for low-bitrate H.264"),
     preprocess_deinterlace: str = typer.Option("auto", help="Deinterlace mode (auto/off)"),
     preprocess_colorspace_normalize: bool = typer.Option(True, help="Normalize colorspace to BT.709"),
+    inference_accelerator: InferenceAccelerator = typer.Option(InferenceAccelerator.AUTO, help="Inference accelerator (none/auto/compile/tensorrt)"),
+    async_pipeline: bool = typer.Option(True, "--async-pipeline/--no-async-pipeline", help="Enable 3-stage async pipeline"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds of each file"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -152,6 +158,8 @@ def batch(
         preprocess_deblock=preprocess_deblock,
         preprocess_deinterlace=preprocess_deinterlace,
         preprocess_colorspace_normalize=preprocess_colorspace_normalize,
+        inference_accelerator=inference_accelerator,
+        async_pipeline=async_pipeline,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
