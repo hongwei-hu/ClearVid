@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from clearvid.app.bootstrap.paths import OUTPUTS_DIR
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -675,7 +677,7 @@ class ExportPanel(QWidget):
         profile_val = profile.value if profile else "output"
         template = self.naming_edit.text() or DEFAULT_TEMPLATE
         filename = render_output_name(template, input_path, profile_val)
-        out_dir = output_dir or str(Path.cwd() / "outputs")
+        out_dir = output_dir or str(OUTPUTS_DIR)
         self.output_edit.setText(str(Path(out_dir) / filename))
 
     def update_estimation(
@@ -732,7 +734,7 @@ class ExportPanel(QWidget):
         selected, _ = QFileDialog.getSaveFileName(
             self,
             "选择输出文件",
-            self.output_edit.text() or str(Path.cwd() / "outputs"),
+            self.output_edit.text() or str(OUTPUTS_DIR),
             "MP4 文件 (*.mp4);;所有文件 (*)",
         )
         if selected:

@@ -20,6 +20,12 @@ from clearvid.app.models.tensorrt_engine import (
     describe_accelerator,
     detect_best_accelerator,
 )
+from clearvid.app.bootstrap.paths import (
+    REALESRGAN_WEIGHTS_DIR,
+    TRT_CACHE_DIR,
+    WEIGHTS_DIR,
+    ffmpeg_path,
+)
 from clearvid.app.postprocess.enhance import apply_sharpening
 from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
 from clearvid.app.preprocess.filters import build_preprocess_filters
@@ -135,7 +141,7 @@ def run_realesrgan_video(
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> None:
     _emit_progress(progress_callback, 6, "正在准备 Real-ESRGAN 权重")
-    weights_dir = Path.cwd() / "weights" / "realesrgan"
+    weights_dir = REALESRGAN_WEIGHTS_DIR
     model_key = resolve_upscale_model(config.upscale_model, config.quality_mode)
     model_path = ensure_realesrgan_weights(weights_dir, model_key)
     model_label = _MODEL_REGISTRY[model_key]["filename"]
@@ -151,7 +157,7 @@ def run_realesrgan_video(
             accel,
             fp16=config.fp16_enabled,
             tile_size=config.tile_size or 512,
-            cache_dir=Path.cwd() / "weights" / "trt_cache",
+            cache_dir=TRT_CACHE_DIR,
         )
 
     _emit_progress(progress_callback, 12, "正在初始化人脸修复")
@@ -195,7 +201,7 @@ def enhance_single_frame(
     This is used by the preview feature to show a Before/After comparison
     without launching the full streaming pipeline.
     """
-    weights_dir = Path.cwd() / "weights" / "realesrgan"
+    weights_dir = REALESRGAN_WEIGHTS_DIR
     model_key = resolve_upscale_model(config.upscale_model, config.quality_mode)
     model_path = ensure_realesrgan_weights(weights_dir, model_key)
     upsampler = _build_upsampler(config, model_path, model_key, metadata.width, metadata.height)
@@ -231,7 +237,7 @@ def extract_frame(video_path: Path, timestamp_sec: float = 0.0, width: int = 0, 
         width, height = meta.width, meta.height
 
     command = [
-        "ffmpeg",
+        ffmpeg_path() or "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
         "-hwaccel", "auto",
@@ -352,13 +358,13 @@ def _build_codeformer_restorer(
     if config.face_restore_model == FaceRestoreModel.GFPGAN:
         return GFPGANRestorer(
             upscale_factor=upscale_factor,
-            weights_root=Path.cwd() / "weights",
+            weights_root=WEIGHTS_DIR,
         )
 
     return CodeFormerRestorer(
         fidelity_weight=config.face_restore_strength,
         upscale_factor=upscale_factor,
-        weights_root=Path.cwd() / "weights",
+        weights_root=WEIGHTS_DIR,
         use_poisson_blend=config.face_poisson_blend,
     )
 
@@ -416,7 +422,7 @@ def _stream_process_video(
 
 def _mux_output(config: EnhancementConfig, temp_video_path: Path) -> None:
     command = [
-        "ffmpeg",
+        ffmpeg_path() or "ffmpeg",
         "-y",
         "-hide_banner",
         "-i",
@@ -524,7 +530,7 @@ def _map_frame_progress(processed_frames: int, total_frames: int | None) -> int:
 
 def _build_decode_command(config: EnhancementConfig, metadata: VideoMetadata) -> list[str]:
     command = [
-        "ffmpeg",
+        ffmpeg_path() or "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
@@ -553,7 +559,7 @@ def _build_encode_command(
     temp_video_path: Path,
 ) -> list[str]:
     command = [
-        "ffmpeg",
+        ffmpeg_path() or "ffmpeg",
         "-y",
         "-hide_banner",
         "-loglevel",

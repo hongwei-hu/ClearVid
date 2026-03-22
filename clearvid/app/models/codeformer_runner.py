@@ -7,6 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from clearvid.app.bootstrap.paths import CODEFORMER_WEIGHTS_DIR
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,7 +22,7 @@ def validate_codeformer_environment(weights_path: Path | None = None) -> tuple[b
         return False, "CodeFormer requires CUDA in the current runtime."
 
     try:
-        ensure_codeformer_weights(weights_path or Path.cwd() / "weights" / "codeformer")
+        ensure_codeformer_weights(weights_path or CODEFORMER_WEIGHTS_DIR)
     except Exception as exc:  # noqa: BLE001
         return False, f"CodeFormer 权重准备失败: {exc}"
 

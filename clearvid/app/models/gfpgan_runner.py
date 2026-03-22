@@ -12,6 +12,8 @@ from pathlib import Path
 
 import cv2
 
+from clearvid.app.bootstrap.paths import GFPGAN_WEIGHTS_DIR
+
 logger = logging.getLogger(__name__)
 
 GFPGAN_MODEL_FILENAME = "GFPGANv1.4.pth"
@@ -73,7 +75,7 @@ def validate_gfpgan_environment(weights_path: Path | None = None) -> tuple[bool,
         return False, "GFPGAN requires CUDA."
 
     try:
-        ensure_gfpgan_weights(weights_path or Path.cwd() / "weights" / "gfpgan")
+        ensure_gfpgan_weights(weights_path or GFPGAN_WEIGHTS_DIR)
     except Exception as exc:  # noqa: BLE001
         return False, f"GFPGAN weights not available: {exc}"
 

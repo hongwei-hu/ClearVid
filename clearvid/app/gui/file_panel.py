@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from clearvid.app.bootstrap.paths import APP_ROOT
+
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".m4v"}
 
 
@@ -27,7 +29,7 @@ class FilePanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._last_input_dir = str(Path.cwd())
+        self._last_input_dir = str(APP_ROOT)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)

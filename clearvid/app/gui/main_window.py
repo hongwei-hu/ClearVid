@@ -7,6 +7,12 @@ import time
 import yaml
 from pathlib import Path
 
+from clearvid.app.bootstrap.paths import APP_ROOT, OUTPUTS_DIR
+from clearvid.app.bootstrap.weight_manager import (
+    download_weight,
+    missing_weights_for_export,
+)
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -319,6 +325,41 @@ class MainWindow(QMainWindow):
     # Export job (single file)
     # ==================================================================
 
+    def _ensure_weights(self, config) -> bool:
+        """Check for missing weights and offer to download them. Returns True if ready."""
+        missing = missing_weights_for_export(
+            face_restore_enabled=config.face_restore_enabled,
+            face_restore_model=config.face_restore_model.value if hasattr(config.face_restore_model, "value") else str(config.face_restore_model),
+            upscale_model=config.upscale_model.value if hasattr(config.upscale_model, "value") else str(config.upscale_model),
+        )
+        if not missing:
+            return True
+
+        names = "\n".join(f"  • {s.name} ({s.size_mb} MB)" for s in missing)
+        total_mb = sum(s.size_mb for s in missing)
+        reply = QMessageBox.question(
+            self,
+            "需要下载模型权重",
+            f"以下模型权重文件缺失，需要下载后才能处理:\n\n{names}\n\n"
+            f"总计约 {total_mb} MB，是否立即下载？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+
+        self._log_message(f"开始下载 {len(missing)} 个模型权重...")
+        for spec in missing:
+            self._log_message(f"  下载: {spec.name} ({spec.size_mb} MB)...")
+            QApplication.processEvents()
+            ok = download_weight(spec)
+            if not ok:
+                QMessageBox.critical(self, "下载失败", f"未能下载 {spec.name}。\n请检查网络连接后重试。")
+                return False
+            self._log_message(f"  ✅ {spec.name} 下载完成")
+
+        self._log_message("所有权重文件准备就绪")
+        return True
+
     def _run_job(self) -> None:
         input_path = self._file_panel.input_path
         output_path = self._export_panel.output_edit.text()
@@ -340,6 +381,10 @@ class MainWindow(QMainWindow):
 
         self._export_panel.hide_post_export()
         config = self._export_panel.build_config(input_path)
+
+        # Check and download missing weights before starting
+        if not self._ensure_weights(config):
+            return
 
         self._log_message(f"开始处理: {config.input_path}")
         self._export_panel.set_export_enabled(False)
@@ -399,7 +444,7 @@ class MainWindow(QMainWindow):
             return
 
         template = self._export_panel.naming_edit.text() or DEFAULT_TEMPLATE
-        out_dir = self._settings.last_output_dir() or str(Path.cwd() / "outputs")
+        out_dir = self._settings.last_output_dir() or str(OUTPUTS_DIR)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
         jobs: list[ExportJob] = []
@@ -424,6 +469,10 @@ class MainWindow(QMainWindow):
 
         if not jobs:
             QMessageBox.information(self, "队列为空", "未找到有效的视频文件。")
+            return
+
+        # Check weights using first job's config (all jobs share the same settings)
+        if not self._ensure_weights(jobs[0].config):
             return
 
         self._log_message(f"开始队列导出: {len(jobs)} 个文件")
@@ -530,7 +579,7 @@ class MainWindow(QMainWindow):
         data.pop("output_path", None)
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出配置", str(Path.cwd() / "clearvid_config.yaml"),
+            self, "导出配置", str(APP_ROOT / "clearvid_config.yaml"),
             "YAML 文件 (*.yaml *.yml);;所有文件 (*)",
         )
         if path:

@@ -104,7 +104,8 @@ def _apply_tensorrt(
         return model
 
     if cache_dir is None:
-        cache_dir = Path.cwd() / "weights" / "trt_cache"
+        from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
+        cache_dir = TRT_CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
