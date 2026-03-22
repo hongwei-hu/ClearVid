@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,12 @@ TARGET_LABELS = {
     TargetProfile.SCALE2X: "放大 2 倍",
     TargetProfile.SCALE4X: "放大 4 倍",
 }
+
+
+def _populate_combo(combo: Any, labels: dict[Any, str], values: Iterable[Any], default_value: Any) -> None:
+    for item in values:
+        combo.addItem(labels[item], item)
+    combo.setCurrentText(labels[default_value])
 
 
 def _coerce_enum(enum_type: type, value: Any, default: Any) -> Any:
@@ -68,6 +75,7 @@ def _load_qt() -> dict[str, object]:
             QMainWindow,
             QMessageBox,
             QPlainTextEdit,
+            QProgressBar,
             QPushButton,
             QSpinBox,
             QVBoxLayout,
@@ -90,6 +98,7 @@ def _load_qt() -> dict[str, object]:
         "QMainWindow": QMainWindow,
         "QMessageBox": QMessageBox,
         "QPlainTextEdit": QPlainTextEdit,
+        "QProgressBar": QProgressBar,
         "QPushButton": QPushButton,
         "QSpinBox": QSpinBox,
         "QThread": QThread,
@@ -103,6 +112,7 @@ def _create_worker_class(q_thread_cls: Any, signal_factory: Any) -> type:
     class Worker(q_thread_cls):  # type: ignore[misc, valid-type]
         completed = signal_factory(str)  # type: ignore[operator]
         failed = signal_factory(str)  # type: ignore[operator]
+        progress = signal_factory(int, str)  # type: ignore[operator]
 
         def __init__(self, config: EnhancementConfig):
             super().__init__()
@@ -110,10 +120,13 @@ def _create_worker_class(q_thread_cls: Any, signal_factory: Any) -> type:
 
         def run(self) -> None:
             try:
-                result = Orchestrator().run_single(self._config)
+                result = Orchestrator().run_single(self._config, progress_callback=self._emit_progress)
                 self.completed.emit(result.model_dump_json(indent=2))
             except Exception as exc:  # noqa: BLE001
                 self.failed.emit(str(exc))
+
+        def _emit_progress(self, percent: int, message: str) -> None:
+            self.progress.emit(percent, message)
 
     return Worker
 
@@ -131,6 +144,7 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
     q_main_window = qt["QMainWindow"]
     q_message_box = qt["QMessageBox"]
     q_plain_text_edit = qt["QPlainTextEdit"]
+    q_progress_bar = qt["QProgressBar"]
     q_push_button = qt["QPushButton"]
     q_spin_box = qt["QSpinBox"]
     q_vbox_layout = qt["QVBoxLayout"]
@@ -142,6 +156,7 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             self.setWindowTitle("ClearVid 视频清晰度增强")
             self.resize(920, 620)
             self._worker: object | None = None
+            self._last_progress_message = ""
             self._environment = collect_environment_info()
 
             root = q_widget()
@@ -164,19 +179,13 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             output_button.clicked.connect(self._pick_output)
 
             self.target_combo = q_combo_box()
-            for item in TargetProfile:
-                self.target_combo.addItem(TARGET_LABELS[item], item)
-            self.target_combo.setCurrentText(TARGET_LABELS[TargetProfile.FHD])
+            _populate_combo(self.target_combo, TARGET_LABELS, TargetProfile, TargetProfile.FHD)
 
             self.quality_combo = q_combo_box()
-            for item in QualityMode:
-                self.quality_combo.addItem(QUALITY_LABELS[item], item)
-            self.quality_combo.setCurrentText(QUALITY_LABELS[QualityMode.QUALITY])
+            _populate_combo(self.quality_combo, QUALITY_LABELS, QualityMode, QualityMode.QUALITY)
 
             self.backend_combo = q_combo_box()
-            for item in BackendType:
-                self.backend_combo.addItem(BACKEND_LABELS[item], item)
-            self.backend_combo.setCurrentText(BACKEND_LABELS[BackendType.AUTO])
+            _populate_combo(self.backend_combo, BACKEND_LABELS, BackendType, BackendType.AUTO)
 
             self.preview_seconds = q_spin_box()
             self.preview_seconds.setMinimum(0)
@@ -231,11 +240,18 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             buttons = q_hbox_layout()
             plan_button = q_push_button("自动生成输出路径")
             plan_button.clicked.connect(self._autofill_output)
-            run_button = q_push_button("开始导出")
-            run_button.clicked.connect(self._run_job)
+            self.run_button = q_push_button("开始导出")
+            self.run_button.clicked.connect(self._run_job)
             buttons.addWidget(plan_button)
-            buttons.addWidget(run_button)
+            buttons.addWidget(self.run_button)
             layout.addLayout(buttons)
+
+            self.progress_label = q_label("等待开始")
+            self.progress_bar = q_progress_bar()
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            layout.addWidget(self.progress_label)
+            layout.addWidget(self.progress_bar)
 
             self.log = q_plain_text_edit()
             self.log.setReadOnly(True)
@@ -348,15 +364,31 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             )
 
             self.log.appendPlainText(f"开始处理: {config.input_path}")
+            self._set_running_state(True)
+            self._on_progress(0, "正在准备任务")
             self._worker = worker_class(config)
+            self._worker.progress.connect(self._on_progress)
             self._worker.completed.connect(self._on_completed)
             self._worker.failed.connect(self._on_failed)
             self._worker.start()
 
         def _on_completed(self, payload: str) -> None:
+            self._set_running_state(False)
+            self._on_progress(100, "处理完成")
             self.log.appendPlainText("处理完成:\n" + payload)
 
         def _on_failed(self, message: str) -> None:
+            self._set_running_state(False)
             self.log.appendPlainText(f"处理失败: {message}")
+
+        def _on_progress(self, percent: int, message: str) -> None:
+            self.progress_bar.setValue(max(0, min(100, percent)))
+            self.progress_label.setText(message)
+            if message != self._last_progress_message:
+                self.log.appendPlainText(message)
+                self._last_progress_message = message
+
+        def _set_running_state(self, is_running: bool) -> None:
+            self.run_button.setEnabled(not is_running)
 
     return MainWindow

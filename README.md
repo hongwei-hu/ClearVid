@@ -11,6 +11,8 @@ ClearVid is a Windows-first Python project for enhancing real-world character vi
 - Baseline FFmpeg enhancement backend is implemented for end-to-end validation.
 - Real-ESRGAN true backend is implemented and validated on the sample video.
 - CodeFormer face restoration is integrated into the Real-ESRGAN pipeline.
+- GUI now shows real processing stage and percentage progress during export.
+- Real-ESRGAN and CodeFormer video processing now uses a streaming raw-frame pipeline to reduce disk I/O without lowering output quality.
 - The GUI is directly launchable from Windows with the provided starter script.
 - Real-ESRGAN runtime detection is implemented, with automatic fallback to the baseline backend when the model runtime is unavailable.
 
@@ -123,3 +125,9 @@ The baseline backend is intentionally simple. It uses FFmpeg scaling and mild cl
 It is not the final quality path.
 
 The current final quality path is the Real-ESRGAN backend with optional CodeFormer face restoration. GUI and CLI both expose the face restoration switch and strength.
+
+## Performance note
+
+The current performance optimization does not trade away export quality.
+
+The quality path still uses the same enhancement models and the same output encoder settings. The optimization is in the transport layer: video frames are now streamed as raw frames between FFmpeg and Python instead of being written out as temporary PNG sequences. This reduces disk pressure and processing overhead while keeping the enhanced frame data lossless before final encoding.

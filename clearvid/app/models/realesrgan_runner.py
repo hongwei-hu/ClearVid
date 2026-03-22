@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
@@ -89,41 +90,35 @@ def run_realesrgan_video(
     metadata: VideoMetadata,
     output_width: int,
     output_height: int,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> None:
+    _emit_progress(progress_callback, 6, "正在准备 Real-ESRGAN 权重")
     weights_dir = Path.cwd() / "weights" / "realesrgan"
     model_path = ensure_realesrgan_weights(weights_dir)
+    _emit_progress(progress_callback, 10, "正在初始化 Real-ESRGAN")
     upsampler = _build_upsampler(config, model_path)
+    _emit_progress(progress_callback, 14, "正在初始化人脸修复")
     codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
 
     temp_root = Path(tempfile.mkdtemp(prefix="clearvid-realesrgan-"))
-    input_frames_dir = temp_root / "input_frames"
-    output_frames_dir = temp_root / "output_frames"
-    input_frames_dir.mkdir(parents=True, exist_ok=True)
-    output_frames_dir.mkdir(parents=True, exist_ok=True)
+    temp_video_path = temp_root / "enhanced_video.mp4"
 
     try:
-        _extract_frames(config, input_frames_dir)
-        frame_paths = sorted(input_frames_dir.glob("*.png"))
-        if not frame_paths:
-            raise RuntimeError("Real-ESRGAN 未提取到任何视频帧。")
-
         outscale = _resolve_outscale(metadata, output_width, output_height, config.target_profile)
-        for frame_path in frame_paths:
-            image = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise RuntimeError(f"无法读取提取帧: {frame_path}")
-
-            enhanced, _ = upsampler.enhance(image, outscale=outscale)
-            if codeformer_restorer is not None:
-                enhanced = codeformer_restorer.restore_faces(enhanced)
-            finalized = _resize_for_target(enhanced, output_width, output_height, config.target_profile)
-            output_frame_path = output_frames_dir / frame_path.name
-            if not cv2.imwrite(str(output_frame_path), finalized):
-                raise RuntimeError(f"无法写出增强帧: {output_frame_path}")
-
-        temp_video_path = temp_root / "enhanced_video.mp4"
-        _encode_video(config, metadata, output_frames_dir, temp_video_path)
+        _stream_process_video(
+            config=config,
+            metadata=metadata,
+            output_width=output_width,
+            output_height=output_height,
+            outscale=outscale,
+            upsampler=upsampler,
+            codeformer_restorer=codeformer_restorer,
+            temp_video_path=temp_video_path,
+            progress_callback=progress_callback,
+        )
+        _emit_progress(progress_callback, 96, "正在封装音频与元数据")
         _mux_output(config, temp_video_path)
+        _emit_progress(progress_callback, 100, "视频导出完成")
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -196,53 +191,40 @@ def _build_codeformer_restorer(
     )
 
 
-def _extract_frames(config: EnhancementConfig, output_dir: Path) -> None:
-    command = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-hwaccel",
-        "auto",
-        "-i",
-        str(config.input_path),
-    ]
-    if config.preview_seconds:
-        command.extend(["-t", str(config.preview_seconds)])
-    command.extend([
-        "-vsync",
-        "0",
-        str(output_dir / "%08d.png"),
-    ])
-    run_command(command)
+def _stream_process_video(
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+    outscale: float,
+    upsampler: object,
+    codeformer_restorer: CodeFormerRestorer | None,
+    temp_video_path: Path,
+    progress_callback: Callable[[int, str], None] | None,
+) -> None:
+    import subprocess
 
+    decode_command = _build_decode_command(config)
+    encode_command = _build_encode_command(config, metadata, output_width, output_height, temp_video_path)
+    decoder = subprocess.Popen(decode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    encoder = subprocess.Popen(encode_command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-def _encode_video(config: EnhancementConfig, metadata: VideoMetadata, frames_dir: Path, temp_video_path: Path) -> None:
-    command = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-framerate",
-        f"{metadata.fps:.6f}",
-        "-i",
-        str(frames_dir / "%08d.png"),
-        "-c:v",
-        config.encoder,
-        "-preset",
-        config.encoder_preset,
-    ]
-
-    if config.video_bitrate:
-        command.extend(["-b:v", config.video_bitrate])
-    else:
-        command.extend(["-cq", "18"])
-
-    command.extend([
-        "-pix_fmt",
-        "yuv420p",
-        "-an",
-        str(temp_video_path),
-    ])
-    run_command(command)
+    try:
+        _process_stream_frames(
+            config=config,
+            metadata=metadata,
+            output_width=output_width,
+            output_height=output_height,
+            outscale=outscale,
+            upsampler=upsampler,
+            codeformer_restorer=codeformer_restorer,
+            decoder=decoder,
+            encoder=encoder,
+            progress_callback=progress_callback,
+        )
+        _finalize_stream_processes(decoder, encoder)
+    finally:
+        _cleanup_stream_processes(decoder, encoder)
 
 
 def _mux_output(config: EnhancementConfig, temp_video_path: Path) -> None:
@@ -322,3 +304,177 @@ def _fit_and_pad_frame(frame: np.ndarray, output_width: int, output_height: int)
     offset_y = (output_height - resized_height) // 2
     canvas[offset_y:offset_y + resized_height, offset_x:offset_x + resized_width] = resized
     return canvas
+
+
+def _read_exact_bytes(stream: object, byte_count: int) -> bytes | None:
+    buffer = bytearray()
+    while len(buffer) < byte_count:
+        chunk = stream.read(byte_count - len(buffer))
+        if not chunk:
+            break
+        buffer.extend(chunk)
+
+    if not buffer:
+        return None
+    if len(buffer) != byte_count:
+        raise RuntimeError("视频帧流被意外截断。")
+    return bytes(buffer)
+
+
+def _estimate_total_frames(metadata: VideoMetadata, preview_seconds: int | None) -> int | None:
+    duration_seconds = preview_seconds or metadata.duration_seconds
+    if duration_seconds <= 0 or metadata.fps <= 0:
+        return None
+    return max(1, int(round(duration_seconds * metadata.fps)))
+
+
+def _map_frame_progress(processed_frames: int, total_frames: int | None) -> int:
+    if not total_frames:
+        return 18
+    ratio = min(max(processed_frames / total_frames, 0.0), 1.0)
+    return 18 + int(76 * ratio)
+
+
+def _build_decode_command(config: EnhancementConfig) -> list[str]:
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-hwaccel",
+        "auto",
+        "-i",
+        str(config.input_path),
+    ]
+    if config.preview_seconds:
+        command.extend(["-t", str(config.preview_seconds)])
+    command.extend(["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"])
+    return command
+
+
+def _build_encode_command(
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+    temp_video_path: Path,
+) -> list[str]:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{output_width}x{output_height}",
+        "-r",
+        f"{metadata.fps:.6f}",
+        "-i",
+        "pipe:0",
+        "-c:v",
+        config.encoder,
+        "-preset",
+        config.encoder_preset,
+    ]
+    if config.video_bitrate:
+        command.extend(["-b:v", config.video_bitrate])
+    else:
+        command.extend(["-cq", "18"])
+    command.extend(["-pix_fmt", "yuv420p", "-an", str(temp_video_path)])
+    return command
+
+
+def _process_stream_frames(
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+    outscale: float,
+    upsampler: object,
+    codeformer_restorer: CodeFormerRestorer | None,
+    decoder: object,
+    encoder: object,
+    progress_callback: Callable[[int, str], None] | None,
+) -> None:
+    frame_size = metadata.width * metadata.height * 3
+    total_frames = _estimate_total_frames(metadata, config.preview_seconds)
+    processed_frames = 0
+    last_reported_progress = -1
+
+    assert decoder.stdout is not None
+    assert encoder.stdin is not None
+    _emit_progress(progress_callback, 18, "正在流式处理视频帧")
+
+    while True:
+        raw_frame = _read_exact_bytes(decoder.stdout, frame_size)
+        if raw_frame is None:
+            break
+
+        image = np.frombuffer(raw_frame, dtype=np.uint8).reshape((metadata.height, metadata.width, 3))
+        enhanced, _ = upsampler.enhance(image, outscale=outscale)
+        if codeformer_restorer is not None:
+            enhanced = codeformer_restorer.restore_faces(enhanced)
+        finalized = _resize_for_target(enhanced, output_width, output_height, config.target_profile)
+        encoder.stdin.write(np.ascontiguousarray(finalized).tobytes())
+
+        processed_frames += 1
+        last_reported_progress = _report_stream_progress(
+            processed_frames,
+            total_frames,
+            last_reported_progress,
+            progress_callback,
+        )
+
+    encoder.stdin.close()
+
+
+def _report_stream_progress(
+    processed_frames: int,
+    total_frames: int | None,
+    last_reported_progress: int,
+    progress_callback: Callable[[int, str], None] | None,
+) -> int:
+    progress = _map_frame_progress(processed_frames, total_frames)
+    if progress > last_reported_progress:
+        _emit_progress(progress_callback, progress, f"正在增强视频帧 {processed_frames}/{total_frames or '?'}")
+        return progress
+    return last_reported_progress
+
+
+def _finalize_stream_processes(decoder: object, encoder: object) -> None:
+    decoder_stderr = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
+    encoder_stderr = encoder.stderr.read().decode("utf-8", errors="replace") if encoder.stderr else ""
+    decoder_return_code = decoder.wait()
+    encoder_return_code = encoder.wait()
+    if decoder_return_code != 0:
+        raise RuntimeError(decoder_stderr.strip() or "FFmpeg 解码失败")
+    if encoder_return_code != 0:
+        raise RuntimeError(encoder_stderr.strip() or "FFmpeg 编码失败")
+
+
+def _cleanup_stream_processes(decoder: object, encoder: object) -> None:
+    if decoder.stdout:
+        decoder.stdout.close()
+    if decoder.stderr:
+        decoder.stderr.close()
+    if encoder.stdin and not encoder.stdin.closed:
+        encoder.stdin.close()
+    if encoder.stderr:
+        encoder.stderr.close()
+    if decoder.poll() is None:
+        decoder.kill()
+    if encoder.poll() is None:
+        encoder.kill()
+
+
+def _emit_progress(
+    progress_callback: Callable[[int, str], None] | None,
+    percent: int,
+    message: str,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(percent, message)
