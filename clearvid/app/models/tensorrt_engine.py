@@ -69,6 +69,13 @@ def _apply_torch_compile(model: object) -> object:
             logger.warning("torch.compile 不可用 (需要 PyTorch ≥ 2.0)，回退到标准推理")
             return model
 
+        # inductor backend requires triton for CUDA kernel compilation
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            logger.warning("triton 未安装，torch.compile (inductor) 不可用，回退到标准推理。安装: pip install triton")
+            return model
+
         compiled = torch.compile(model, mode="max-autotune", backend="inductor")
         logger.info("已启用 torch.compile (inductor) 加速")
         return compiled
@@ -267,6 +274,8 @@ def detect_best_accelerator() -> InferenceAccelerator:
     try:
         import torch
         if hasattr(torch, "compile"):
+            # inductor backend requires triton for CUDA kernel compilation
+            import triton  # noqa: F401
             return InferenceAccelerator.COMPILE
     except ImportError:
         pass
