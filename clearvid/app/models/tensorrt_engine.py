@@ -194,16 +194,16 @@ def _build_trt_engine(
             raise RuntimeError(f"ONNX 解析失败:\n{errors}")
 
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4 GB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)  # 2 GB
 
     if fp16:
         config.set_flag(trt.BuilderFlag.FP16)
 
-    # Dynamic shape profile — support variable batch, height, width
+    # Dynamic shape profile — keep max modest to avoid OOM during build
     profile = builder.create_optimization_profile()
     min_hw = max(64, tile_size // 4)
-    max_hw = tile_size * 2
-    max_batch = max(batch_size * 2, 32)
+    max_hw = min(tile_size + 512, 1024)  # cap to prevent enormous allocations
+    max_batch = min(batch_size, 16)
     profile.set_shape(
         "input",
         min=(1, 3, min_hw, min_hw),
