@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from clearvid.app.io.probe import collect_environment_info
-from clearvid.app.models.realesrgan_runner import validate_realesrgan_environment
+from clearvid.app.models.realesrgan_runner import resolve_upscale_model, validate_realesrgan_environment
 from clearvid.app.schemas.models import BackendType, EnhancementConfig, ExecutionPlan, TargetProfile, VideoMetadata
 
 
@@ -35,6 +35,8 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
         raise RuntimeError(message)
 
     notes.append("Using Real-ESRGAN backend.")
+    resolved_model = resolve_upscale_model(config.upscale_model, config.quality_mode)
+    notes.append(f"Upscale model: {resolved_model}")
     if config.temporal_stabilize_enabled:
         notes.append(f"Temporal stabilization: ON (strength={config.temporal_stabilize_strength:.2f})")
     return ExecutionPlan(

@@ -1,6 +1,7 @@
 target_profile: fhd
 quality_mode: quality
 backend: baseline
+upscale_model: auto
 face_restore_enabled: true
 face_restore_strength: 0.55
 temporal_stabilize_enabled: true

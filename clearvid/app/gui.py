@@ -7,13 +7,19 @@ from typing import Any
 
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
-from clearvid.app.schemas.models import BackendType, EnhancementConfig, QualityMode, TargetProfile
+from clearvid.app.schemas.models import BackendType, EnhancementConfig, QualityMode, TargetProfile, UpscaleModel
 
 
 BACKEND_LABELS = {
     BackendType.AUTO: "自动",
     BackendType.BASELINE: "基线增强",
     BackendType.REALESRGAN: "Real-ESRGAN",
+}
+
+UPSCALE_MODEL_LABELS = {
+    UpscaleModel.AUTO: "自动（质量模式决定）",
+    UpscaleModel.GENERAL_V3: "General v3 （轻量快速）",
+    UpscaleModel.X4PLUS: "x4plus RRDB （高质量）",
 }
 
 QUALITY_LABELS = {
@@ -187,6 +193,9 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             self.backend_combo = q_combo_box()
             _populate_combo(self.backend_combo, BACKEND_LABELS, BackendType, BackendType.AUTO)
 
+            self.upscale_model_combo = q_combo_box()
+            _populate_combo(self.upscale_model_combo, UPSCALE_MODEL_LABELS, UpscaleModel, UpscaleModel.AUTO)
+
             self.preview_seconds = q_spin_box()
             self.preview_seconds.setMinimum(0)
             self.preview_seconds.setMaximum(24 * 60 * 60)
@@ -230,21 +239,23 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             form_layout.addWidget(self.quality_combo, 3, 1)
             form_layout.addWidget(q_label("增强后端"), 4, 0)
             form_layout.addWidget(self.backend_combo, 4, 1)
-            form_layout.addWidget(q_label("预览秒数"), 5, 0)
-            form_layout.addWidget(self.preview_seconds, 5, 1)
-            form_layout.addWidget(inspect_button, 5, 2)
-            form_layout.addWidget(q_label("人脸修复强度"), 6, 0)
-            form_layout.addWidget(self.face_restore_strength, 6, 1)
-            form_layout.addWidget(self.face_restore_enabled, 6, 2)
-            form_layout.addWidget(q_label("时序稳定强度"), 7, 0)
-            form_layout.addWidget(self.temporal_stabilize_strength, 7, 1)
-            form_layout.addWidget(self.temporal_stabilize_enabled, 7, 2)
+            form_layout.addWidget(q_label("超分模型"), 5, 0)
+            form_layout.addWidget(self.upscale_model_combo, 5, 1)
+            form_layout.addWidget(q_label("预览秒数"), 6, 0)
+            form_layout.addWidget(self.preview_seconds, 6, 1)
+            form_layout.addWidget(inspect_button, 6, 2)
+            form_layout.addWidget(q_label("人脸修复强度"), 7, 0)
+            form_layout.addWidget(self.face_restore_strength, 7, 1)
+            form_layout.addWidget(self.face_restore_enabled, 7, 2)
+            form_layout.addWidget(q_label("时序稳定强度"), 8, 0)
+            form_layout.addWidget(self.temporal_stabilize_strength, 8, 1)
+            form_layout.addWidget(self.temporal_stabilize_enabled, 8, 2)
 
             checkbox_row = q_hbox_layout()
             checkbox_row.addWidget(self.preserve_audio)
             checkbox_row.addWidget(self.preserve_subtitles)
             checkbox_row.addWidget(self.preserve_metadata)
-            form_layout.addLayout(checkbox_row, 8, 0, 1, 3)
+            form_layout.addLayout(checkbox_row, 9, 0, 1, 3)
 
             layout.addWidget(form_group)
 
@@ -359,6 +370,11 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 self.backend_combo.currentData(),
                 BackendType.AUTO,
             )
+            upscale_model = _coerce_enum(
+                UpscaleModel,
+                self.upscale_model_combo.currentData(),
+                UpscaleModel.AUTO,
+            )
 
             config = EnhancementConfig(
                 input_path=Path(self.input_edit.text()),
@@ -366,6 +382,7 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 target_profile=target_profile,
                 quality_mode=quality_mode,
                 backend=backend,
+                upscale_model=upscale_model,
                 face_restore_enabled=self.face_restore_enabled.isChecked(),
                 face_restore_strength=self.face_restore_strength.value(),
                 temporal_stabilize_enabled=self.temporal_stabilize_enabled.isChecked(),

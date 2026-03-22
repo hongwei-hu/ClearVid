@@ -26,6 +26,12 @@ class TargetProfile(str, Enum):
     SCALE4X = "scale4x"
 
 
+class UpscaleModel(str, Enum):
+    AUTO = "auto"
+    GENERAL_V3 = "general_v3"
+    X4PLUS = "x4plus"
+
+
 class HardwareProfile(str, Enum):
     AUTO = "auto"
     HIGH_END = "high_end"
@@ -88,6 +94,7 @@ class EnhancementConfig(BaseModel):
     target_profile: TargetProfile = TargetProfile.FHD
     quality_mode: QualityMode = QualityMode.QUALITY
     backend: BackendType = BackendType.AUTO
+    upscale_model: UpscaleModel = UpscaleModel.AUTO
     face_restore_enabled: bool = True
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
     temporal_stabilize_enabled: bool = True
