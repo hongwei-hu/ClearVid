@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clearvid"
+version = "0.1.0"
+description = "Windows-first video enhancement toolkit for real-world footage."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Proprietary" }
+authors = [
+  { name = "ClearVid" },
+]
+dependencies = [
+  "pydantic>=2.10,<3.0",
+  "pyyaml>=6.0.2,<7.0",
+  "rich>=13.9,<15.0",
+  "typer>=0.15,<1.0",
+]
+
+[project.optional-dependencies]
+gui = [
+  "PySide6>=6.8,<7.0",
+]
+media = [
+  "numpy>=2.2,<3.0",
+  "opencv-python>=4.10,<5.0",
+]
+inference = [
+  "torch>=2.6,<3.0",
+  "torchvision>=0.21,<1.0",
+  "basicsr>=1.4.2",
+  "facexlib>=0.3.0",
+  "realesrgan>=0.3.0",
+  "gfpgan>=1.3.8",
+]
+acceleration = [
+  "onnx>=1.17,<2.0",
+  "onnxruntime-gpu>=1.20,<2.0",
+]
+dev = [
+  "pytest>=8.3,<9.0",
+  "ruff>=0.11,<1.0",
+]
+
+[project.scripts]
+clearvid = "clearvid.app.cli:app"
+clearvid-gui = "clearvid.app.gui:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["clearvid"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

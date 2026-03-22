@@ -1,0 +1,16 @@
+target_profile: fhd
+quality_mode: quality
+backend: baseline
+face_restore_enabled: true
+face_restore_strength: 0.55
+denoise_strength: 0.08
+sharpen_strength: 0.12
+tile_size: 512
+tile_pad: 16
+batch_size: 4
+fp16_enabled: true
+preserve_audio: true
+preserve_subtitles: true
+preserve_metadata: true
+encoder: hevc_nvenc
+encoder_preset: p5
