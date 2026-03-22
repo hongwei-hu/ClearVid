@@ -12,9 +12,22 @@ import cv2
 import numpy as np
 
 from clearvid.app.models.codeformer_runner import CodeFormerRestorer
+from clearvid.app.models.tensorrt_engine import (
+    InferenceAccelerator,
+    accelerate_model,
+    describe_accelerator,
+    detect_best_accelerator,
+)
 from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
 from clearvid.app.preprocess.filters import build_preprocess_filters
-from clearvid.app.schemas.models import EnhancementConfig, QualityMode, TargetProfile, UpscaleModel, VideoMetadata
+from clearvid.app.schemas.models import (
+    EnhancementConfig,
+    InferenceAccelerator as InferenceAcceleratorEnum,
+    QualityMode,
+    TargetProfile,
+    UpscaleModel,
+    VideoMetadata,
+)
 from clearvid.app.utils.subprocess_utils import run_command
 
 DEFAULT_MODEL_SCALE = 4
@@ -124,6 +137,19 @@ def run_realesrgan_video(
     model_label = _MODEL_REGISTRY[model_key]["filename"]
     _emit_progress(progress_callback, 10, f"正在初始化 Real-ESRGAN ({model_label})")
     upsampler = _build_upsampler(config, model_path, model_key, metadata.width, metadata.height)
+
+    # Apply inference accelerator
+    accel = _resolve_accelerator(config.inference_accelerator)
+    if accel != InferenceAccelerator.NONE:
+        _emit_progress(progress_callback, 11, f"正在应用推理加速: {describe_accelerator(accel)}")
+        upsampler.model = accelerate_model(
+            upsampler.model,
+            accel,
+            fp16=config.fp16_enabled,
+            tile_size=config.tile_size or 512,
+            cache_dir=Path.cwd() / "weights" / "trt_cache",
+        )
+
     _emit_progress(progress_callback, 12, "正在初始化人脸修复")
     codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
     _emit_progress(progress_callback, 14, "正在初始化时序稳定器")
@@ -265,6 +291,13 @@ def _build_temporal_stabilizer(config: EnhancementConfig) -> TemporalStabilizer 
     if not config.temporal_stabilize_enabled:
         return None
     return TemporalStabilizer(strength=config.temporal_stabilize_strength)
+
+
+def _resolve_accelerator(requested: InferenceAcceleratorEnum) -> InferenceAccelerator:
+    """Map config enum to runtime accelerator, resolving AUTO."""
+    if requested == InferenceAcceleratorEnum.AUTO:
+        return detect_best_accelerator()
+    return InferenceAccelerator(requested.value)
 
 
 def _stream_process_video(
@@ -633,6 +666,41 @@ def _process_stream_frames(
     _emit_progress(progress_callback, 18, "正在流式处理视频帧")
 
     raw_queue, decode_errors, reader = _start_decode_thread(decoder.stdout, frame_size)
+
+    if config.async_pipeline:
+        _process_frames_async(
+            config, metadata, output_width, output_height, outscale,
+            upsampler, codeformer_restorer, stabilizer,
+            raw_queue, encoder, total_frames, progress_callback,
+        )
+    else:
+        _process_frames_sync(
+            config, metadata, output_width, output_height, outscale,
+            upsampler, codeformer_restorer, stabilizer,
+            raw_queue, encoder, total_frames, progress_callback,
+        )
+
+    reader.join()
+    if decode_errors:
+        raise decode_errors[0]
+
+
+def _process_frames_sync(
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+    outscale: float,
+    upsampler: object,
+    codeformer_restorer: CodeFormerRestorer | None,
+    stabilizer: TemporalStabilizer | None,
+    raw_queue: queue.Queue,
+    encoder: object,
+    total_frames: int | None,
+    progress_callback: Callable[[int, str], None] | None,
+) -> None:
+    """Original synchronous processing: inference and encode on main thread."""
+    use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
     processed_frames = 0
     last_reported_progress = -1
 
@@ -650,9 +718,83 @@ def _process_stream_frames(
         )
 
     encoder.stdin.close()
-    reader.join()
-    if decode_errors:
-        raise decode_errors[0]
+
+
+_ENHANCED_QUEUE_DEPTH = 4
+
+
+def _process_frames_async(
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+    outscale: float,
+    upsampler: object,
+    codeformer_restorer: CodeFormerRestorer | None,
+    stabilizer: TemporalStabilizer | None,
+    raw_queue: queue.Queue,
+    encoder: object,
+    total_frames: int | None,
+    progress_callback: Callable[[int, str], None] | None,
+) -> None:
+    """3-stage async pipeline: decode thread → GPU inference (main) → write thread.
+
+    Stage 1 (background thread): FFmpeg decode → raw_queue  (already running)
+    Stage 2 (main thread):       GPU inference → enhanced_queue
+    Stage 3 (background thread): Post-process + encode ← enhanced_queue
+
+    This overlaps GPU computation with CPU post-processing and I/O encoding.
+    """
+    enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+        maxsize=_ENHANCED_QUEUE_DEPTH,
+    )
+    write_errors: list[BaseException] = []
+    frames_written = [0]  # mutable counter shared with write thread
+
+    def _write_loop() -> None:
+        """Stage 3: consume enhanced frames, post-process, and write to encoder."""
+        try:
+            while True:
+                item = enhanced_queue.get()
+                if item is None:
+                    break
+                frames_written[0] += _write_enhanced_frames(
+                    item, codeformer_restorer, stabilizer,
+                    output_width, output_height, config.target_profile,
+                    encoder.stdin,
+                )
+        except Exception as exc:  # noqa: BLE001
+            write_errors.append(exc)
+        finally:
+            encoder.stdin.close()
+
+    write_thread = threading.Thread(target=_write_loop, daemon=True)
+    write_thread.start()
+
+    # Stage 2 (main thread): GPU inference — feeds enhanced_queue
+    use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
+    last_reported_progress = -1
+
+    try:
+        while True:
+            enhanced_list = _fetch_enhanced_frames(
+                raw_queue, use_batching, config.batch_size,
+                metadata.height, metadata.width, upsampler, outscale,
+            )
+            if enhanced_list is None:
+                break
+            enhanced_queue.put(enhanced_list)
+
+            # Report progress from write thread's counter
+            last_reported_progress = _report_stream_progress(
+                frames_written[0], total_frames, last_reported_progress, progress_callback,
+            )
+    finally:
+        enhanced_queue.put(None)  # signal write thread to stop
+
+    write_thread.join()
+    if write_errors:
+        raise write_errors[0]
 
 
 def _report_stream_progress(

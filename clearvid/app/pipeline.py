@@ -5,7 +5,7 @@ from pathlib import Path
 from clearvid.app.io.probe import collect_environment_info
 from clearvid.app.models.realesrgan_runner import resolve_upscale_model, validate_realesrgan_environment
 from clearvid.app.preprocess.filters import build_preprocess_filters
-from clearvid.app.schemas.models import BackendType, EnhancementConfig, ExecutionPlan, TargetProfile, VideoMetadata
+from clearvid.app.schemas.models import BackendType, EnhancementConfig, ExecutionPlan, InferenceAccelerator, TargetProfile, VideoMetadata
 
 
 def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> ExecutionPlan:
@@ -45,6 +45,9 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
         notes.append(f"Preprocess filters: {', '.join(preprocess_filters)}")
     else:
         notes.append("Preprocess filters: none")
+    accel_label = config.inference_accelerator.value
+    notes.append(f"Inference accelerator: {accel_label}")
+    notes.append(f"Async pipeline: {'ON' if config.async_pipeline else 'OFF'}")
     return ExecutionPlan(
         output_width=output_width,
         output_height=output_height,
