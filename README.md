@@ -9,6 +9,7 @@ ClearVid is a Windows-first Python project for enhancing real-world character vi
 - CLI and a simple desktop GUI are implemented.
 - Batch job discovery and task planning are implemented.
 - Baseline FFmpeg enhancement backend is implemented for end-to-end validation.
+- Real-ESRGAN true backend is implemented and validated on the sample video.
 - The GUI is directly launchable from Windows with the provided starter script.
 - Real-ESRGAN runtime detection is implemented, with automatic fallback to the baseline backend when the model runtime is unavailable.
 
@@ -19,9 +20,7 @@ ClearVid is a Windows-first Python project for enhancing real-world character vi
 - FFmpeg with NVENC and NVDEC support available on PATH
 - NVIDIA GPU with recent drivers
 
-The currently configured local Python is 3.13. It is fine for the scaffold, but for heavy PyTorch and model compatibility, Python 3.11 is the safer target.
-
-On this machine specifically, the installed PyTorch build does not support RTX 5090 GPU architecture yet, so the application currently auto-falls back to the FFmpeg baseline backend. The GUI will show this status clearly.
+The currently configured project `.venv` is using Python 3.13 on this machine and is already working with the installed CUDA-compatible PyTorch build.
 
 ## Install
 
@@ -87,19 +86,26 @@ Or on Windows, just run:
 
 ## Current model runtime note
 
-The `.venv` environment in this repository is now prepared for RTX 5090 compatible PyTorch.
+The `.venv` environment in this repository is prepared for RTX 5090 compatible PyTorch, and the Real-ESRGAN true backend is available.
 
 What is already ready:
 
 - `.venv` contains a CUDA-compatible PyTorch build with `sm_120` support.
 - ClearVid GUI and core dependencies are installed in `.venv`.
 - Real-ESRGAN related Python packages are installed in `.venv`.
+- ClearVid can auto-download the default `realesr-general-x4v3.pth` weight on first Real-ESRGAN run.
+- Auto backend selection now prefers Real-ESRGAN when the runtime is available.
 
-What is still missing for the true model backend:
+Optional manual setup:
 
-- Real-ESRGAN weight files under [weights/README.zh-CN.md](weights/README.zh-CN.md)
+- You can still place custom Real-ESRGAN weights under [weights/README.zh-CN.md](weights/README.zh-CN.md)
+- The baseline backend remains available as a fallback path from both CLI and GUI
 
-Until weights are added, the application will continue to run through the baseline backend, which is still directly usable from the GUI.
+Run a quick Real-ESRGAN preview:
+
+```powershell
+clearvid run samples\sample.mp4 --target-profile fhd --backend realesrgan --preview-seconds 2 --output outputs\sample_fhd_realesrgan_preview.mp4
+```
 
 ## What the baseline backend does
 
@@ -107,4 +113,4 @@ The baseline backend is intentionally simple. It uses FFmpeg scaling and mild cl
 
 It is not the final quality path.
 
-The next integration step is replacing the baseline video stage with Real-ESRGAN and attaching CodeFormer to the face enhancement stage.
+The current final quality path is the Real-ESRGAN backend. A later optional step is attaching CodeFormer to the face enhancement stage.

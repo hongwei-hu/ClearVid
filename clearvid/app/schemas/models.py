@@ -108,7 +108,7 @@ class EnhancementConfig(BaseModel):
 
 
 class ExecutionPlan(BaseModel):
-    command: list[str]
+    command: list[str] = Field(default_factory=list)
     output_width: int
     output_height: int
     backend: BackendType

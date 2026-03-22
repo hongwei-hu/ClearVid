@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from clearvid.app.models.realesrgan_runner import run_realesrgan_video
 from clearvid.app.io.probe import probe_video
 from clearvid.app.pipeline import build_execution_plan
 from clearvid.app.schemas.models import BatchResult, EnhancementConfig
@@ -25,7 +26,16 @@ class Orchestrator:
                 backend=plan.backend,
             )
 
-        run_command(plan.command)
+        if plan.backend.value == "realesrgan":
+            run_realesrgan_video(
+                config=config,
+                metadata=metadata,
+                output_width=plan.output_width,
+                output_height=plan.output_height,
+            )
+        else:
+            run_command(plan.command)
+
         return BatchResult(
             input_path=config.input_path,
             output_path=config.output_path,
