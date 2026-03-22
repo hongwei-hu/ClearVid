@@ -165,6 +165,8 @@ class MainWindow(QMainWindow):
         self._export_panel.setMinimumWidth(260)
         self._export_panel.setMaximumWidth(420)
         self._export_panel.export_requested.connect(self._run_job)
+        self._export_panel.pause_requested.connect(self._toggle_pause)
+        self._export_panel.cancel_requested.connect(self._cancel_current)
         self._export_panel.export_all_requested.connect(self._run_queue)
         self._export_panel.smart_params_requested.connect(self._apply_recommendation)
         self._export_panel.output_dir_changed.connect(self._settings.set_last_output_dir)
@@ -431,6 +433,7 @@ class MainWindow(QMainWindow):
         self._worker.failed.connect(self._on_failed)
         self._worker.cancelled.connect(self._on_cancelled)
         self._worker.preview_ready.connect(self._on_preview_ready)
+        self._export_panel.set_exporting_state(True)
         self._worker.start()
 
     def _on_progress(self, percent: int, message: str) -> None:
@@ -442,6 +445,7 @@ class MainWindow(QMainWindow):
     def _on_completed(self, payload: str) -> None:
         elapsed = time.monotonic() - self._export_start_time
         self._export_panel.set_export_enabled(True)
+        self._export_panel.set_exporting_state(False)
         self._export_panel.set_progress(100, "\u2705 处理完成")
         self._export_panel.show_post_export(self._export_panel.output_edit.text())
         self._log_message("处理完成:\n" + payload)
@@ -458,6 +462,7 @@ class MainWindow(QMainWindow):
     def _on_failed(self, message: str) -> None:
         elapsed = time.monotonic() - self._export_start_time
         self._export_panel.set_export_enabled(True)
+        self._export_panel.set_exporting_state(False)
         self._export_panel.set_progress(0, "\u274c 处理失败")
         self._log_message(f"处理失败: {message}")
         append_history(HistoryRecord.now(
@@ -470,6 +475,7 @@ class MainWindow(QMainWindow):
 
     def _on_cancelled(self) -> None:
         self._export_panel.set_export_enabled(True)
+        self._export_panel.set_exporting_state(False)
         self._export_panel.set_progress(0, "导出已取消")
         self._log_message("导出已被用户取消")
 
@@ -800,6 +806,17 @@ class MainWindow(QMainWindow):
         elif self._preview_worker and self._preview_worker.isRunning():
             self._preview_worker.requestInterruption()
             self._log_message("预览取消中…")
+
+    def _toggle_pause(self) -> None:
+        """Toggle pause/resume for the current export."""
+        if not hasattr(self, '_export_control') or self._export_control is None:
+            return
+        if self._export_control.is_paused:
+            self._export_control.resume()
+            self._log_message("导出已继续")
+        else:
+            self._export_control.pause()
+            self._log_message("导出已暂停")
 
     # ==================================================================
     # Onboarding (#20)

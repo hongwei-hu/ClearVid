@@ -171,6 +171,8 @@ class ExportPanel(QWidget):
     export_all_requested = Signal()  # queue all files in file list
     smart_params_requested = Signal()
     output_dir_changed = Signal(str)
+    pause_requested = Signal()
+    cancel_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -535,6 +537,26 @@ class ExportPanel(QWidget):
         self.export_all_btn.clicked.connect(self.export_all_requested.emit)
         bottom.addWidget(self.export_all_btn)
 
+        # Pause / Cancel buttons (visible only during export)
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+        self._pause_btn = QPushButton("⏸ 暂停")
+        self._pause_btn.setMinimumHeight(32)
+        self._pause_btn.setToolTip("暂停/继续当前导出")
+        self._pause_btn.setVisible(False)
+        self._pause_btn.clicked.connect(self._toggle_pause)
+        ctrl_row.addWidget(self._pause_btn)
+
+        self._cancel_btn = QPushButton("⏹ 取消")
+        self._cancel_btn.setMinimumHeight(32)
+        self._cancel_btn.setToolTip("取消当前导出 (Esc)")
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.clicked.connect(self.cancel_requested.emit)
+        ctrl_row.addWidget(self._cancel_btn)
+        bottom.addLayout(ctrl_row)
+
+        self._is_paused = False
+
         # Mid-export preview button (hidden until preview is available)
         self._preview_progress_btn = QPushButton("👁 预览已完成部分")
         self._preview_progress_btn.setMinimumHeight(32)
@@ -702,6 +724,19 @@ class ExportPanel(QWidget):
 
     def set_export_enabled(self, enabled: bool) -> None:
         self.export_btn.setEnabled(enabled)
+
+    def set_exporting_state(self, active: bool) -> None:
+        """Show/hide pause and cancel buttons based on export state."""
+        self._pause_btn.setVisible(active)
+        self._cancel_btn.setVisible(active)
+        if not active:
+            self._is_paused = False
+            self._pause_btn.setText("⏸ 暂停")
+
+    def _toggle_pause(self) -> None:
+        self._is_paused = not self._is_paused
+        self._pause_btn.setText("▶ 继续" if self._is_paused else "⏸ 暂停")
+        self.pause_requested.emit()
 
     def autofill_output(self, input_path: str, output_dir: str = "") -> None:
         """Auto-generate output path using the naming template."""
