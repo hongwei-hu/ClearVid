@@ -15,7 +15,7 @@ from clearvid.app.bootstrap.weight_manager import (
 )
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -848,6 +848,13 @@ def launch() -> None:
     sys.excepthook = _exception_hook
 
     app = QApplication(sys.argv)
+
+    # Set a default font with explicit point size to prevent
+    # "QFont::setPointSize: Point size <= 0" warnings from px-based stylesheets.
+    default_font = QFont("Segoe UI", 10)
+    default_font.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(default_font)
+
     app.setStyleSheet(get_dark_theme())
     window = MainWindow()
     window.show()
