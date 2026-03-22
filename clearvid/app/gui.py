@@ -423,7 +423,7 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 upscale_model=upscale_model,
                 inference_accelerator=inference_accelerator,
                 async_pipeline=self.async_pipeline.isChecked(),
-                face_restore_enabled=self.face_restore_enabled.isChecked()
+                face_restore_enabled=self.face_restore_enabled.isChecked(),
                 face_restore_strength=self.face_restore_strength.value(),
                 temporal_stabilize_enabled=self.temporal_stabilize_enabled.isChecked(),
                 temporal_stabilize_strength=self.temporal_stabilize_strength.value(),
