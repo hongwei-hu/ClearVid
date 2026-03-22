@@ -10,6 +10,7 @@ from rich.table import Table
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.pipeline import build_execution_plan
+from clearvid.app.recommend import recommend
 from clearvid.app.schemas.models import BackendType, EnhancementConfig, FaceRestoreModel, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
 from clearvid.app.task_queue import discover_video_files
 
@@ -65,6 +66,23 @@ def plan(
     )
     execution_plan = build_execution_plan(config, metadata)
     console.print_json(data=json.loads(execution_plan.model_dump_json()))
+
+    # Show smart recommendation
+    environment = collect_environment_info()
+    rec = recommend(metadata, environment)
+    table = Table(title="智能推荐参数")
+    table.add_column("参数")
+    table.add_column("推荐值")
+    table.add_row("输出规格", rec.target_profile)
+    table.add_row("质量模式", rec.quality_mode)
+    table.add_row("超分模型", rec.upscale_model)
+    table.add_row("编码器", rec.encoder)
+    table.add_row("推理加速", rec.inference_accelerator)
+    table.add_row("分块尺寸", str(rec.tile_size) if rec.tile_size else "无分块")
+    console.print(table)
+    if rec.notes:
+        for note in rec.notes:
+            console.print(f"  [dim]•[/dim] {note}")
 
 
 @app.command()

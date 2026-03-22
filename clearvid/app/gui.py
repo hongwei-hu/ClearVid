@@ -7,6 +7,7 @@ from typing import Any
 
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
+from clearvid.app.recommend import recommend
 from clearvid.app.schemas.models import BackendType, EnhancementConfig, FaceRestoreModel, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
 
 
@@ -66,11 +67,22 @@ def _coerce_enum(enum_type: type, value: Any, default: Any) -> Any:
     return default
 
 
+def _set_combo_by_value(combo: Any, value: str) -> None:
+    """Set a QComboBox to the item whose data (enum value) matches *value*."""
+    for i in range(combo.count()):
+        data = combo.itemData(i)
+        item_value = data.value if hasattr(data, "value") else str(data)
+        if item_value == value:
+            combo.setCurrentIndex(i)
+            return
+
+
 def main() -> None:
     qt = _load_qt()
     application = qt["QApplication"](sys.argv)
     worker_class = _create_worker_class(qt["QThread"], qt["Signal"])
-    window_class = _create_main_window_class(qt, worker_class)
+    preview_worker_class = _create_preview_worker_class(qt["QThread"], qt["Signal"])
+    window_class = _create_main_window_class(qt, worker_class, preview_worker_class)
     window = window_class()
     window.show()
     sys.exit(application.exec())
@@ -78,7 +90,8 @@ def main() -> None:
 
 def _load_qt() -> dict[str, object]:
     try:
-        from PySide6.QtCore import QThread, Signal
+        from PySide6.QtCore import QThread, Signal, Qt
+        from PySide6.QtGui import QImage, QPixmap
         from PySide6.QtWidgets import (
             QApplication,
             QCheckBox,
@@ -95,6 +108,7 @@ def _load_qt() -> dict[str, object]:
             QPlainTextEdit,
             QProgressBar,
             QPushButton,
+            QSlider,
             QSpinBox,
             QVBoxLayout,
             QWidget,
@@ -111,17 +125,21 @@ def _load_qt() -> dict[str, object]:
         "QGridLayout": QGridLayout,
         "QGroupBox": QGroupBox,
         "QHBoxLayout": QHBoxLayout,
+        "QImage": QImage,
         "QLabel": QLabel,
         "QLineEdit": QLineEdit,
         "QMainWindow": QMainWindow,
         "QMessageBox": QMessageBox,
+        "QPixmap": QPixmap,
         "QPlainTextEdit": QPlainTextEdit,
         "QProgressBar": QProgressBar,
         "QPushButton": QPushButton,
+        "QSlider": QSlider,
         "QSpinBox": QSpinBox,
         "QThread": QThread,
         "QVBoxLayout": QVBoxLayout,
         "QWidget": QWidget,
+        "Qt": Qt,
         "Signal": Signal,
     }
 
@@ -149,7 +167,27 @@ def _create_worker_class(q_thread_cls: Any, signal_factory: Any) -> type:
     return Worker
 
 
-def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type:
+def _create_preview_worker_class(q_thread_cls: Any, signal_factory: Any) -> type:
+    class PreviewWorker(q_thread_cls):  # type: ignore[misc, valid-type]
+        finished = signal_factory(object, object)  # type: ignore[operator]  # (original_bgr, enhanced_bgr)
+        failed = signal_factory(str)  # type: ignore[operator]
+
+        def __init__(self, config: EnhancementConfig, timestamp_sec: float):
+            super().__init__()
+            self._config = config
+            self._timestamp_sec = timestamp_sec
+
+        def run(self) -> None:
+            try:
+                original, enhanced, _ = Orchestrator().preview_frame(self._config, self._timestamp_sec)
+                self.finished.emit(original, enhanced)
+            except Exception as exc:  # noqa: BLE001
+                self.failed.emit(str(exc))
+
+    return PreviewWorker
+
+
+def _create_main_window_class(qt: dict[str, object], worker_class: type, preview_worker_class: type) -> type:
     q_check_box = qt["QCheckBox"]
     q_combo_box = qt["QComboBox"]
     q_double_spin_box = qt["QDoubleSpinBox"]
@@ -157,25 +195,31 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
     q_grid_layout = qt["QGridLayout"]
     q_group_box = qt["QGroupBox"]
     q_hbox_layout = qt["QHBoxLayout"]
+    q_image = qt["QImage"]
     q_label = qt["QLabel"]
     q_line_edit = qt["QLineEdit"]
     q_main_window = qt["QMainWindow"]
     q_message_box = qt["QMessageBox"]
+    q_pixmap = qt["QPixmap"]
     q_plain_text_edit = qt["QPlainTextEdit"]
     q_progress_bar = qt["QProgressBar"]
     q_push_button = qt["QPushButton"]
+    q_slider = qt["QSlider"]
     q_spin_box = qt["QSpinBox"]
     q_vbox_layout = qt["QVBoxLayout"]
     q_widget = qt["QWidget"]
+    qt_ns = qt["Qt"]
 
     class MainWindow(q_main_window):  # type: ignore[misc, valid-type]
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("ClearVid 视频清晰度增强")
-            self.resize(920, 620)
+            self.resize(920, 720)
             self._worker: object | None = None
+            self._preview_worker: object | None = None
             self._last_progress_message = ""
             self._environment = collect_environment_info()
+            self._video_duration: float = 0.0
 
             root = q_widget()
             layout = q_vbox_layout(root)
@@ -336,12 +380,53 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
 
             layout.addWidget(form_group)
 
+            # --- Preview panel ---
+            preview_group = q_group_box("帧预览 (Before / After)")
+            preview_layout = q_vbox_layout(preview_group)
+
+            # Time slider row
+            slider_row = q_hbox_layout()
+            slider_row.addWidget(q_label("时间位置"))
+            self.preview_slider = q_slider(qt_ns.Horizontal)
+            self.preview_slider.setMinimum(0)
+            self.preview_slider.setMaximum(1000)
+            self.preview_slider.setValue(0)
+            slider_row.addWidget(self.preview_slider)
+            self.preview_time_label = q_label("0.0 秒")
+            self.preview_time_label.setMinimumWidth(60)
+            slider_row.addWidget(self.preview_time_label)
+            self.preview_button = q_push_button("生成预览")
+            self.preview_button.clicked.connect(self._run_preview)
+            slider_row.addWidget(self.preview_button)
+            preview_layout.addLayout(slider_row)
+
+            self.preview_slider.valueChanged.connect(self._on_slider_moved)
+
+            # Before / After image row
+            image_row = q_hbox_layout()
+            self.before_label = q_label("原始帧")
+            self.before_label.setAlignment(qt_ns.AlignCenter)
+            self.before_label.setMinimumHeight(180)
+            self.before_label.setStyleSheet("background: #1a1a1a; color: #888; border: 1px solid #333;")
+            self.after_label = q_label("增强帧")
+            self.after_label.setAlignment(qt_ns.AlignCenter)
+            self.after_label.setMinimumHeight(180)
+            self.after_label.setStyleSheet("background: #1a1a1a; color: #888; border: 1px solid #333;")
+            image_row.addWidget(self.before_label)
+            image_row.addWidget(self.after_label)
+            preview_layout.addLayout(image_row)
+
+            layout.addWidget(preview_group)
+
             buttons = q_hbox_layout()
             plan_button = q_push_button("自动生成输出路径")
             plan_button.clicked.connect(self._autofill_output)
+            smart_button = q_push_button("一键最佳")
+            smart_button.clicked.connect(self._apply_recommendation)
             self.run_button = q_push_button("开始导出")
             self.run_button.clicked.connect(self._run_job)
             buttons.addWidget(plan_button)
+            buttons.addWidget(smart_button)
             buttons.addWidget(self.run_button)
             layout.addLayout(buttons)
 
@@ -408,6 +493,115 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 f"输入信息: 分辨率 {metadata.width}x{metadata.height}, 帧率 {metadata.fps:.3f} fps, "
                 f"视频编码 {metadata.video_codec}, 音频流 {metadata.audio_streams} 条, 时长 {metadata.duration_seconds:.2f} 秒"
             )
+
+        def _on_slider_moved(self, value: int) -> None:
+            if self._video_duration > 0:
+                seconds = value / 1000.0 * self._video_duration
+                self.preview_time_label.setText(f"{seconds:.1f} 秒")
+            else:
+                self.preview_time_label.setText(f"{value / 10.0:.1f}%")
+
+        def _run_preview(self) -> None:
+            if not self.input_edit.text():
+                q_message_box.information(self, "未选择输入视频", "请先选择一个输入视频文件。")
+                return
+
+            # Probe for duration if not yet known
+            if self._video_duration <= 0:
+                try:
+                    meta = probe_video(Path(self.input_edit.text()))
+                    self._video_duration = meta.duration_seconds
+                except Exception:  # noqa: BLE001
+                    self._video_duration = 60.0  # fallback
+
+            timestamp = self.preview_slider.value() / 1000.0 * max(self._video_duration, 0.1)
+
+            # Build a minimal config for preview
+            target_profile = _coerce_enum(TargetProfile, self.target_combo.currentData(), TargetProfile.FHD)
+            quality_mode = _coerce_enum(QualityMode, self.quality_combo.currentData(), QualityMode.QUALITY)
+            upscale_model = _coerce_enum(UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO)
+
+            config = EnhancementConfig(
+                input_path=Path(self.input_edit.text()),
+                output_path=Path(self.output_edit.text() or "preview_temp.mp4"),
+                target_profile=target_profile,
+                quality_mode=quality_mode,
+                upscale_model=upscale_model,
+                face_restore_enabled=self.face_restore_enabled.isChecked(),
+                face_restore_strength=self.face_restore_strength.value(),
+                face_restore_model=_coerce_enum(
+                    FaceRestoreModel,
+                    self.face_restore_model_combo.currentData(),
+                    FaceRestoreModel.CODEFORMER,
+                ),
+                face_poisson_blend=self.face_poisson_blend.isChecked(),
+                sharpen_enabled=self.sharpen_enabled.isChecked(),
+                sharpen_strength=self.sharpen_strength.value(),
+            )
+
+            self.preview_button.setEnabled(False)
+            self.preview_button.setText("预览生成中...")
+            self.log.appendPlainText(f"正在生成预览帧 (t={timestamp:.1f}s)...")
+
+            self._preview_worker = preview_worker_class(config, timestamp)
+            self._preview_worker.finished.connect(self._on_preview_finished)
+            self._preview_worker.failed.connect(self._on_preview_failed)
+            self._preview_worker.start()
+
+        def _on_preview_finished(self, original: object, enhanced: object) -> None:
+            import numpy as np
+
+            self.preview_button.setEnabled(True)
+            self.preview_button.setText("生成预览")
+
+            def _numpy_to_pixmap(bgr_array: np.ndarray, max_width: int = 440) -> object:
+                rgb = bgr_array[:, :, ::-1].copy()
+                h, w, ch = rgb.shape
+                image = q_image(rgb.data, w, h, ch * w, q_image.Format.Format_RGB888)
+                pix = q_pixmap.fromImage(image)
+                if pix.width() > max_width:
+                    pix = pix.scaledToWidth(max_width, qt_ns.SmoothTransformation)
+                return pix
+
+            self.before_label.setPixmap(_numpy_to_pixmap(original))
+            self.after_label.setPixmap(_numpy_to_pixmap(enhanced))
+            self.log.appendPlainText("预览帧已生成")
+
+        def _on_preview_failed(self, message: str) -> None:
+            self.preview_button.setEnabled(True)
+            self.preview_button.setText("生成预览")
+            self.log.appendPlainText(f"预览失败: {message}")
+
+        def _apply_recommendation(self) -> None:
+            if not self.input_edit.text():
+                q_message_box.information(self, "未选择输入视频", "请先选择一个输入视频再使用一键最佳。")
+                return
+
+            try:
+                metadata = probe_video(Path(self.input_edit.text()))
+            except Exception as exc:  # noqa: BLE001
+                q_message_box.critical(self, "视频分析失败", str(exc))
+                return
+
+            self._video_duration = metadata.duration_seconds
+            rec = recommend(metadata, self._environment)
+
+            # Apply recommendation to widgets
+            _set_combo_by_value(self.target_combo, rec.target_profile)
+            _set_combo_by_value(self.quality_combo, rec.quality_mode)
+            _set_combo_by_value(self.upscale_model_combo, rec.upscale_model)
+            _set_combo_by_value(self.accelerator_combo, rec.inference_accelerator)
+            self.face_restore_enabled.setChecked(rec.face_restore_enabled)
+            _set_combo_by_value(self.face_restore_model_combo, rec.face_restore_model)
+            self.temporal_stabilize_enabled.setChecked(rec.temporal_stabilize_enabled)
+            self.sharpen_enabled.setChecked(rec.sharpen_enabled)
+            self.sharpen_strength.setValue(rec.sharpen_strength)
+            self.async_pipeline.setChecked(rec.async_pipeline)
+
+            self._autofill_output()
+
+            notes_text = "\n".join(f"  • {n}" for n in rec.notes)
+            self.log.appendPlainText(f"一键最佳已应用:\n{notes_text}")
 
         def _refresh_environment_status(self) -> None:
             preferred_backend_text = {
