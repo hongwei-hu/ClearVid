@@ -6,17 +6,18 @@ import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
     QScrollArea,
     QSizePolicy,
     QSlider,
-    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from clearvid.app.gui.estimation import format_duration
 from clearvid.app.gui.widgets.split_preview import SplitCompareWidget
 
 
@@ -24,6 +25,7 @@ class PreviewPanel(QWidget):
     """Center panel with split-line Before/After comparison and time slider."""
 
     preview_requested = Signal(float)  # timestamp in seconds
+    auto_preview_changed = Signal(bool)  # emitted when checkbox toggled
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -59,15 +61,24 @@ class PreviewPanel(QWidget):
         self._slider.setMaximum(1000)
         self._slider.setValue(0)
         self._slider.valueChanged.connect(self._on_slider_moved)
+        self._slider.sliderReleased.connect(self._on_slider_released)
         slider_row.addWidget(self._slider, 1)
 
-        self._time_label = QLabel("0.0 秒")
+        self._time_label = QLabel("0 秒")
         self._time_label.setMinimumWidth(60)
         slider_row.addWidget(self._time_label)
 
-        self._preview_btn = QPushButton("生成预览")
-        self._preview_btn.clicked.connect(self._request_preview)
-        slider_row.addWidget(self._preview_btn)
+        self._auto_preview_cb = QCheckBox("自动生成预览")
+        self._auto_preview_cb.setChecked(False)
+        self._auto_preview_cb.setToolTip(
+            "勾选后，选择视频或拖动进度条后自动生成预览图"
+        )
+        self._auto_preview_cb.toggled.connect(self.auto_preview_changed.emit)
+        slider_row.addWidget(self._auto_preview_cb)
+
+        self._preview_status = QLabel("")
+        self._preview_status.setStyleSheet("color: #9e9e9e; font-size: 11px;")
+        slider_row.addWidget(self._preview_status)
 
         layout.addLayout(slider_row)
 
@@ -79,8 +90,8 @@ class PreviewPanel(QWidget):
         self._video_duration = duration
 
     def set_preview_loading(self, loading: bool) -> None:
-        self._preview_btn.setEnabled(not loading)
-        self._preview_btn.setText("预览生成中..." if loading else "生成预览")
+        self._auto_preview_cb.setEnabled(not loading)
+        self._preview_status.setText("预览生成中..." if loading else "")
 
     def update_preview(
         self, original_bgr: np.ndarray, enhanced_bgr: np.ndarray
@@ -99,14 +110,23 @@ class PreviewPanel(QWidget):
         """Alias for get_timestamp — used by auto-preview and shortcuts."""
         return self.get_timestamp()
 
+    def is_auto_preview(self) -> bool:
+        """Return whether auto-preview is enabled."""
+        return self._auto_preview_cb.isChecked()
+
     # ---- Internal ----
 
     def _on_slider_moved(self, value: int) -> None:
         if self._video_duration > 0:
             seconds = value / 1000.0 * self._video_duration
-            self._time_label.setText(f"{seconds:.1f} 秒")
+            self._time_label.setText(format_duration(seconds))
         else:
             self._time_label.setText(f"{value / 10.0:.1f}%")
+
+    def _on_slider_released(self) -> None:
+        """When slider drag ends, auto-request preview if enabled."""
+        if self._auto_preview_cb.isChecked():
+            self.preview_requested.emit(self.get_timestamp())
 
     def _request_preview(self) -> None:
         self.preview_requested.emit(self.get_timestamp())

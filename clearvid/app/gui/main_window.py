@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from clearvid.app.gui._helpers import coerce_enum
+from clearvid.app.gui.estimation import format_duration
 from clearvid.app.gui.export_panel import ExportPanel
 from clearvid.app.gui.file_panel import FilePanel
 from clearvid.app.gui.history_dialog import HistoryRecord, append_history, HistoryDialog
@@ -244,18 +245,22 @@ class MainWindow(QMainWindow):
             info_text = (
                 f"{metadata.width}\u00d7{metadata.height}  |  "
                 f"{metadata.fps:.1f} fps  |  {metadata.video_codec}  |  "
-                f"{metadata.duration_seconds:.1f} 秒"
+                f"{format_duration(metadata.duration_seconds)}"
             )
             self._preview_panel.set_video_info(info_text, metadata.duration_seconds)
             self._log_message(
                 f"已加载: {Path(path).name}  "
                 f"({metadata.width}x{metadata.height}, {metadata.fps:.1f} fps, "
-                f"{metadata.video_codec}, {metadata.duration_seconds:.1f}s)"
+                f"{metadata.video_codec}, {format_duration(metadata.duration_seconds)})"
             )
             # Update estimation
             self._export_panel.update_estimation(
                 self._video_duration, self._video_frames, self._video_size_bytes,
             )
+            # Auto-preview at slider position when enabled
+            if self._preview_panel.is_auto_preview():
+                ts = self._preview_panel.current_timestamp()
+                self._run_preview(ts)
         except Exception as exc:  # noqa: BLE001
             self._preview_panel.set_video_info(f"\u26a0 无法解析: {exc}", 0)
             self._log_message(f"视频探测失败: {exc}")
@@ -712,11 +717,13 @@ class MainWindow(QMainWindow):
 
     def _schedule_preview_refresh(self) -> None:
         """Restart the 500 ms debounce timer on any parameter change."""
-        if self._file_panel.input_path:
+        if self._file_panel.input_path and self._preview_panel.is_auto_preview():
             self._preview_debounce.start()
 
     def _auto_refresh_preview(self) -> None:
         """Fired after 500 ms of no parameter changes — refresh preview at current timestamp."""
+        if not self._preview_panel.is_auto_preview():
+            return
         ts = self._preview_panel.current_timestamp()
         if ts >= 0 and self._file_panel.input_path:
             self._run_preview(ts)

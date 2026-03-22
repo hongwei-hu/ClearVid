@@ -96,7 +96,7 @@ def estimate_export(
     est_mb = est_bytes / (1024 * 1024)
 
     # --- Description ---
-    time_str = _format_duration(est_seconds)
+    time_str = format_duration(est_seconds)
     size_str = f"{est_mb:.0f} MB" if est_mb < 1024 else f"{est_mb / 1024:.1f} GB"
     desc = f"预计耗时 {time_str}，输出约 {size_str}"
 
@@ -122,7 +122,7 @@ def _interpolate_crf_mult(crf: int) -> float:
     return 1.0
 
 
-def _format_duration(seconds: float) -> str:
+def format_duration(seconds: float) -> str:
     """Format seconds into human-readable string."""
     if seconds < 60:
         return f"{seconds:.0f} 秒"

@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from clearvid.app.gui._helpers import coerce_enum, populate_combo, set_combo_by_value
-from clearvid.app.gui.estimation import estimate_export
+from clearvid.app.gui.estimation import estimate_export, format_duration
 from clearvid.app.gui.naming import DEFAULT_TEMPLATE, render_output_name
 from clearvid.app.gui.preset_cards import BUILTIN_PRESETS, Preset, PresetCardsWidget
 from clearvid.app.gui.widgets.collapsible import CollapsibleSection
@@ -256,6 +256,7 @@ class ExportPanel(QWidget):
         self.preview_seconds.setValue(0)
         self.preview_seconds.setSuffix(" 秒")
         self.preview_seconds.setSpecialValueText("完整视频")
+        self.preview_seconds.valueChanged.connect(self._on_export_duration_changed)
         lay.addLayout(_labeled_row(
             "导出时长", self.preview_seconds,
             "仅处理视频前 N 秒，设为 0 则导出全片。适合快速试效果。",
@@ -687,6 +688,31 @@ class ExportPanel(QWidget):
         source_size_bytes: int = 0,
     ) -> None:
         """Update the estimation label with rough time and size predictions."""
+        # Store source metadata for re-computation when export duration changes.
+        self._src_duration = duration_sec
+        self._src_frames = total_frames
+        self._src_size_bytes = source_size_bytes
+        self._refresh_estimation()
+
+    def _on_export_duration_changed(self) -> None:
+        """Re-compute estimation when the user changes the export duration."""
+        if hasattr(self, "_src_duration"):
+            self._refresh_estimation()
+
+    def _refresh_estimation(self) -> None:
+        """(Re-)compute and display the estimation with current settings."""
+        dur = self._src_duration
+        frames = self._src_frames
+        size_bytes = self._src_size_bytes
+
+        # If user set a partial export duration, clamp to that.
+        export_sec = self.preview_seconds.value()
+        if export_sec > 0 and dur > 0:
+            ratio = min(export_sec / dur, 1.0)
+            dur = export_sec
+            frames = max(1, int(frames * ratio))
+            size_bytes = int(size_bytes * ratio)
+
         quality = coerce_enum(
             QualityMode, self.quality_combo.currentData(), QualityMode.QUALITY
         )
@@ -695,12 +721,12 @@ class ExportPanel(QWidget):
         )
         crf_val = self.encoder_crf.value() if self.encoder_crf.value() > 0 else 18
         est = estimate_export(
-            duration_sec=duration_sec,
-            total_frames=total_frames,
+            duration_sec=dur,
+            total_frames=frames,
             quality_mode=quality.value if quality else "quality",
             target_profile=profile.value if profile else "fhd",
             encoder_crf=crf_val,
-            source_size_bytes=source_size_bytes,
+            source_size_bytes=size_bytes,
         )
         self.estimation_label.setText(f"📊 {est.description}")
         self.estimation_label.setVisible(True)
