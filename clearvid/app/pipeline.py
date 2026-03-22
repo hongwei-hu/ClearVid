@@ -48,6 +48,14 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
     accel_label = config.inference_accelerator.value
     notes.append(f"Inference accelerator: {accel_label}")
     notes.append(f"Async pipeline: {'ON' if config.async_pipeline else 'OFF'}")
+    if config.face_restore_enabled:
+        notes.append(f"Face restore: {config.face_restore_model.value} (strength={config.face_restore_strength:.2f}, poisson={config.face_poisson_blend})")
+    if config.sharpen_enabled:
+        notes.append(f"Sharpening: ON (strength={config.sharpen_strength:.2f})")
+    if config.encoder_crf is not None:
+        notes.append(f"Encoder CRF: {config.encoder_crf}")
+    if config.output_pixel_format != "yuv420p":
+        notes.append(f"Pixel format: {config.output_pixel_format}")
     return ExecutionPlan(
         output_width=output_width,
         output_height=output_height,

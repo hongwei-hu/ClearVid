@@ -10,7 +10,7 @@ from rich.table import Table
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.pipeline import build_execution_plan
-from clearvid.app.schemas.models import BackendType, EnhancementConfig, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
+from clearvid.app.schemas.models import BackendType, EnhancementConfig, FaceRestoreModel, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
 from clearvid.app.task_queue import discover_video_files
 
 app = typer.Typer(help="ClearVid command line interface")
@@ -78,8 +78,14 @@ def run(
     preserve_audio: bool = typer.Option(True),
     preserve_subtitles: bool = typer.Option(True),
     preserve_metadata: bool = typer.Option(True),
-    face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
+    face_restore_enabled: bool = typer.Option(True, help="Enable face restoration"),
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
+    face_restore_model: FaceRestoreModel = typer.Option(FaceRestoreModel.CODEFORMER, help="Face restore model (codeformer/gfpgan)"),
+    face_poisson_blend: bool = typer.Option(False, help="Use Poisson blending for face paste-back"),
+    sharpen_enabled: bool = typer.Option(True, "--sharpen/--no-sharpen", help="Enable post-process sharpening"),
+    sharpen_strength: float = typer.Option(0.12, min=0.0, max=1.0, help="Sharpening strength"),
+    encoder_crf: int | None = typer.Option(None, help="Encoder CRF/CQ value (lower = higher quality)"),
+    output_pixel_format: str = typer.Option("yuv420p", help="Output pixel format (yuv420p/yuv420p10le/p010le)"),
     temporal_stabilize_enabled: bool = typer.Option(True, help="Enable optical-flow temporal stabilization"),
     temporal_stabilize_strength: float = typer.Option(0.6, min=0.0, max=1.0, help="Temporal stabilization strength"),
     preprocess_denoise: bool = typer.Option(True, help="Enable nlmeans denoise preprocessing"),
@@ -103,6 +109,12 @@ def run(
         preserve_metadata=preserve_metadata,
         face_restore_enabled=face_restore_enabled,
         face_restore_strength=face_restore_strength,
+        face_restore_model=face_restore_model,
+        face_poisson_blend=face_poisson_blend,
+        sharpen_enabled=sharpen_enabled,
+        sharpen_strength=sharpen_strength,
+        encoder_crf=encoder_crf,
+        output_pixel_format=output_pixel_format,
         temporal_stabilize_enabled=temporal_stabilize_enabled,
         temporal_stabilize_strength=temporal_stabilize_strength,
         preprocess_denoise=preprocess_denoise,
@@ -126,8 +138,14 @@ def batch(
     backend: BackendType = typer.Option(BackendType.AUTO),
     upscale_model: UpscaleModel = typer.Option(UpscaleModel.AUTO, help="Super-resolution model (auto/general_v3/x4plus)"),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
-    face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
+    face_restore_enabled: bool = typer.Option(True, help="Enable face restoration"),
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
+    face_restore_model: FaceRestoreModel = typer.Option(FaceRestoreModel.CODEFORMER, help="Face restore model (codeformer/gfpgan)"),
+    face_poisson_blend: bool = typer.Option(False, help="Use Poisson blending for face paste-back"),
+    sharpen_enabled: bool = typer.Option(True, "--sharpen/--no-sharpen", help="Enable post-process sharpening"),
+    sharpen_strength: float = typer.Option(0.12, min=0.0, max=1.0, help="Sharpening strength"),
+    encoder_crf: int | None = typer.Option(None, help="Encoder CRF/CQ value"),
+    output_pixel_format: str = typer.Option("yuv420p", help="Output pixel format"),
     temporal_stabilize_enabled: bool = typer.Option(True, help="Enable optical-flow temporal stabilization"),
     temporal_stabilize_strength: float = typer.Option(0.6, min=0.0, max=1.0, help="Temporal stabilization strength"),
     preprocess_denoise: bool = typer.Option(True, help="Enable nlmeans denoise preprocessing"),
@@ -152,6 +170,12 @@ def batch(
         quality_mode=quality_mode,
         face_restore_enabled=face_restore_enabled,
         face_restore_strength=face_restore_strength,
+        face_restore_model=face_restore_model,
+        face_poisson_blend=face_poisson_blend,
+        sharpen_enabled=sharpen_enabled,
+        sharpen_strength=sharpen_strength,
+        encoder_crf=encoder_crf,
+        output_pixel_format=output_pixel_format,
         temporal_stabilize_enabled=temporal_stabilize_enabled,
         temporal_stabilize_strength=temporal_stabilize_strength,
         preprocess_denoise=preprocess_denoise,

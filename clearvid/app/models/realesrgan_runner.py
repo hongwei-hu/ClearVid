@@ -12,16 +12,19 @@ import cv2
 import numpy as np
 
 from clearvid.app.models.codeformer_runner import CodeFormerRestorer
+from clearvid.app.models.gfpgan_runner import GFPGANRestorer
 from clearvid.app.models.tensorrt_engine import (
     InferenceAccelerator,
     accelerate_model,
     describe_accelerator,
     detect_best_accelerator,
 )
+from clearvid.app.postprocess.enhance import apply_sharpening
 from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
 from clearvid.app.preprocess.filters import build_preprocess_filters
 from clearvid.app.schemas.models import (
     EnhancementConfig,
+    FaceRestoreModel,
     InferenceAccelerator as InferenceAcceleratorEnum,
     QualityMode,
     TargetProfile,
@@ -275,15 +278,23 @@ def _build_codeformer_restorer(
     metadata: VideoMetadata,
     output_width: int,
     output_height: int,
-) -> CodeFormerRestorer | None:
+) -> CodeFormerRestorer | GFPGANRestorer | None:
     if not config.face_restore_enabled:
         return None
 
     upscale_factor = _resolve_outscale(metadata, output_width, output_height, config.target_profile)
+
+    if config.face_restore_model == FaceRestoreModel.GFPGAN:
+        return GFPGANRestorer(
+            upscale_factor=upscale_factor,
+            weights_root=Path.cwd() / "weights",
+        )
+
     return CodeFormerRestorer(
         fidelity_weight=config.face_restore_strength,
         upscale_factor=upscale_factor,
         weights_root=Path.cwd() / "weights",
+        use_poisson_blend=config.face_poisson_blend,
     )
 
 
@@ -494,14 +505,23 @@ def _build_encode_command(
         "pipe:0",
         "-c:v",
         config.encoder,
-        "-preset",
-        config.encoder_preset,
     ]
-    if config.video_bitrate:
+    # AV1 NVENC uses different preset naming
+    if config.encoder == "av1_nvenc":
+        command.extend(["-preset", config.encoder_preset])
+        command.extend(["-tier", "1"])
+    else:
+        command.extend(["-preset", config.encoder_preset])
+
+    # Quality control: explicit CRF > explicit bitrate > default CQ
+    if config.encoder_crf is not None:
+        command.extend(["-cq", str(config.encoder_crf)])
+    elif config.video_bitrate:
         command.extend(["-b:v", config.video_bitrate])
     else:
         command.extend(["-cq", "18"])
-    command.extend(["-pix_fmt", "yuv420p", "-an", str(temp_video_path)])
+
+    command.extend(["-pix_fmt", config.output_pixel_format, "-an", str(temp_video_path)])
     return command
 
 
@@ -624,12 +644,13 @@ def _fetch_enhanced_frames(
 
 def _write_enhanced_frames(
     enhanced_list: list[np.ndarray],
-    codeformer_restorer: CodeFormerRestorer | None,
+    codeformer_restorer: CodeFormerRestorer | GFPGANRestorer | None,
     stabilizer: TemporalStabilizer | None,
     output_width: int,
     output_height: int,
     target_profile: TargetProfile,
     encoder_stdin: object,
+    sharpen_strength: float = 0.0,
 ) -> int:
     """Post-process and write frames to encoder. Returns count written."""
     count = 0
@@ -639,6 +660,8 @@ def _write_enhanced_frames(
         finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
         if stabilizer is not None:
             finalized = stabilizer.stabilize(finalized)
+        if sharpen_strength > 0:
+            finalized = apply_sharpening(finalized, sharpen_strength)
         encoder_stdin.write(np.ascontiguousarray(finalized).tobytes())
         count += 1
     return count
@@ -651,7 +674,7 @@ def _process_stream_frames(
     output_height: int,
     outscale: float,
     upsampler: object,
-    codeformer_restorer: CodeFormerRestorer | None,
+    codeformer_restorer: CodeFormerRestorer | GFPGANRestorer | None,
     stabilizer: TemporalStabilizer | None,
     decoder: object,
     encoder: object,
@@ -692,7 +715,7 @@ def _process_frames_sync(
     output_height: int,
     outscale: float,
     upsampler: object,
-    codeformer_restorer: CodeFormerRestorer | None,
+    codeformer_restorer: CodeFormerRestorer | GFPGANRestorer | None,
     stabilizer: TemporalStabilizer | None,
     raw_queue: queue.Queue,
     encoder: object,
@@ -712,6 +735,7 @@ def _process_frames_sync(
             break
         processed_frames += _write_enhanced_frames(
             enhanced_list, codeformer_restorer, stabilizer, output_width, output_height, config.target_profile, encoder.stdin,
+            sharpen_strength=config.sharpen_strength if config.sharpen_enabled else 0.0,
         )
         last_reported_progress = _report_stream_progress(
             processed_frames, total_frames, last_reported_progress, progress_callback,
@@ -730,7 +754,7 @@ def _process_frames_async(
     output_height: int,
     outscale: float,
     upsampler: object,
-    codeformer_restorer: CodeFormerRestorer | None,
+    codeformer_restorer: CodeFormerRestorer | GFPGANRestorer | None,
     stabilizer: TemporalStabilizer | None,
     raw_queue: queue.Queue,
     encoder: object,
@@ -762,6 +786,7 @@ def _process_frames_async(
                     item, codeformer_restorer, stabilizer,
                     output_width, output_height, config.target_profile,
                     encoder.stdin,
+                    sharpen_strength=config.sharpen_strength if config.sharpen_enabled else 0.0,
                 )
         except Exception as exc:  # noqa: BLE001
             write_errors.append(exc)

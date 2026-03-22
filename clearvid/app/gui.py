@@ -7,7 +7,7 @@ from typing import Any
 
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
-from clearvid.app.schemas.models import BackendType, EnhancementConfig, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
+from clearvid.app.schemas.models import BackendType, EnhancementConfig, FaceRestoreModel, InferenceAccelerator, QualityMode, TargetProfile, UpscaleModel
 
 
 BACKEND_LABELS = {
@@ -27,6 +27,11 @@ ACCELERATOR_LABELS = {
     InferenceAccelerator.NONE: "无加速",
     InferenceAccelerator.COMPILE: "torch.compile",
     InferenceAccelerator.TENSORRT: "TensorRT",
+}
+
+FACE_MODEL_LABELS = {
+    FaceRestoreModel.CODEFORMER: "CodeFormer",
+    FaceRestoreModel.GFPGAN: "GFPGAN",
 }
 
 QUALITY_LABELS = {
@@ -230,6 +235,31 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             self.temporal_stabilize_strength.setSingleStep(0.05)
             self.temporal_stabilize_strength.setValue(0.6)
 
+            self.face_restore_model_combo = q_combo_box()
+            _populate_combo(self.face_restore_model_combo, FACE_MODEL_LABELS, FaceRestoreModel, FaceRestoreModel.CODEFORMER)
+            self.face_poisson_blend = q_check_box("Poisson 融合")
+            self.face_poisson_blend.setChecked(False)
+
+            self.sharpen_enabled = q_check_box("启用锐化")
+            self.sharpen_enabled.setChecked(True)
+            self.sharpen_strength = q_double_spin_box()
+            self.sharpen_strength.setDecimals(2)
+            self.sharpen_strength.setRange(0.0, 1.0)
+            self.sharpen_strength.setSingleStep(0.05)
+            self.sharpen_strength.setValue(0.12)
+
+            self.encoder_crf = q_spin_box()
+            self.encoder_crf.setMinimum(0)
+            self.encoder_crf.setMaximum(63)
+            self.encoder_crf.setValue(18)
+            self.encoder_crf.setSpecialValueText("自动")
+
+            self.output_pixel_format = q_combo_box()
+            self.output_pixel_format.addItem("yuv420p (8-bit)", "yuv420p")
+            self.output_pixel_format.addItem("yuv420p10le (10-bit)", "yuv420p10le")
+            self.output_pixel_format.addItem("p010le (10-bit)", "p010le")
+            self.output_pixel_format.setCurrentIndex(0)
+
             self.preprocess_denoise = q_check_box("预处理降噪")
             self.preprocess_denoise.setChecked(True)
             self.preprocess_deblock = q_check_box("预处理去块")
@@ -276,19 +306,33 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             form_layout.addWidget(self.temporal_stabilize_strength, 9, 1)
             form_layout.addWidget(self.temporal_stabilize_enabled, 9, 2)
 
+            form_layout.addWidget(q_label("人脸修复模型"), 10, 0)
+            form_layout.addWidget(self.face_restore_model_combo, 10, 1)
+            form_layout.addWidget(self.face_poisson_blend, 10, 2)
+
+            form_layout.addWidget(q_label("锐化强度"), 11, 0)
+            form_layout.addWidget(self.sharpen_strength, 11, 1)
+            form_layout.addWidget(self.sharpen_enabled, 11, 2)
+
+            form_layout.addWidget(q_label("编码 CRF"), 12, 0)
+            form_layout.addWidget(self.encoder_crf, 12, 1)
+            form_layout.addWidget(q_label("像素格式"), 12, 2)
+
+            form_layout.addWidget(self.output_pixel_format, 13, 0, 1, 2)
+
             preprocess_row = q_hbox_layout()
             preprocess_row.addWidget(self.preprocess_denoise)
             preprocess_row.addWidget(self.preprocess_deblock)
             preprocess_row.addWidget(self.preprocess_deinterlace)
             preprocess_row.addWidget(self.preprocess_colorspace)
-            form_layout.addWidget(q_label("预处理选项"), 10, 0)
-            form_layout.addLayout(preprocess_row, 10, 1, 1, 2)
+            form_layout.addWidget(q_label("预处理选项"), 14, 0)
+            form_layout.addLayout(preprocess_row, 14, 1, 1, 2)
 
             checkbox_row = q_hbox_layout()
             checkbox_row.addWidget(self.preserve_audio)
             checkbox_row.addWidget(self.preserve_subtitles)
             checkbox_row.addWidget(self.preserve_metadata)
-            form_layout.addLayout(checkbox_row, 11, 0, 1, 3)
+            form_layout.addLayout(checkbox_row, 15, 0, 1, 3)
 
             layout.addWidget(form_group)
 
@@ -425,6 +469,16 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 async_pipeline=self.async_pipeline.isChecked(),
                 face_restore_enabled=self.face_restore_enabled.isChecked(),
                 face_restore_strength=self.face_restore_strength.value(),
+                face_restore_model=_coerce_enum(
+                    FaceRestoreModel,
+                    self.face_restore_model_combo.currentData(),
+                    FaceRestoreModel.CODEFORMER,
+                ),
+                face_poisson_blend=self.face_poisson_blend.isChecked(),
+                sharpen_enabled=self.sharpen_enabled.isChecked(),
+                sharpen_strength=self.sharpen_strength.value(),
+                encoder_crf=self.encoder_crf.value() if self.encoder_crf.value() > 0 else None,
+                output_pixel_format=self.output_pixel_format.currentData() or "yuv420p",
                 temporal_stabilize_enabled=self.temporal_stabilize_enabled.isChecked(),
                 temporal_stabilize_strength=self.temporal_stabilize_strength.value(),
                 preprocess_denoise=self.preprocess_denoise.isChecked(),
