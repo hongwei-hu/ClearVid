@@ -6,6 +6,10 @@ face_restore_enabled: true
 face_restore_strength: 0.55
 temporal_stabilize_enabled: true
 temporal_stabilize_strength: 0.6
+preprocess_denoise: true
+preprocess_deblock: true
+preprocess_deinterlace: auto
+preprocess_colorspace_normalize: true
 denoise_strength: 0.08
 sharpen_strength: 0.12
 tile_size: 512

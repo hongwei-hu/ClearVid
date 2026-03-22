@@ -13,6 +13,7 @@ import numpy as np
 
 from clearvid.app.models.codeformer_runner import CodeFormerRestorer
 from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
+from clearvid.app.preprocess.filters import build_preprocess_filters
 from clearvid.app.schemas.models import EnhancementConfig, QualityMode, TargetProfile, UpscaleModel, VideoMetadata
 from clearvid.app.utils.subprocess_utils import run_command
 
@@ -280,7 +281,7 @@ def _stream_process_video(
 ) -> None:
     import subprocess
 
-    decode_command = _build_decode_command(config)
+    decode_command = _build_decode_command(config, metadata)
     encode_command = _build_encode_command(config, metadata, output_width, output_height, temp_video_path)
     decoder = subprocess.Popen(decode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     encoder = subprocess.Popen(encode_command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -412,7 +413,7 @@ def _map_frame_progress(processed_frames: int, total_frames: int | None) -> int:
     return 18 + int(76 * ratio)
 
 
-def _build_decode_command(config: EnhancementConfig) -> list[str]:
+def _build_decode_command(config: EnhancementConfig, metadata: VideoMetadata) -> list[str]:
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -425,6 +426,12 @@ def _build_decode_command(config: EnhancementConfig) -> list[str]:
     ]
     if config.preview_seconds:
         command.extend(["-t", str(config.preview_seconds)])
+
+    # Build preprocessing filter chain
+    vf_filters = build_preprocess_filters(config, metadata)
+    if vf_filters:
+        command.extend(["-vf", ",".join(vf_filters)])
+
     command.extend(["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"])
     return command
 
