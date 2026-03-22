@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 from clearvid.app.models.codeformer_runner import CodeFormerRestorer
+from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
 from clearvid.app.schemas.models import EnhancementConfig, TargetProfile, VideoMetadata
 from clearvid.app.utils.subprocess_utils import run_command
 
@@ -99,8 +100,10 @@ def run_realesrgan_video(
     model_path = ensure_realesrgan_weights(weights_dir)
     _emit_progress(progress_callback, 10, "正在初始化 Real-ESRGAN")
     upsampler = _build_upsampler(config, model_path, metadata.width, metadata.height)
-    _emit_progress(progress_callback, 14, "正在初始化人脸修复")
+    _emit_progress(progress_callback, 12, "正在初始化人脸修复")
     codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
+    _emit_progress(progress_callback, 14, "正在初始化时序稳定器")
+    stabilizer = _build_temporal_stabilizer(config)
 
     temp_root = Path(tempfile.mkdtemp(prefix="clearvid-realesrgan-"))
     temp_video_path = temp_root / "enhanced_video.mp4"
@@ -115,6 +118,7 @@ def run_realesrgan_video(
             outscale=outscale,
             upsampler=upsampler,
             codeformer_restorer=codeformer_restorer,
+            stabilizer=stabilizer,
             temp_video_path=temp_video_path,
             progress_callback=progress_callback,
         )
@@ -196,6 +200,12 @@ def _build_codeformer_restorer(
     )
 
 
+def _build_temporal_stabilizer(config: EnhancementConfig) -> TemporalStabilizer | None:
+    if not config.temporal_stabilize_enabled:
+        return None
+    return TemporalStabilizer(strength=config.temporal_stabilize_strength)
+
+
 def _stream_process_video(
     config: EnhancementConfig,
     metadata: VideoMetadata,
@@ -204,6 +214,7 @@ def _stream_process_video(
     outscale: float,
     upsampler: object,
     codeformer_restorer: CodeFormerRestorer | None,
+    stabilizer: TemporalStabilizer | None,
     temp_video_path: Path,
     progress_callback: Callable[[int, str], None] | None,
 ) -> None:
@@ -223,6 +234,7 @@ def _stream_process_video(
             outscale=outscale,
             upsampler=upsampler,
             codeformer_restorer=codeformer_restorer,
+            stabilizer=stabilizer,
             decoder=decoder,
             encoder=encoder,
             progress_callback=progress_callback,
@@ -513,6 +525,7 @@ def _fetch_enhanced_frames(
 def _write_enhanced_frames(
     enhanced_list: list[np.ndarray],
     codeformer_restorer: CodeFormerRestorer | None,
+    stabilizer: TemporalStabilizer | None,
     output_width: int,
     output_height: int,
     target_profile: TargetProfile,
@@ -524,6 +537,8 @@ def _write_enhanced_frames(
         if codeformer_restorer is not None:
             enhanced = codeformer_restorer.restore_faces(enhanced)
         finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
+        if stabilizer is not None:
+            finalized = stabilizer.stabilize(finalized)
         encoder_stdin.write(np.ascontiguousarray(finalized).tobytes())
         count += 1
     return count
@@ -537,6 +552,7 @@ def _process_stream_frames(
     outscale: float,
     upsampler: object,
     codeformer_restorer: CodeFormerRestorer | None,
+    stabilizer: TemporalStabilizer | None,
     decoder: object,
     encoder: object,
     progress_callback: Callable[[int, str], None] | None,
@@ -560,7 +576,7 @@ def _process_stream_frames(
         if enhanced_list is None:
             break
         processed_frames += _write_enhanced_frames(
-            enhanced_list, codeformer_restorer, output_width, output_height, config.target_profile, encoder.stdin,
+            enhanced_list, codeformer_restorer, stabilizer, output_width, output_height, config.target_profile, encoder.stdin,
         )
         last_reported_progress = _report_stream_progress(
             processed_frames, total_frames, last_reported_progress, progress_callback,

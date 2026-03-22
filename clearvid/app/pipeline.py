@@ -35,6 +35,8 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
         raise RuntimeError(message)
 
     notes.append("Using Real-ESRGAN backend.")
+    if config.temporal_stabilize_enabled:
+        notes.append(f"Temporal stabilization: ON (strength={config.temporal_stabilize_strength:.2f})")
     return ExecutionPlan(
         output_width=output_width,
         output_height=output_height,
