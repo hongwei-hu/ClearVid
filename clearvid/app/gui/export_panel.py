@@ -247,6 +247,19 @@ class ExportPanel(QWidget):
         ))
         lay.addWidget(_hint("{name}_{profile} → 视频名_fhd.mp4"))
 
+        # Export duration (preview_seconds)
+        self.preview_seconds = QSpinBox()
+        self.preview_seconds.setMinimum(0)
+        self.preview_seconds.setMaximum(24 * 60 * 60)
+        self.preview_seconds.setValue(0)
+        self.preview_seconds.setSuffix(" 秒")
+        self.preview_seconds.setSpecialValueText("完整视频")
+        lay.addLayout(_labeled_row(
+            "导出时长", self.preview_seconds,
+            "仅处理视频前 N 秒，设为 0 则导出全片。适合快速试效果。",
+        ))
+        lay.addWidget(_hint("0 = 全片；输入秒数可只导出前段"))
+
         # Output path
         out_row = QHBoxLayout()
         out_lbl = QLabel("输出路径")
@@ -603,6 +616,7 @@ class ExportPanel(QWidget):
             preserve_audio=self.preserve_audio.isChecked(),
             preserve_subtitles=self.preserve_subtitles.isChecked(),
             preserve_metadata=self.preserve_metadata.isChecked(),
+            preview_seconds=self.preview_seconds.value() or None,
         )
 
     def build_preview_config(self, input_path: str) -> EnhancementConfig:
