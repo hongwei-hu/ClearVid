@@ -90,6 +90,8 @@ class EnhancementConfig(BaseModel):
     backend: BackendType = BackendType.AUTO
     face_restore_enabled: bool = True
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
+    temporal_stabilize_enabled: bool = True
+    temporal_stabilize_strength: float = Field(default=0.6, ge=0.0, le=1.0)
     denoise_strength: float = Field(default=0.08, ge=0.0, le=1.0)
     sharpen_strength: float = Field(default=0.12, ge=0.0, le=1.0)
     tile_size: int = 0

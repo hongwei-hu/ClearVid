@@ -200,6 +200,14 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             self.face_restore_strength.setSingleStep(0.05)
             self.face_restore_strength.setValue(0.55)
 
+            self.temporal_stabilize_enabled = q_check_box("启用时序稳定")
+            self.temporal_stabilize_enabled.setChecked(True)
+            self.temporal_stabilize_strength = q_double_spin_box()
+            self.temporal_stabilize_strength.setDecimals(2)
+            self.temporal_stabilize_strength.setRange(0.0, 1.0)
+            self.temporal_stabilize_strength.setSingleStep(0.05)
+            self.temporal_stabilize_strength.setValue(0.6)
+
             inspect_button = q_push_button("分析视频")
             inspect_button.clicked.connect(self._inspect_input)
 
@@ -228,12 +236,15 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             form_layout.addWidget(q_label("人脸修复强度"), 6, 0)
             form_layout.addWidget(self.face_restore_strength, 6, 1)
             form_layout.addWidget(self.face_restore_enabled, 6, 2)
+            form_layout.addWidget(q_label("时序稳定强度"), 7, 0)
+            form_layout.addWidget(self.temporal_stabilize_strength, 7, 1)
+            form_layout.addWidget(self.temporal_stabilize_enabled, 7, 2)
 
             checkbox_row = q_hbox_layout()
             checkbox_row.addWidget(self.preserve_audio)
             checkbox_row.addWidget(self.preserve_subtitles)
             checkbox_row.addWidget(self.preserve_metadata)
-            form_layout.addLayout(checkbox_row, 7, 0, 1, 3)
+            form_layout.addLayout(checkbox_row, 8, 0, 1, 3)
 
             layout.addWidget(form_group)
 
@@ -357,6 +368,8 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 backend=backend,
                 face_restore_enabled=self.face_restore_enabled.isChecked(),
                 face_restore_strength=self.face_restore_strength.value(),
+                temporal_stabilize_enabled=self.temporal_stabilize_enabled.isChecked(),
+                temporal_stabilize_strength=self.temporal_stabilize_strength.value(),
                 preserve_audio=self.preserve_audio.isChecked(),
                 preserve_subtitles=self.preserve_subtitles.isChecked(),
                 preserve_metadata=self.preserve_metadata.isChecked(),

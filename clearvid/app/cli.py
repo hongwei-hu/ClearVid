@@ -79,6 +79,8 @@ def run(
     preserve_metadata: bool = typer.Option(True),
     face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
+    temporal_stabilize_enabled: bool = typer.Option(True, help="Enable optical-flow temporal stabilization"),
+    temporal_stabilize_strength: float = typer.Option(0.6, min=0.0, max=1.0, help="Temporal stabilization strength"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -93,6 +95,8 @@ def run(
         preserve_metadata=preserve_metadata,
         face_restore_enabled=face_restore_enabled,
         face_restore_strength=face_restore_strength,
+        temporal_stabilize_enabled=temporal_stabilize_enabled,
+        temporal_stabilize_strength=temporal_stabilize_strength,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
@@ -109,6 +113,8 @@ def batch(
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
     face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
     face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
+    temporal_stabilize_enabled: bool = typer.Option(True, help="Enable optical-flow temporal stabilization"),
+    temporal_stabilize_strength: float = typer.Option(0.6, min=0.0, max=1.0, help="Temporal stabilization strength"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds of each file"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -124,6 +130,8 @@ def batch(
         quality_mode=quality_mode,
         face_restore_enabled=face_restore_enabled,
         face_restore_strength=face_restore_strength,
+        temporal_stabilize_enabled=temporal_stabilize_enabled,
+        temporal_stabilize_strength=temporal_stabilize_strength,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
