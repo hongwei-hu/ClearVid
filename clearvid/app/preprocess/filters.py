@@ -84,13 +84,13 @@ def _deblock_filter(
         # High bitrate → little block artifact, skip
         return []
 
-    # Stronger filtering for lower bitrate
+    # Stronger filtering for lower bitrate (alpha/beta range: 0.0 – 1.0)
     if bpp < 0.05:
-        alpha, beta = "3", "3"
+        alpha, beta = "1.0", "1.0"
     elif bpp < 0.10:
-        alpha, beta = "2", "2"
+        alpha, beta = "0.6", "0.6"
     else:
-        alpha, beta = "1", "1"
+        alpha, beta = "0.3", "0.3"
 
     return [f"deblock=filter=weak:alpha={alpha}:beta={beta}"]
 
