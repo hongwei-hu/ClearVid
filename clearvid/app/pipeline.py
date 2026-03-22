@@ -9,13 +9,13 @@ from clearvid.app.schemas.models import BackendType, EnhancementConfig, Executio
 
 def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> ExecutionPlan:
     output_width, output_height = resolve_output_size(metadata.width, metadata.height, config.target_profile)
+    resolved_backend = resolve_backend(config.backend)
     notes = [
         f"Input: {metadata.width}x{metadata.height} @ {metadata.fps:.3f} fps",
         f"Output: {output_width}x{output_height}",
-        f"Backend: {config.backend.value}",
+        f"Backend: {resolved_backend.value}",
     ]
 
-    resolved_backend = resolve_backend(config.backend)
     if resolved_backend != config.backend:
         notes.append(f"Resolved backend: {resolved_backend.value}")
 
@@ -34,7 +34,13 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
     if not available:
         raise RuntimeError(message)
 
-    raise RuntimeError("Real-ESRGAN backend wiring is the next implementation step.")
+    notes.append("Using Real-ESRGAN backend.")
+    return ExecutionPlan(
+        output_width=output_width,
+        output_height=output_height,
+        backend=resolved_backend,
+        notes=notes,
+    )
 
 
 def resolve_backend(requested_backend: BackendType) -> BackendType:
