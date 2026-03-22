@@ -1,0 +1,637 @@
+"""Right sidebar: export settings panel with collapsible sections and tooltips."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from clearvid.app.gui._helpers import coerce_enum, populate_combo, set_combo_by_value
+from clearvid.app.gui.widgets.collapsible import CollapsibleSection
+from clearvid.app.schemas.models import (
+    BackendType,
+    EnhancementConfig,
+    FaceRestoreModel,
+    InferenceAccelerator,
+    QualityMode,
+    TargetProfile,
+    UpscaleModel,
+)
+
+# ---------------------------------------------------------------------------
+# Label dictionaries
+# ---------------------------------------------------------------------------
+
+BACKEND_LABELS = {
+    BackendType.AUTO: "自动",
+    BackendType.BASELINE: "基线增强",
+    BackendType.REALESRGAN: "Real-ESRGAN",
+}
+UPSCALE_MODEL_LABELS = {
+    UpscaleModel.AUTO: "自动（质量模式决定）",
+    UpscaleModel.GENERAL_V3: "General v3 （轻量快速）",
+    UpscaleModel.X4PLUS: "x4plus RRDB （高质量）",
+}
+ACCELERATOR_LABELS = {
+    InferenceAccelerator.AUTO: "自动检测",
+    InferenceAccelerator.NONE: "无加速",
+    InferenceAccelerator.COMPILE: "torch.compile",
+    InferenceAccelerator.TENSORRT: "TensorRT",
+}
+FACE_MODEL_LABELS = {
+    FaceRestoreModel.CODEFORMER: "CodeFormer",
+    FaceRestoreModel.GFPGAN: "GFPGAN",
+}
+QUALITY_LABELS = {
+    QualityMode.FAST: "快速",
+    QualityMode.BALANCED: "平衡",
+    QualityMode.QUALITY: "高质量",
+}
+TARGET_LABELS = {
+    TargetProfile.SOURCE: "保持原始分辨率",
+    TargetProfile.FHD: "1080p",
+    TargetProfile.UHD4K: "4K",
+    TargetProfile.SCALE2X: "放大 2 倍",
+    TargetProfile.SCALE4X: "放大 4 倍",
+}
+
+# ---------------------------------------------------------------------------
+# Tooltip texts (user-friendly explanations for every parameter)
+# ---------------------------------------------------------------------------
+
+TOOLTIPS: dict[str, str] = {
+    "target_profile": (
+        "目标输出分辨率。\n"
+        "480p 视频建议选 1080p，720p/1080p 视频可选 4K。\n"
+        "选「保持原始」则只做画质增强不改变大小"
+    ),
+    "quality_mode": (
+        "控制 AI 超分的精细程度。\n"
+        "高质量模式效果最好但速度较慢(约慢 3 倍)。\n"
+        "首次尝试建议先用快速模式确认效果"
+    ),
+    "backend": (
+        "Real-ESRGAN 是核心 AI 超分引擎，需要 NVIDIA 独显。\n"
+        "基线模式仅使用传统滤镜，质量较低但无需 GPU"
+    ),
+    "upscale_model": (
+        "General v3 轻量快速，适合批量处理；\n"
+        "x4plus 参数量更大细节更丰富，适合精品制作"
+    ),
+    "encoder_crf": (
+        "恒定质量系数，数字越小画质越好但文件越大。\n"
+        "推荐: 15=近无损  18=高质量  22=标准  28=较低"
+    ),
+    "pixel_format": (
+        "10-bit 色彩过渡更平滑（减少色带），\n"
+        "但部分旧设备可能不支持播放"
+    ),
+    "face_restore": (
+        "AI 自动检测并修复模糊人脸。\n"
+        "没有人物或仅有远景时关闭可加快处理速度"
+    ),
+    "face_strength": (
+        "低 = 保守修复，保留更多原始细节\n"
+        "高 = 激进修复，人脸更清晰但可能不够自然\n"
+        "建议范围: 0.4 - 0.7"
+    ),
+    "face_model": "CodeFormer 更自然保真；GFPGAN 偏向美化肤质",
+    "poisson_blend": "让修复后的人脸与周围皮肤过渡更自然，减少色差和接缝感",
+    "temporal": "AI 超分逐帧独立处理可能导致纹理闪烁，开启后利用相邻帧信息抑制闪烁",
+    "temporal_strength": "越高越稳定但可能损失运动细节。快速运动视频建议调低",
+    "sharpen": "增强画面边缘清晰度。过高可能产生不自然的白边，建议 0.05-0.20",
+    "denoise": "自动根据视频码率调整降噪力度。低码率视频强降噪，高码率轻降噪以保留细节",
+    "deblock": "低码率 H.264 视频常见方块状伪影，此选项专门修复。高码率视频会自动跳过",
+    "deinterlace": "自动检测隔行扫描(老旧录像常见)，转为逐行扫描消除运动时的横条纹",
+    "colorspace": "不同来源视频可能使用不同色彩标准(BT.601/709)，统一后 AI 模型处理效果更一致",
+    "accelerator": "TensorRT 可将处理速度提升 2-4 倍，但首次使用需要编译引擎(约 3-10 分钟)",
+    "async_pipeline": "让解码→AI增强→编码三步同时运行，可提速约 30-50%",
+    "preserve_audio": "保留原视频的音频轨道。关闭后导出为纯视频（无声）",
+    "preserve_subtitles": "保留嵌入的字幕轨道（如有）",
+    "preserve_metadata": "保留拍摄日期、GPS 等元信息",
+}
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _hint(text: str) -> QLabel:
+    """Create a small gray hint label below a control."""
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color: #9e9e9e; font-size: 11px; margin-left: 4px;")
+    return lbl
+
+
+def _labeled_row(
+    label_text: str, widget: QWidget, tooltip: str = ""
+) -> QHBoxLayout:
+    """Create ``Label | Widget`` horizontal row with optional tooltip."""
+    row = QHBoxLayout()
+    lbl = QLabel(label_text)
+    lbl.setMinimumWidth(80)
+    if tooltip:
+        lbl.setToolTip(tooltip)
+        widget.setToolTip(tooltip)
+    row.addWidget(lbl)
+    row.addWidget(widget, 1)
+    return row
+
+
+# ===========================================================================
+# ExportPanel
+# ===========================================================================
+
+
+class ExportPanel(QWidget):
+    """Right sidebar containing all export parameters in collapsible sections."""
+
+    export_requested = Signal()
+    smart_params_requested = Signal()
+    output_dir_changed = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._sections: dict[str, CollapsibleSection] = {}
+
+        # Outer layout: scrollable body + fixed bottom
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        self._layout = QVBoxLayout(container)
+        self._layout.setContentsMargins(8, 8, 8, 8)
+        self._layout.setSpacing(4)
+
+        self._build_smart_section()
+        self._build_output_section()
+        self._build_encoding_section()
+        self._build_enhancement_section()
+        self._build_face_section()
+        self._build_preprocess_section()
+        self._build_temporal_section()
+        self._build_stream_section()
+        self._build_performance_section()
+
+        self._layout.addStretch(1)
+
+        scroll.setWidget(container)
+        outer.addWidget(scroll, 1)
+
+        # --- Fixed bottom: progress + export button ---
+        self._build_bottom(outer)
+
+    # ------------------------------------------------------------------
+    # Section builders
+    # ------------------------------------------------------------------
+
+    def _build_smart_section(self) -> None:
+        self._smart_btn = QPushButton("\u26a1 一键最佳适配")
+        self._smart_btn.setObjectName("smartButton")
+        self._smart_btn.setMinimumHeight(34)
+        self._smart_btn.setToolTip("根据输入视频和硬件自动选择最佳处理参数")
+        self._smart_btn.clicked.connect(self.smart_params_requested.emit)
+        self._layout.addWidget(self._smart_btn)
+
+    def _build_output_section(self) -> None:
+        sec = CollapsibleSection("输出设置", name="output", expanded=True)
+        lay = sec.content_layout
+
+        self.target_combo = QComboBox()
+        populate_combo(self.target_combo, TARGET_LABELS, TargetProfile, TargetProfile.FHD)
+        lay.addLayout(_labeled_row("输出规格", self.target_combo, TOOLTIPS["target_profile"]))
+        lay.addWidget(_hint("目标分辨率，480p\u21921080p / 720p\u21924K"))
+
+        # Output path
+        out_row = QHBoxLayout()
+        out_lbl = QLabel("输出路径")
+        out_lbl.setMinimumWidth(80)
+        out_row.addWidget(out_lbl)
+        self.output_edit = QLineEdit()
+        self.output_edit.setPlaceholderText("选择输出位置...")
+        out_row.addWidget(self.output_edit, 1)
+        out_browse = QPushButton("\U0001f4c1")
+        out_browse.setFixedWidth(32)
+        out_browse.setToolTip("浏览输出位置")
+        out_browse.clicked.connect(self._browse_output)
+        out_row.addWidget(out_browse)
+        lay.addLayout(out_row)
+
+        self._layout.addWidget(sec)
+        self._sections["output"] = sec
+
+    def _build_encoding_section(self) -> None:
+        sec = CollapsibleSection("编码设置", name="encoding", expanded=True)
+        lay = sec.content_layout
+
+        self.encoder_crf = QSpinBox()
+        self.encoder_crf.setMinimum(0)
+        self.encoder_crf.setMaximum(63)
+        self.encoder_crf.setValue(18)
+        self.encoder_crf.setSpecialValueText("自动")
+        lay.addLayout(_labeled_row("画质 CRF", self.encoder_crf, TOOLTIPS["encoder_crf"]))
+        lay.addWidget(_hint("越小画质越好，推荐 15-22"))
+
+        self.pixel_format_combo = QComboBox()
+        self.pixel_format_combo.addItem("8-bit (yuv420p)", "yuv420p")
+        self.pixel_format_combo.addItem("10-bit (yuv420p10le)", "yuv420p10le")
+        self.pixel_format_combo.addItem("10-bit (p010le)", "p010le")
+        lay.addLayout(
+            _labeled_row("色彩深度", self.pixel_format_combo, TOOLTIPS["pixel_format"])
+        )
+
+        self._layout.addWidget(sec)
+        self._sections["encoding"] = sec
+
+    def _build_enhancement_section(self) -> None:
+        sec = CollapsibleSection("画质增强", name="enhancement", expanded=False)
+        lay = sec.content_layout
+
+        self.backend_combo = QComboBox()
+        populate_combo(self.backend_combo, BACKEND_LABELS, BackendType, BackendType.AUTO)
+        lay.addLayout(_labeled_row("增强后端", self.backend_combo, TOOLTIPS["backend"]))
+        lay.addWidget(_hint("自动根据显卡选择最佳方案"))
+
+        self.upscale_model_combo = QComboBox()
+        populate_combo(
+            self.upscale_model_combo, UPSCALE_MODEL_LABELS, UpscaleModel, UpscaleModel.AUTO
+        )
+        lay.addLayout(
+            _labeled_row("超分模型", self.upscale_model_combo, TOOLTIPS["upscale_model"])
+        )
+
+        self.quality_combo = QComboBox()
+        populate_combo(self.quality_combo, QUALITY_LABELS, QualityMode, QualityMode.QUALITY)
+        lay.addLayout(_labeled_row("质量模式", self.quality_combo, TOOLTIPS["quality_mode"]))
+
+        self.sharpen_enabled = QCheckBox("启用锐化")
+        self.sharpen_enabled.setChecked(True)
+        self.sharpen_enabled.setToolTip(TOOLTIPS["sharpen"])
+        lay.addWidget(self.sharpen_enabled)
+
+        self.sharpen_strength = QDoubleSpinBox()
+        self.sharpen_strength.setDecimals(2)
+        self.sharpen_strength.setRange(0.0, 1.0)
+        self.sharpen_strength.setSingleStep(0.05)
+        self.sharpen_strength.setValue(0.12)
+        lay.addLayout(_labeled_row("锐化强度", self.sharpen_strength, TOOLTIPS["sharpen"]))
+        lay.addWidget(_hint("建议 0.05-0.20，过高会产生白边"))
+
+        self._layout.addWidget(sec)
+        self._sections["enhancement"] = sec
+
+    def _build_face_section(self) -> None:
+        sec = CollapsibleSection("人脸修复", name="face", expanded=False)
+        lay = sec.content_layout
+
+        self.face_restore_enabled = QCheckBox("启用人脸修复")
+        self.face_restore_enabled.setChecked(True)
+        self.face_restore_enabled.setToolTip(TOOLTIPS["face_restore"])
+        lay.addWidget(self.face_restore_enabled)
+        lay.addWidget(_hint("自动检测并修复模糊人脸"))
+
+        self.face_restore_strength = QDoubleSpinBox()
+        self.face_restore_strength.setDecimals(2)
+        self.face_restore_strength.setRange(0.0, 1.0)
+        self.face_restore_strength.setSingleStep(0.05)
+        self.face_restore_strength.setValue(0.55)
+        lay.addLayout(
+            _labeled_row("修复强度", self.face_restore_strength, TOOLTIPS["face_strength"])
+        )
+        lay.addWidget(_hint("0.4-0.7 较自然，过高可能不真实"))
+
+        self.face_model_combo = QComboBox()
+        populate_combo(
+            self.face_model_combo, FACE_MODEL_LABELS, FaceRestoreModel, FaceRestoreModel.CODEFORMER
+        )
+        lay.addLayout(_labeled_row("修复模型", self.face_model_combo, TOOLTIPS["face_model"]))
+
+        self.face_poisson_blend = QCheckBox("泊松融合")
+        self.face_poisson_blend.setChecked(False)
+        self.face_poisson_blend.setToolTip(TOOLTIPS["poisson_blend"])
+        lay.addWidget(self.face_poisson_blend)
+        lay.addWidget(_hint("让修复后的人脸边缘过渡更自然"))
+
+        self._layout.addWidget(sec)
+        self._sections["face"] = sec
+
+    def _build_preprocess_section(self) -> None:
+        sec = CollapsibleSection("预处理", name="preprocess", expanded=False)
+        lay = sec.content_layout
+
+        self.preprocess_denoise = QCheckBox("智能降噪")
+        self.preprocess_denoise.setChecked(True)
+        self.preprocess_denoise.setToolTip(TOOLTIPS["denoise"])
+        lay.addWidget(self.preprocess_denoise)
+        lay.addWidget(_hint("去除噪点颗粒，对低码率视频效果明显"))
+
+        self.preprocess_deblock = QCheckBox("去块效应")
+        self.preprocess_deblock.setChecked(True)
+        self.preprocess_deblock.setToolTip(TOOLTIPS["deblock"])
+        lay.addWidget(self.preprocess_deblock)
+        lay.addWidget(_hint("修复低码率视频的方块感"))
+
+        self.preprocess_deinterlace = QCheckBox("自动去隔行")
+        self.preprocess_deinterlace.setChecked(True)
+        self.preprocess_deinterlace.setToolTip(TOOLTIPS["deinterlace"])
+        lay.addWidget(self.preprocess_deinterlace)
+
+        self.preprocess_colorspace = QCheckBox("色彩空间归一化")
+        self.preprocess_colorspace.setChecked(True)
+        self.preprocess_colorspace.setToolTip(TOOLTIPS["colorspace"])
+        lay.addWidget(self.preprocess_colorspace)
+
+        self._layout.addWidget(sec)
+        self._sections["preprocess"] = sec
+
+    def _build_temporal_section(self) -> None:
+        sec = CollapsibleSection("时序与稳定", name="temporal", expanded=False)
+        lay = sec.content_layout
+
+        self.temporal_enabled = QCheckBox("启用时序稳定")
+        self.temporal_enabled.setChecked(True)
+        self.temporal_enabled.setToolTip(TOOLTIPS["temporal"])
+        lay.addWidget(self.temporal_enabled)
+        lay.addWidget(_hint("减少 AI 超分后相邻帧的闪烁"))
+
+        self.temporal_strength = QDoubleSpinBox()
+        self.temporal_strength.setDecimals(2)
+        self.temporal_strength.setRange(0.0, 1.0)
+        self.temporal_strength.setSingleStep(0.05)
+        self.temporal_strength.setValue(0.6)
+        lay.addLayout(
+            _labeled_row("稳定强度", self.temporal_strength, TOOLTIPS["temporal_strength"])
+        )
+        lay.addWidget(_hint("快速运动视频建议调低"))
+
+        self._layout.addWidget(sec)
+        self._sections["temporal"] = sec
+
+    def _build_stream_section(self) -> None:
+        sec = CollapsibleSection("流保留", name="stream", expanded=False)
+        lay = sec.content_layout
+
+        self.preserve_audio = QCheckBox("保留音频")
+        self.preserve_audio.setChecked(True)
+        self.preserve_audio.setToolTip(TOOLTIPS["preserve_audio"])
+        lay.addWidget(self.preserve_audio)
+
+        self.preserve_subtitles = QCheckBox("保留字幕")
+        self.preserve_subtitles.setChecked(True)
+        self.preserve_subtitles.setToolTip(TOOLTIPS["preserve_subtitles"])
+        lay.addWidget(self.preserve_subtitles)
+
+        self.preserve_metadata = QCheckBox("保留元数据")
+        self.preserve_metadata.setChecked(True)
+        self.preserve_metadata.setToolTip(TOOLTIPS["preserve_metadata"])
+        lay.addWidget(self.preserve_metadata)
+
+        self._layout.addWidget(sec)
+        self._sections["stream"] = sec
+
+    def _build_performance_section(self) -> None:
+        sec = CollapsibleSection("性能", name="performance", expanded=False)
+        lay = sec.content_layout
+
+        self.accelerator_combo = QComboBox()
+        populate_combo(
+            self.accelerator_combo,
+            ACCELERATOR_LABELS,
+            InferenceAccelerator,
+            InferenceAccelerator.AUTO,
+        )
+        lay.addLayout(
+            _labeled_row("推理加速", self.accelerator_combo, TOOLTIPS["accelerator"])
+        )
+        lay.addWidget(_hint("TensorRT 最快但需首次编译"))
+
+        self.async_pipeline = QCheckBox("异步流水线")
+        self.async_pipeline.setChecked(True)
+        self.async_pipeline.setToolTip(TOOLTIPS["async_pipeline"])
+        lay.addWidget(self.async_pipeline)
+        lay.addWidget(_hint("三级并行处理，提速约 30-50%"))
+
+        self._layout.addWidget(sec)
+        self._sections["performance"] = sec
+
+    def _build_bottom(self, outer: QVBoxLayout) -> None:
+        """Build the fixed bottom area: progress bar + export button."""
+        bottom = QVBoxLayout()
+        bottom.setContentsMargins(8, 8, 8, 8)
+        bottom.setSpacing(6)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        bottom.addWidget(self.progress_bar)
+
+        self.progress_label = QLabel("就绪")
+        self.progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_label.setStyleSheet("color: #9e9e9e; font-size: 12px;")
+        bottom.addWidget(self.progress_label)
+
+        self.export_btn = QPushButton("\u25b6  开始导出")
+        self.export_btn.setObjectName("exportButton")
+        self.export_btn.setMinimumHeight(40)
+        self.export_btn.clicked.connect(self.export_requested.emit)
+        bottom.addWidget(self.export_btn)
+
+        # Post-export action buttons (hidden until export completes)
+        self._post_row = QHBoxLayout()
+        self._open_folder_btn = QPushButton("\U0001f4c2 打开文件夹")
+        self._open_folder_btn.setVisible(False)
+        self._play_btn = QPushButton("\u25b6 播放视频")
+        self._play_btn.setVisible(False)
+        self._post_row.addWidget(self._open_folder_btn)
+        self._post_row.addWidget(self._play_btn)
+        bottom.addLayout(self._post_row)
+
+        outer.addLayout(bottom)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_sections(self) -> dict[str, CollapsibleSection]:
+        return self._sections
+
+    def build_config(self, input_path: str) -> EnhancementConfig:
+        """Build an EnhancementConfig from the current widget state."""
+        return EnhancementConfig(
+            input_path=Path(input_path),
+            output_path=Path(self.output_edit.text()),
+            target_profile=coerce_enum(
+                TargetProfile, self.target_combo.currentData(), TargetProfile.FHD
+            ),
+            quality_mode=coerce_enum(
+                QualityMode, self.quality_combo.currentData(), QualityMode.QUALITY
+            ),
+            backend=coerce_enum(
+                BackendType, self.backend_combo.currentData(), BackendType.AUTO
+            ),
+            upscale_model=coerce_enum(
+                UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO
+            ),
+            inference_accelerator=coerce_enum(
+                InferenceAccelerator,
+                self.accelerator_combo.currentData(),
+                InferenceAccelerator.AUTO,
+            ),
+            async_pipeline=self.async_pipeline.isChecked(),
+            face_restore_enabled=self.face_restore_enabled.isChecked(),
+            face_restore_strength=self.face_restore_strength.value(),
+            face_restore_model=coerce_enum(
+                FaceRestoreModel,
+                self.face_model_combo.currentData(),
+                FaceRestoreModel.CODEFORMER,
+            ),
+            face_poisson_blend=self.face_poisson_blend.isChecked(),
+            sharpen_enabled=self.sharpen_enabled.isChecked(),
+            sharpen_strength=self.sharpen_strength.value(),
+            encoder_crf=self.encoder_crf.value() if self.encoder_crf.value() > 0 else None,
+            output_pixel_format=self.pixel_format_combo.currentData() or "yuv420p",
+            temporal_stabilize_enabled=self.temporal_enabled.isChecked(),
+            temporal_stabilize_strength=self.temporal_strength.value(),
+            preprocess_denoise=self.preprocess_denoise.isChecked(),
+            preprocess_deblock=self.preprocess_deblock.isChecked(),
+            preprocess_deinterlace=(
+                "auto" if self.preprocess_deinterlace.isChecked() else "off"
+            ),
+            preprocess_colorspace_normalize=self.preprocess_colorspace.isChecked(),
+            preserve_audio=self.preserve_audio.isChecked(),
+            preserve_subtitles=self.preserve_subtitles.isChecked(),
+            preserve_metadata=self.preserve_metadata.isChecked(),
+        )
+
+    def build_preview_config(self, input_path: str) -> EnhancementConfig:
+        """Build a minimal config for preview (no real output needed)."""
+        return EnhancementConfig(
+            input_path=Path(input_path),
+            output_path=Path(self.output_edit.text() or "preview_temp.mp4"),
+            target_profile=coerce_enum(
+                TargetProfile, self.target_combo.currentData(), TargetProfile.FHD
+            ),
+            quality_mode=coerce_enum(
+                QualityMode, self.quality_combo.currentData(), QualityMode.QUALITY
+            ),
+            upscale_model=coerce_enum(
+                UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO
+            ),
+            face_restore_enabled=self.face_restore_enabled.isChecked(),
+            face_restore_strength=self.face_restore_strength.value(),
+            face_restore_model=coerce_enum(
+                FaceRestoreModel,
+                self.face_model_combo.currentData(),
+                FaceRestoreModel.CODEFORMER,
+            ),
+            face_poisson_blend=self.face_poisson_blend.isChecked(),
+            sharpen_enabled=self.sharpen_enabled.isChecked(),
+            sharpen_strength=self.sharpen_strength.value(),
+        )
+
+    def apply_recommendation(self, rec: Any) -> None:
+        """Apply a Recommendation object to widget state."""
+        set_combo_by_value(self.target_combo, rec.target_profile)
+        set_combo_by_value(self.quality_combo, rec.quality_mode)
+        set_combo_by_value(self.upscale_model_combo, rec.upscale_model)
+        set_combo_by_value(self.accelerator_combo, rec.inference_accelerator)
+        self.face_restore_enabled.setChecked(rec.face_restore_enabled)
+        set_combo_by_value(self.face_model_combo, rec.face_restore_model)
+        self.temporal_enabled.setChecked(rec.temporal_stabilize_enabled)
+        self.sharpen_enabled.setChecked(rec.sharpen_enabled)
+        self.sharpen_strength.setValue(rec.sharpen_strength)
+        self.async_pipeline.setChecked(rec.async_pipeline)
+
+    def set_progress(self, percent: int, message: str) -> None:
+        self.progress_bar.setValue(max(0, min(100, percent)))
+        self.progress_label.setText(message)
+
+    def set_export_enabled(self, enabled: bool) -> None:
+        self.export_btn.setEnabled(enabled)
+
+    def autofill_output(self, input_path: str) -> None:
+        """Auto-generate output path based on input file and target profile."""
+        if not input_path:
+            return
+        stem = Path(input_path).stem
+        profile = coerce_enum(
+            TargetProfile, self.target_combo.currentData(), TargetProfile.FHD
+        )
+        suffix = profile.value if profile else "output"
+        self.output_edit.setText(str(Path.cwd() / "outputs" / f"{stem}_{suffix}.mp4"))
+
+    def show_post_export(self, output_path: str) -> None:
+        """Show 'open folder' and 'play' buttons after successful export."""
+        self._open_folder_btn.setVisible(True)
+        self._play_btn.setVisible(True)
+        # Disconnect previous connections (safe even if none exist)
+        try:
+            self._open_folder_btn.clicked.disconnect()
+        except RuntimeError:
+            pass
+        try:
+            self._play_btn.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self._open_folder_btn.clicked.connect(lambda: self._open_folder(output_path))
+        self._play_btn.clicked.connect(lambda: self._play_video(output_path))
+
+    def hide_post_export(self) -> None:
+        self._open_folder_btn.setVisible(False)
+        self._play_btn.setVisible(False)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _browse_output(self) -> None:
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "选择输出文件",
+            self.output_edit.text() or str(Path.cwd() / "outputs"),
+            "MP4 文件 (*.mp4);;所有文件 (*)",
+        )
+        if selected:
+            self.output_edit.setText(selected)
+            self.output_dir_changed.emit(str(Path(selected).parent))
+
+    @staticmethod
+    def _open_folder(path: str) -> None:
+        """Open the containing folder and select the file (Windows)."""
+        folder = str(Path(path).parent)
+        if os.name == "nt":
+            subprocess.Popen(  # noqa: S603, S607
+                ["explorer", "/select,", os.path.normpath(path)]
+            )
+        else:
+            subprocess.Popen(["xdg-open", folder])  # noqa: S603, S607
+
+    @staticmethod
+    def _play_video(path: str) -> None:
+        """Open the video file with the system default player."""
+        os.startfile(path)  # noqa: S606  # Windows-specific
