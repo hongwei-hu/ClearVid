@@ -185,12 +185,13 @@ def _get_or_build_engine(
     # Step 2: build TensorRT engine in ISOLATED SUBPROCESS
     # This prevents GPU-intensive TRT builder from freezing the main app.
     if progress_callback is not None:
-        progress_callback(11, "首次构建 TensorRT 引擎 (约1-2分钟，后续秒级加载)...")
+        progress_callback(11, "首次构建 TensorRT 引擎 (可能需要数分钟，后续秒级加载)...")
     logger.info("正在构建 TensorRT 引擎 (首次构建, 子进程隔离) ...")
     _build_trt_engine_subprocess(
         onnx_path, engine_path,
         fp16=fp16, tile_size=tile_size, batch_size=batch_size,
-        timeout=180,
+        timeout=600,
+        progress_callback=progress_callback,
     )
 
     if not engine_path.exists() or engine_path.stat().st_size == 0:
@@ -268,7 +269,8 @@ def _build_trt_engine_subprocess(
     fp16: bool,
     tile_size: int,
     batch_size: int,
-    timeout: int = 180,
+    timeout: int = 600,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> None:
     """Build TRT engine in an isolated subprocess with timeout.
 
@@ -276,6 +278,8 @@ def _build_trt_engine_subprocess(
     - On timeout the process is killed → GPU memory released immediately
     - Lower priority on Windows to reduce desktop compositor stutter
     """
+    import time as _time
+
     args_json = json.dumps({
         "onnx_path": str(onnx_path),
         "engine_path": str(engine_path),
@@ -297,11 +301,29 @@ def _build_trt_engine_subprocess(
         stderr=subprocess.PIPE,
         creationflags=creation_flags,
     )
+
+    # Poll subprocess with periodic progress updates
+    t_start = _time.monotonic()
+    poll_interval = 10  # seconds
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=poll_interval)
+                # Process finished
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = _time.monotonic() - t_start
+                if elapsed > timeout:
+                    raise  # will be caught by outer handler
+                if progress_callback is not None:
+                    progress_callback(
+                        11,
+                        f"TensorRT 引擎构建中... ({elapsed:.0f}s / 最长{timeout}s)",
+                    )
+                continue
+
         if proc.returncode != 0:
             err_msg = stderr.decode(errors="replace").strip()
-            # Clean up partial engine file
             if engine_path.exists():
                 try:
                     engine_path.unlink()
