@@ -16,6 +16,16 @@ import sys
 from pathlib import Path
 
 
+def _fix_console_encoding() -> None:
+    """Ensure console can handle Unicode on Windows."""
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _ensure_lib_on_path() -> None:
     """Add ``lib/`` to sys.path so pip-installed packages are importable."""
     from clearvid.app.bootstrap.paths import LIB_DIR
@@ -119,6 +129,7 @@ def _verify_import(module_name: str, display_name: str) -> bool:
 
 def main() -> None:
     """Main launcher entry point."""
+    _fix_console_encoding()
     _ensure_lib_on_path()
 
     if _needs_install():
