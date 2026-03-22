@@ -13,6 +13,7 @@ class QualityMode(str, Enum):
 
 
 class BackendType(str, Enum):
+    AUTO = "auto"
     BASELINE = "baseline"
     REALESRGAN = "realesrgan"
 
@@ -73,6 +74,12 @@ class EnvironmentInfo(BaseModel):
     gpu_name: str | None = None
     gpu_driver_version: str | None = None
     gpu_memory_mb: int | None = None
+    torch_version: str | None = None
+    torch_cuda_available: bool = False
+    torch_gpu_compatible: bool = False
+    preferred_backend: BackendType = BackendType.BASELINE
+    realesrgan_available: bool = False
+    realesrgan_message: str | None = None
 
 
 class EnhancementConfig(BaseModel):
@@ -80,7 +87,7 @@ class EnhancementConfig(BaseModel):
     output_path: Path
     target_profile: TargetProfile = TargetProfile.FHD
     quality_mode: QualityMode = QualityMode.QUALITY
-    backend: BackendType = BackendType.BASELINE
+    backend: BackendType = BackendType.AUTO
     face_restore_enabled: bool = True
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
     denoise_strength: float = Field(default=0.08, ge=0.0, le=1.0)
@@ -113,3 +120,4 @@ class BatchResult(BaseModel):
     output_path: Path
     success: bool
     message: str
+    backend: BackendType | None = None

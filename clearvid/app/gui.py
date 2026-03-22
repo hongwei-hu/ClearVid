@@ -2,12 +2,45 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
+from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.schemas.models import BackendType, EnhancementConfig, QualityMode, TargetProfile
 
 
+BACKEND_LABELS = {
+    BackendType.AUTO: "自动",
+    BackendType.BASELINE: "基线增强",
+    BackendType.REALESRGAN: "Real-ESRGAN",
+}
+
+QUALITY_LABELS = {
+    QualityMode.FAST: "快速",
+    QualityMode.BALANCED: "平衡",
+    QualityMode.QUALITY: "高质量",
+}
+
+TARGET_LABELS = {
+    TargetProfile.SOURCE: "保持原始分辨率",
+    TargetProfile.FHD: "1080p",
+    TargetProfile.UHD4K: "4K",
+    TargetProfile.SCALE2X: "放大 2 倍",
+    TargetProfile.SCALE4X: "放大 4 倍",
+}
+
+
 def main() -> None:
+    qt = _load_qt()
+    application = qt["QApplication"](sys.argv)
+    worker_class = _create_worker_class(qt["QThread"], qt["Signal"])
+    window_class = _create_main_window_class(qt, worker_class)
+    window = window_class()
+    window.show()
+    sys.exit(application.exec())
+
+
+def _load_qt() -> dict[str, object]:
     try:
         from PySide6.QtCore import QThread, Signal
         from PySide6.QtWidgets import (
@@ -22,17 +55,41 @@ def main() -> None:
             QLineEdit,
             QMainWindow,
             QMessageBox,
-            QPushButton,
             QPlainTextEdit,
+            QPushButton,
+            QSpinBox,
             QVBoxLayout,
             QWidget,
         )
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("PySide6 is not installed. Install with the gui extra.") from exc
 
-    class Worker(QThread):
-        completed = Signal(str)
-        failed = Signal(str)
+    return {
+        "QApplication": QApplication,
+        "QCheckBox": QCheckBox,
+        "QComboBox": QComboBox,
+        "QFileDialog": QFileDialog,
+        "QGridLayout": QGridLayout,
+        "QGroupBox": QGroupBox,
+        "QHBoxLayout": QHBoxLayout,
+        "QLabel": QLabel,
+        "QLineEdit": QLineEdit,
+        "QMainWindow": QMainWindow,
+        "QMessageBox": QMessageBox,
+        "QPlainTextEdit": QPlainTextEdit,
+        "QPushButton": QPushButton,
+        "QSpinBox": QSpinBox,
+        "QThread": QThread,
+        "QVBoxLayout": QVBoxLayout,
+        "QWidget": QWidget,
+        "Signal": Signal,
+    }
+
+
+def _create_worker_class(q_thread_cls: Any, signal_factory: Any) -> type:
+    class Worker(q_thread_cls):  # type: ignore[misc, valid-type]
+        completed = signal_factory(str)  # type: ignore[operator]
+        failed = signal_factory(str)  # type: ignore[operator]
 
         def __init__(self, config: EnhancementConfig):
             super().__init__()
@@ -45,101 +102,140 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 self.failed.emit(str(exc))
 
-    class MainWindow(QMainWindow):
+    return Worker
+
+
+def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type:
+    q_check_box = qt["QCheckBox"]
+    q_combo_box = qt["QComboBox"]
+    q_file_dialog = qt["QFileDialog"]
+    q_grid_layout = qt["QGridLayout"]
+    q_group_box = qt["QGroupBox"]
+    q_hbox_layout = qt["QHBoxLayout"]
+    q_label = qt["QLabel"]
+    q_line_edit = qt["QLineEdit"]
+    q_main_window = qt["QMainWindow"]
+    q_message_box = qt["QMessageBox"]
+    q_plain_text_edit = qt["QPlainTextEdit"]
+    q_push_button = qt["QPushButton"]
+    q_spin_box = qt["QSpinBox"]
+    q_vbox_layout = qt["QVBoxLayout"]
+    q_widget = qt["QWidget"]
+
+    class MainWindow(q_main_window):  # type: ignore[misc, valid-type]
         def __init__(self) -> None:
             super().__init__()
-            self.setWindowTitle("ClearVid")
-            self.resize(860, 520)
-            self._worker: Worker | None = None
+            self.setWindowTitle("ClearVid 视频清晰度增强")
+            self.resize(920, 620)
+            self._worker: object | None = None
+            self._environment = collect_environment_info()
 
-            root = QWidget()
-            layout = QVBoxLayout(root)
+            root = q_widget()
+            layout = q_vbox_layout(root)
 
-            form_group = QGroupBox("Job")
-            form_layout = QGridLayout(form_group)
+            self.status_box = q_plain_text_edit()
+            self.status_box.setReadOnly(True)
+            self.status_box.setMaximumHeight(100)
+            layout.addWidget(self.status_box)
 
-            self.input_edit = QLineEdit()
-            self.output_edit = QLineEdit()
+            form_group = q_group_box("任务设置")
+            form_layout = q_grid_layout(form_group)
 
-            input_button = QPushButton("Browse")
+            self.input_edit = q_line_edit()
+            self.output_edit = q_line_edit()
+
+            input_button = q_push_button("选择文件")
             input_button.clicked.connect(self._pick_input)
-            output_button = QPushButton("Browse")
+            output_button = q_push_button("选择位置")
             output_button.clicked.connect(self._pick_output)
 
-            self.target_combo = QComboBox()
+            self.target_combo = q_combo_box()
             for item in TargetProfile:
-                self.target_combo.addItem(item.value, item)
-            self.target_combo.setCurrentText(TargetProfile.FHD.value)
+                self.target_combo.addItem(TARGET_LABELS[item], item)
+            self.target_combo.setCurrentText(TARGET_LABELS[TargetProfile.FHD])
 
-            self.quality_combo = QComboBox()
+            self.quality_combo = q_combo_box()
             for item in QualityMode:
-                self.quality_combo.addItem(item.value, item)
-            self.quality_combo.setCurrentText(QualityMode.QUALITY.value)
+                self.quality_combo.addItem(QUALITY_LABELS[item], item)
+            self.quality_combo.setCurrentText(QUALITY_LABELS[QualityMode.QUALITY])
 
-            self.backend_combo = QComboBox()
+            self.backend_combo = q_combo_box()
             for item in BackendType:
-                self.backend_combo.addItem(item.value, item)
+                self.backend_combo.addItem(BACKEND_LABELS[item], item)
+            self.backend_combo.setCurrentText(BACKEND_LABELS[BackendType.AUTO])
 
-            self.preserve_audio = QCheckBox("Preserve audio")
+            self.preview_seconds = q_spin_box()
+            self.preview_seconds.setMinimum(0)
+            self.preview_seconds.setMaximum(24 * 60 * 60)
+            self.preview_seconds.setValue(0)
+
+            inspect_button = q_push_button("分析视频")
+            inspect_button.clicked.connect(self._inspect_input)
+
+            self.preserve_audio = q_check_box("保留音频")
             self.preserve_audio.setChecked(True)
-            self.preserve_subtitles = QCheckBox("Preserve subtitles")
+            self.preserve_subtitles = q_check_box("保留字幕")
             self.preserve_subtitles.setChecked(True)
-            self.preserve_metadata = QCheckBox("Preserve metadata")
+            self.preserve_metadata = q_check_box("保留元数据")
             self.preserve_metadata.setChecked(True)
 
-            form_layout.addWidget(QLabel("Input"), 0, 0)
+            form_layout.addWidget(q_label("输入视频"), 0, 0)
             form_layout.addWidget(self.input_edit, 0, 1)
             form_layout.addWidget(input_button, 0, 2)
-            form_layout.addWidget(QLabel("Output"), 1, 0)
+            form_layout.addWidget(q_label("输出文件"), 1, 0)
             form_layout.addWidget(self.output_edit, 1, 1)
             form_layout.addWidget(output_button, 1, 2)
-            form_layout.addWidget(QLabel("Target profile"), 2, 0)
+            form_layout.addWidget(q_label("输出规格"), 2, 0)
             form_layout.addWidget(self.target_combo, 2, 1)
-            form_layout.addWidget(QLabel("Quality mode"), 3, 0)
+            form_layout.addWidget(q_label("质量模式"), 3, 0)
             form_layout.addWidget(self.quality_combo, 3, 1)
-            form_layout.addWidget(QLabel("Backend"), 4, 0)
+            form_layout.addWidget(q_label("增强后端"), 4, 0)
             form_layout.addWidget(self.backend_combo, 4, 1)
+            form_layout.addWidget(q_label("预览秒数"), 5, 0)
+            form_layout.addWidget(self.preview_seconds, 5, 1)
+            form_layout.addWidget(inspect_button, 5, 2)
 
-            checkbox_row = QHBoxLayout()
+            checkbox_row = q_hbox_layout()
             checkbox_row.addWidget(self.preserve_audio)
             checkbox_row.addWidget(self.preserve_subtitles)
             checkbox_row.addWidget(self.preserve_metadata)
-            form_layout.addLayout(checkbox_row, 5, 0, 1, 3)
+            form_layout.addLayout(checkbox_row, 6, 0, 1, 3)
 
             layout.addWidget(form_group)
 
-            buttons = QHBoxLayout()
-            plan_button = QPushButton("Autofill output")
+            buttons = q_hbox_layout()
+            plan_button = q_push_button("自动生成输出路径")
             plan_button.clicked.connect(self._autofill_output)
-            run_button = QPushButton("Run")
+            run_button = q_push_button("开始导出")
             run_button.clicked.connect(self._run_job)
             buttons.addWidget(plan_button)
             buttons.addWidget(run_button)
             layout.addLayout(buttons)
 
-            self.log = QPlainTextEdit()
+            self.log = q_plain_text_edit()
             self.log.setReadOnly(True)
             layout.addWidget(self.log)
 
             self.setCentralWidget(root)
+            self._refresh_environment_status()
 
         def _pick_input(self) -> None:
-            selected, _ = QFileDialog.getOpenFileName(
+            selected, _ = q_file_dialog.getOpenFileName(
                 self,
-                "Select input video",
+                "选择输入视频",
                 str(Path.cwd()),
-                "Video Files (*.mp4 *.mkv *.mov *.avi *.m4v)",
+                "视频文件 (*.mp4 *.mkv *.mov *.avi *.m4v)",
             )
             if selected:
                 self.input_edit.setText(selected)
                 self._autofill_output()
 
         def _pick_output(self) -> None:
-            selected, _ = QFileDialog.getSaveFileName(
+            selected, _ = q_file_dialog.getSaveFileName(
                 self,
-                "Select output video",
+                "选择输出文件",
                 str(Path.cwd() / "outputs" / "clearvid_output.mp4"),
-                "MP4 Files (*.mp4)",
+                "MP4 文件 (*.mp4)",
             )
             if selected:
                 self.output_edit.setText(selected)
@@ -149,38 +245,71 @@ def main() -> None:
                 return
             input_path = Path(self.input_edit.text())
             stem = input_path.stem
-            target = self.target_combo.currentText()
-            self.output_edit.setText(str(Path.cwd() / "outputs" / f"{stem}_{target}.mp4"))
+            selected_profile = self.target_combo.currentData()
+            suffix = selected_profile.value if selected_profile else "output"
+            self.output_edit.setText(str(Path.cwd() / "outputs" / f"{stem}_{suffix}.mp4"))
+
+        def _inspect_input(self) -> None:
+            if not self.input_edit.text():
+                q_message_box.information(self, "未选择输入视频", "请先选择一个输入视频文件。")
+                return
+
+            try:
+                metadata = probe_video(Path(self.input_edit.text()))
+            except Exception as exc:  # noqa: BLE001
+                q_message_box.critical(self, "视频分析失败", str(exc))
+                return
+
+            self.log.appendPlainText(
+                f"输入信息: 分辨率 {metadata.width}x{metadata.height}, 帧率 {metadata.fps:.3f} fps, "
+                f"视频编码 {metadata.video_codec}, 音频流 {metadata.audio_streams} 条, 时长 {metadata.duration_seconds:.2f} 秒"
+            )
+
+        def _refresh_environment_status(self) -> None:
+            preferred_backend_text = {
+                "auto": "自动",
+                "baseline": "基线后端",
+                "realesrgan": "Real-ESRGAN",
+            }.get(self._environment.preferred_backend.value, self._environment.preferred_backend.value)
+            bool_text = lambda value: "是" if value else "否"
+            lines = [
+                f"推荐后端: {preferred_backend_text}",
+                f"FFmpeg 可用: {bool_text(self._environment.ffmpeg_available)}",
+                f"GPU: {self._environment.gpu_name or '未检测到'}",
+                f"Torch 版本: {self._environment.torch_version or '未安装'}",
+                f"Torch GPU 兼容: {bool_text(self._environment.torch_gpu_compatible)}",
+                f"Real-ESRGAN 可用: {bool_text(self._environment.realesrgan_available)}",
+                f"模型状态: {self._environment.realesrgan_message or '未检测'}",
+            ]
+            self.status_box.setPlainText("\n".join(lines))
 
         def _run_job(self) -> None:
             if not self.input_edit.text() or not self.output_edit.text():
-                QMessageBox.warning(self, "Missing paths", "Input and output paths are required.")
+                q_message_box.warning(self, "缺少路径", "请输入输入视频路径和输出文件路径。")
                 return
 
             config = EnhancementConfig(
                 input_path=Path(self.input_edit.text()),
                 output_path=Path(self.output_edit.text()),
-                target_profile=TargetProfile(self.target_combo.currentText()),
-                quality_mode=QualityMode(self.quality_combo.currentText()),
-                backend=BackendType(self.backend_combo.currentText()),
+                target_profile=self.target_combo.currentData(),
+                quality_mode=self.quality_combo.currentData(),
+                backend=self.backend_combo.currentData(),
                 preserve_audio=self.preserve_audio.isChecked(),
                 preserve_subtitles=self.preserve_subtitles.isChecked(),
                 preserve_metadata=self.preserve_metadata.isChecked(),
+                preview_seconds=self.preview_seconds.value() or None,
             )
 
-            self.log.appendPlainText(f"Starting job for {config.input_path}")
-            self._worker = Worker(config)
+            self.log.appendPlainText(f"开始处理: {config.input_path}")
+            self._worker = worker_class(config)
             self._worker.completed.connect(self._on_completed)
             self._worker.failed.connect(self._on_failed)
             self._worker.start()
 
         def _on_completed(self, payload: str) -> None:
-            self.log.appendPlainText(payload)
+            self.log.appendPlainText("处理完成:\n" + payload)
 
         def _on_failed(self, message: str) -> None:
-            self.log.appendPlainText(f"Error: {message}")
+            self.log.appendPlainText(f"处理失败: {message}")
 
-    application = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(application.exec())
+    return MainWindow

@@ -22,6 +22,7 @@ class Orchestrator:
                 output_path=config.output_path,
                 success=True,
                 message="Dry run created execution plan only.",
+                backend=plan.backend,
             )
 
         run_command(plan.command)
@@ -29,7 +30,8 @@ class Orchestrator:
             input_path=config.input_path,
             output_path=config.output_path,
             success=True,
-            message=f"Finished with backend {config.backend.value}.",
+            message=f"Finished with backend {plan.backend.value}.",
+            backend=plan.backend,
         )
 
     def run_batch(self, input_dir: Path, output_dir: Path, template: EnhancementConfig) -> list[BatchResult]:
@@ -49,6 +51,7 @@ class Orchestrator:
                         output_path=output_path,
                         success=False,
                         message=str(exc),
+                        backend=None,
                     )
                 )
 

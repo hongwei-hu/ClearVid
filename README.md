@@ -9,7 +9,8 @@ ClearVid is a Windows-first Python project for enhancing real-world character vi
 - CLI and a simple desktop GUI are implemented.
 - Batch job discovery and task planning are implemented.
 - Baseline FFmpeg enhancement backend is implemented for end-to-end validation.
-- Real-ESRGAN and CodeFormer runners are scaffolded but not fully integrated yet.
+- The GUI is directly launchable from Windows with the provided starter script.
+- Real-ESRGAN runtime detection is implemented, with automatic fallback to the baseline backend when the model runtime is unavailable.
 
 ## Recommended environment
 
@@ -19,6 +20,8 @@ ClearVid is a Windows-first Python project for enhancing real-world character vi
 - NVIDIA GPU with recent drivers
 
 The currently configured local Python is 3.13. It is fine for the scaffold, but for heavy PyTorch and model compatibility, Python 3.11 is the safer target.
+
+On this machine specifically, the installed PyTorch build does not support RTX 5090 GPU architecture yet, so the application currently auto-falls back to the FFmpeg baseline backend. The GUI will show this status clearly.
 
 ## Install
 
@@ -75,6 +78,28 @@ Launch the GUI:
 ```powershell
 clearvid gui
 ```
+
+Or on Windows, just run:
+
+```powershell
+.\Start_ClearVid_GUI.bat
+```
+
+## Current model runtime note
+
+The `.venv` environment in this repository is now prepared for RTX 5090 compatible PyTorch.
+
+What is already ready:
+
+- `.venv` contains a CUDA-compatible PyTorch build with `sm_120` support.
+- ClearVid GUI and core dependencies are installed in `.venv`.
+- Real-ESRGAN related Python packages are installed in `.venv`.
+
+What is still missing for the true model backend:
+
+- Real-ESRGAN weight files under [weights/README.zh-CN.md](weights/README.zh-CN.md)
+
+Until weights are added, the application will continue to run through the baseline backend, which is still directly usable from the GUI.
 
 ## What the baseline backend does
 
