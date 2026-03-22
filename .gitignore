@@ -1,2 +1,14 @@
 deploy
 /GITEA_SYNOLOGY_DEPLOY.md
+/.venv/
+/__pycache__/
+/.pytest_cache/
+/build/
+/dist/
+/outputs/
+/weights/
+*.pyc
+*.pyo
+*.log
+
+samples
