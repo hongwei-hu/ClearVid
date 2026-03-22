@@ -216,7 +216,6 @@ def run_realesrgan_video(
         _emit_progress(progress_callback, 11, f"正在应用推理加速: {accel_label}")
         t_accel = time.perf_counter()
         # TRT opt profile tile: use config value, or 512 as sensible default
-        # (dynamic axes handle any actual input size at runtime)
         trt_tile = config.tile_size if config.tile_size > 0 else 512
         upsampler.model = accelerate_model(
             upsampler.model,
@@ -225,6 +224,7 @@ def run_realesrgan_video(
             tile_size=trt_tile,
             batch_size=config.batch_size,
             cache_dir=TRT_CACHE_DIR,
+            progress_callback=progress_callback,
         )
         accel_actual = "TensorRT" if hasattr(upsampler.model, '_engine') else "PyTorch (回退)"
         _emit_progress(

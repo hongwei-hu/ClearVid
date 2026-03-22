@@ -13,9 +13,13 @@ RealESRGANer tiling/padding logic is untouched.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import subprocess
+import sys
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +42,7 @@ def accelerate_model(
     tile_size: int = 512,
     batch_size: int = 1,
     cache_dir: Path | None = None,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> object:
     """Wrap *model* with the requested accelerator.  Returns the (possibly
     wrapped) model — always usable as a drop-in replacement for the original.
@@ -52,7 +57,10 @@ def accelerate_model(
         return _apply_torch_compile(model)
 
     if accelerator == InferenceAccelerator.TENSORRT:
-        return _apply_tensorrt(model, fp16=fp16, tile_size=tile_size, batch_size=batch_size, cache_dir=cache_dir)
+        return _apply_tensorrt(
+            model, fp16=fp16, tile_size=tile_size, batch_size=batch_size,
+            cache_dir=cache_dir, progress_callback=progress_callback,
+        )
 
     return model
 
@@ -86,7 +94,7 @@ def _apply_torch_compile(model: object) -> object:
 
 
 # ---------------------------------------------------------------------------
-# Tier 2: ONNX → TensorRT
+# Tier 2: ONNX → TensorRT (subprocess-isolated build)
 # ---------------------------------------------------------------------------
 
 def _apply_tensorrt(
@@ -96,10 +104,11 @@ def _apply_tensorrt(
     tile_size: int,
     batch_size: int = 1,
     cache_dir: Path | None,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> object:
     """Export to ONNX, then build/load a TensorRT engine."""
     try:
-        import torch
+        import torch  # noqa: F811
         import tensorrt  # noqa: F401 — ensure tensorrt is importable
     except ImportError:
         logger.warning("tensorrt 包未安装，回退到标准推理。安装: pip install tensorrt")
@@ -112,7 +121,8 @@ def _apply_tensorrt(
 
     try:
         engine_path = _get_or_build_engine(
-            model, fp16=fp16, tile_size=tile_size, batch_size=batch_size, cache_dir=cache_dir,
+            model, fp16=fp16, tile_size=tile_size, batch_size=batch_size,
+            cache_dir=cache_dir, progress_callback=progress_callback,
         )
         wrapper = _TensorRTModelWrapper(engine_path, fp16=fp16)
         logger.info("已启用 TensorRT 加速 (engine: %s)", engine_path.name)
@@ -122,6 +132,13 @@ def _apply_tensorrt(
         return model
 
 
+def _engine_cache_key(model: object, fp16: bool, tile_size: int, batch_size: int) -> str:
+    """Deterministic cache key from model state + build params."""
+    key_data = f"tile{tile_size}_fp16{fp16}_batch{batch_size}"
+    state_bytes = str(sum(p.numel() for p in model.parameters())).encode()
+    return hashlib.sha256(state_bytes + key_data.encode()).hexdigest()[:16]
+
+
 def _get_or_build_engine(
     model: object,
     *,
@@ -129,25 +146,25 @@ def _get_or_build_engine(
     tile_size: int,
     batch_size: int = 1,
     cache_dir: Path,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> Path:
     """Return path to a cached TRT engine, building one if necessary."""
     import torch
 
-    # Deterministic cache key from model state + build params
-    key_data = f"tile{tile_size}_fp16{fp16}_batch{batch_size}"
-    state_bytes = str(sum(p.numel() for p in model.parameters())).encode()
-    digest = hashlib.sha256(state_bytes + key_data.encode()).hexdigest()[:16]
+    digest = _engine_cache_key(model, fp16, tile_size, batch_size)
     engine_path = cache_dir / f"realesrgan_{digest}.engine"
 
-    if engine_path.exists():
+    if engine_path.exists() and engine_path.stat().st_size > 0:
         logger.info("加载缓存的 TensorRT 引擎: %s", engine_path.name)
         return engine_path
 
-    # Step 1: export ONNX
+    # Step 1: export ONNX (quick, in-process)
     onnx_path = cache_dir / f"realesrgan_{digest}.onnx"
     if not onnx_path.exists():
         logger.info("正在导出 ONNX 模型 (tile=%d, batch=%d) ...", tile_size, batch_size)
-        dummy = torch.randn(batch_size, 3, tile_size, tile_size).to(next(model.parameters()).device)
+        dummy = torch.randn(batch_size, 3, tile_size, tile_size).to(
+            next(model.parameters()).device,
+        )
         if fp16:
             dummy = dummy.half()
             model = model.half()
@@ -165,59 +182,146 @@ def _get_or_build_engine(
         )
         logger.info("ONNX 导出完成: %s", onnx_path.name)
 
-    # Step 2: build TensorRT engine
-    logger.info("正在构建 TensorRT 引擎 (首次可能需要几分钟) ...")
-    _build_trt_engine(onnx_path, engine_path, fp16=fp16, tile_size=tile_size, batch_size=batch_size)
+    # Step 2: build TensorRT engine in ISOLATED SUBPROCESS
+    # This prevents GPU-intensive TRT builder from freezing the main app.
+    if progress_callback is not None:
+        progress_callback(11, "首次构建 TensorRT 引擎 (约1-2分钟，后续秒级加载)...")
+    logger.info("正在构建 TensorRT 引擎 (首次构建, 子进程隔离) ...")
+    _build_trt_engine_subprocess(
+        onnx_path, engine_path,
+        fp16=fp16, tile_size=tile_size, batch_size=batch_size,
+        timeout=180,
+    )
+
+    if not engine_path.exists() or engine_path.stat().st_size == 0:
+        raise RuntimeError("TRT 引擎文件未生成")
+
     logger.info("TensorRT 引擎构建完成: %s", engine_path.name)
     return engine_path
 
 
-def _build_trt_engine(
+# -- Self-contained build script executed in subprocess ---------------------
+_TRT_BUILD_SCRIPT = r'''
+import json, os, sys
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+
+args = json.loads(sys.argv[1])
+
+import tensorrt as trt
+
+trt_logger = trt.Logger(trt.Logger.WARNING)
+builder = trt.Builder(trt_logger)
+network = builder.create_network(
+    1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+)
+parser = trt.OnnxParser(network, trt_logger)
+
+with open(args["onnx_path"], "rb") as f:
+    ok = parser.parse(f.read())
+if not ok:
+    errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+    print(f"ONNX_PARSE_FAILED: {errors}", file=sys.stderr)
+    sys.exit(1)
+
+config = builder.create_builder_config()
+config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1 GB
+
+# Optimization level 2 (default=3): much faster build, ~5% less optimized kernels
+if hasattr(config, "builder_optimization_level"):
+    config.builder_optimization_level = 2
+
+if args["fp16"]:
+    config.set_flag(trt.BuilderFlag.FP16)
+
+tile = args["tile_size"]
+batch = args["batch_size"]
+min_hw = max(64, tile // 4)
+max_hw = min(tile + 256, 768)
+max_batch = min(batch, 8)
+
+profile = builder.create_optimization_profile()
+profile.set_shape(
+    "input",
+    min=(1, 3, min_hw, min_hw),
+    opt=(batch, 3, tile, tile),
+    max=(max_batch, 3, max_hw, max_hw),
+)
+config.add_optimization_profile(profile)
+
+print(f"Building TRT engine: opt=({batch},3,{tile},{tile}) max=({max_batch},3,{max_hw},{max_hw})", flush=True)
+engine_bytes = builder.build_serialized_network(network, config)
+if engine_bytes is None:
+    print("ENGINE_BUILD_RETURNED_NONE", file=sys.stderr)
+    sys.exit(1)
+
+with open(args["engine_path"], "wb") as f:
+    f.write(engine_bytes)
+
+print("OK", flush=True)
+'''
+
+
+def _build_trt_engine_subprocess(
     onnx_path: Path,
     engine_path: Path,
     *,
     fp16: bool,
     tile_size: int,
-    batch_size: int = 1,
+    batch_size: int,
+    timeout: int = 180,
 ) -> None:
-    """Build a TensorRT engine from an ONNX model."""
-    import tensorrt as trt
+    """Build TRT engine in an isolated subprocess with timeout.
 
-    trt_logger = trt.Logger(trt.Logger.WARNING)
-    builder = trt.Builder(trt_logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
-    parser = trt.OnnxParser(network, trt_logger)
+    - Subprocess gets its own CUDA context → main app stays responsive
+    - On timeout the process is killed → GPU memory released immediately
+    - Lower priority on Windows to reduce desktop compositor stutter
+    """
+    args_json = json.dumps({
+        "onnx_path": str(onnx_path),
+        "engine_path": str(engine_path),
+        "fp16": fp16,
+        "tile_size": tile_size,
+        "batch_size": batch_size,
+    })
 
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
-            raise RuntimeError(f"ONNX 解析失败:\n{errors}")
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = (
+            subprocess.BELOW_NORMAL_PRIORITY_CLASS
+            | subprocess.CREATE_NO_WINDOW
+        )
 
-    config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)  # 2 GB
-
-    if fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
-
-    # Dynamic shape profile — keep max modest to avoid OOM during build
-    profile = builder.create_optimization_profile()
-    min_hw = max(64, tile_size // 4)
-    max_hw = min(tile_size + 512, 1024)  # cap to prevent enormous allocations
-    max_batch = min(batch_size, 16)
-    profile.set_shape(
-        "input",
-        min=(1, 3, min_hw, min_hw),
-        opt=(batch_size, 3, tile_size, tile_size),
-        max=(max_batch, 3, max_hw, max_hw),
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _TRT_BUILD_SCRIPT, args_json],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creation_flags,
     )
-    config.add_optimization_profile(profile)
-
-    engine_bytes = builder.build_serialized_network(network, config)
-    if engine_bytes is None:
-        raise RuntimeError("TensorRT 引擎序列化失败")
-
-    with open(engine_path, "wb") as f:
-        f.write(engine_bytes)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            err_msg = stderr.decode(errors="replace").strip()
+            # Clean up partial engine file
+            if engine_path.exists():
+                try:
+                    engine_path.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError(f"TRT 引擎构建失败 (exit={proc.returncode}): {err_msg}")
+        logger.info("TRT 子进程输出: %s", stdout.decode(errors="replace").strip())
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        # Clean up partial engine file
+        if engine_path.exists():
+            try:
+                engine_path.unlink()
+            except OSError:
+                pass
+        raise TimeoutError(
+            f"TRT 引擎构建超时 ({timeout}s)。"
+            "建议减小 batch_size 或使用标准 PyTorch 推理。"
+        )
 
 
 class _TensorRTModelWrapper:
@@ -249,9 +353,6 @@ class _TensorRTModelWrapper:
         self._context.set_tensor_address("input", x.data_ptr())
         self._context.set_tensor_address("output", output.data_ptr())
         self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        # No explicit synchronize() here — the downstream .cpu() / .float()
-        # calls in the caller already force an implicit sync.  Removing this
-        # allows better overlap between TRT execution and CPU work.
 
         return output
 
@@ -287,7 +388,6 @@ def detect_best_accelerator() -> InferenceAccelerator:
     try:
         import torch
         if hasattr(torch, "compile"):
-            # inductor backend requires triton for CUDA kernel compilation
             import triton  # noqa: F401
             return InferenceAccelerator.COMPILE
     except ImportError:
