@@ -58,6 +58,7 @@ def _load_qt() -> dict[str, object]:
             QApplication,
             QCheckBox,
             QComboBox,
+            QDoubleSpinBox,
             QFileDialog,
             QGridLayout,
             QGroupBox,
@@ -79,6 +80,7 @@ def _load_qt() -> dict[str, object]:
         "QApplication": QApplication,
         "QCheckBox": QCheckBox,
         "QComboBox": QComboBox,
+        "QDoubleSpinBox": QDoubleSpinBox,
         "QFileDialog": QFileDialog,
         "QGridLayout": QGridLayout,
         "QGroupBox": QGroupBox,
@@ -119,6 +121,7 @@ def _create_worker_class(q_thread_cls: Any, signal_factory: Any) -> type:
 def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type:
     q_check_box = qt["QCheckBox"]
     q_combo_box = qt["QComboBox"]
+    q_double_spin_box = qt["QDoubleSpinBox"]
     q_file_dialog = qt["QFileDialog"]
     q_grid_layout = qt["QGridLayout"]
     q_group_box = qt["QGroupBox"]
@@ -180,6 +183,14 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             self.preview_seconds.setMaximum(24 * 60 * 60)
             self.preview_seconds.setValue(0)
 
+            self.face_restore_enabled = q_check_box("启用人脸修复")
+            self.face_restore_enabled.setChecked(True)
+            self.face_restore_strength = q_double_spin_box()
+            self.face_restore_strength.setDecimals(2)
+            self.face_restore_strength.setRange(0.0, 1.0)
+            self.face_restore_strength.setSingleStep(0.05)
+            self.face_restore_strength.setValue(0.55)
+
             inspect_button = q_push_button("分析视频")
             inspect_button.clicked.connect(self._inspect_input)
 
@@ -205,12 +216,15 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
             form_layout.addWidget(q_label("预览秒数"), 5, 0)
             form_layout.addWidget(self.preview_seconds, 5, 1)
             form_layout.addWidget(inspect_button, 5, 2)
+            form_layout.addWidget(q_label("人脸修复强度"), 6, 0)
+            form_layout.addWidget(self.face_restore_strength, 6, 1)
+            form_layout.addWidget(self.face_restore_enabled, 6, 2)
 
             checkbox_row = q_hbox_layout()
             checkbox_row.addWidget(self.preserve_audio)
             checkbox_row.addWidget(self.preserve_subtitles)
             checkbox_row.addWidget(self.preserve_metadata)
-            form_layout.addLayout(checkbox_row, 6, 0, 1, 3)
+            form_layout.addLayout(checkbox_row, 7, 0, 1, 3)
 
             layout.addWidget(form_group)
 
@@ -325,6 +339,8 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 target_profile=target_profile,
                 quality_mode=quality_mode,
                 backend=backend,
+                face_restore_enabled=self.face_restore_enabled.isChecked(),
+                face_restore_strength=self.face_restore_strength.value(),
                 preserve_audio=self.preserve_audio.isChecked(),
                 preserve_subtitles=self.preserve_subtitles.isChecked(),
                 preserve_metadata=self.preserve_metadata.isChecked(),

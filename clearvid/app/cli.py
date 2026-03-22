@@ -77,6 +77,8 @@ def run(
     preserve_audio: bool = typer.Option(True),
     preserve_subtitles: bool = typer.Option(True),
     preserve_metadata: bool = typer.Option(True),
+    face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
+    face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -89,6 +91,8 @@ def run(
         preserve_audio=preserve_audio,
         preserve_subtitles=preserve_subtitles,
         preserve_metadata=preserve_metadata,
+        face_restore_enabled=face_restore_enabled,
+        face_restore_strength=face_restore_strength,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )
@@ -103,6 +107,8 @@ def batch(
     target_profile: TargetProfile = typer.Option(TargetProfile.FHD),
     backend: BackendType = typer.Option(BackendType.AUTO),
     quality_mode: QualityMode = typer.Option(QualityMode.QUALITY),
+    face_restore_enabled: bool = typer.Option(True, help="Enable CodeFormer face restoration"),
+    face_restore_strength: float = typer.Option(0.55, min=0.0, max=1.0, help="CodeFormer fidelity weight"),
     preview_seconds: int | None = typer.Option(None, help="Process only the first N seconds of each file"),
     dry_run: bool = typer.Option(False),
 ) -> None:
@@ -116,6 +122,8 @@ def batch(
         target_profile=target_profile,
         backend=backend,
         quality_mode=quality_mode,
+        face_restore_enabled=face_restore_enabled,
+        face_restore_strength=face_restore_strength,
         preview_seconds=preview_seconds,
         dry_run=dry_run,
     )

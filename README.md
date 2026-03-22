@@ -10,6 +10,7 @@ ClearVid is a Windows-first Python project for enhancing real-world character vi
 - Batch job discovery and task planning are implemented.
 - Baseline FFmpeg enhancement backend is implemented for end-to-end validation.
 - Real-ESRGAN true backend is implemented and validated on the sample video.
+- CodeFormer face restoration is integrated into the Real-ESRGAN pipeline.
 - The GUI is directly launchable from Windows with the provided starter script.
 - Real-ESRGAN runtime detection is implemented, with automatic fallback to the baseline backend when the model runtime is unavailable.
 
@@ -72,6 +73,12 @@ Batch a directory:
 clearvid batch samples --target-profile fhd --backend baseline --output-dir outputs
 ```
 
+Run a quick Real-ESRGAN + CodeFormer preview:
+
+```powershell
+clearvid run samples\sample.mp4 --target-profile fhd --backend realesrgan --preview-seconds 1 --output outputs\sample_fhd_realesrgan_codeformer_preview.mp4
+```
+
 Launch the GUI:
 
 ```powershell
@@ -94,11 +101,13 @@ What is already ready:
 - ClearVid GUI and core dependencies are installed in `.venv`.
 - Real-ESRGAN related Python packages are installed in `.venv`.
 - ClearVid can auto-download the default `realesr-general-x4v3.pth` weight on first Real-ESRGAN run.
+- ClearVid can auto-download `codeformer.pth` and required facelib detection/parsing weights on first face-restoration run.
 - Auto backend selection now prefers Real-ESRGAN when the runtime is available.
 
 Optional manual setup:
 
 - You can still place custom Real-ESRGAN weights under [weights/README.zh-CN.md](weights/README.zh-CN.md)
+- You can also pre-place CodeFormer and facelib weights under [weights/README.zh-CN.md](weights/README.zh-CN.md)
 - The baseline backend remains available as a fallback path from both CLI and GUI
 
 Run a quick Real-ESRGAN preview:
@@ -113,4 +122,4 @@ The baseline backend is intentionally simple. It uses FFmpeg scaling and mild cl
 
 It is not the final quality path.
 
-The current final quality path is the Real-ESRGAN backend. A later optional step is attaching CodeFormer to the face enhancement stage.
+The current final quality path is the Real-ESRGAN backend with optional CodeFormer face restoration. GUI and CLI both expose the face restoration switch and strength.
