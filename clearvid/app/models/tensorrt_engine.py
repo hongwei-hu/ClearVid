@@ -238,7 +238,9 @@ class _TensorRTModelWrapper:
         self._context.set_tensor_address("input", x.data_ptr())
         self._context.set_tensor_address("output", output.data_ptr())
         self._context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-        torch.cuda.current_stream().synchronize()
+        # No explicit synchronize() here — the downstream .cpu() / .float()
+        # calls in the caller already force an implicit sync.  Removing this
+        # allows better overlap between TRT execution and CPU work.
 
         return output
 
