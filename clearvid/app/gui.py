@@ -30,6 +30,17 @@ TARGET_LABELS = {
 }
 
 
+def _coerce_enum(enum_type: type, value: Any, default: Any) -> Any:
+    if isinstance(value, enum_type):
+        return value
+    if isinstance(value, str):
+        try:
+            return enum_type(value)
+        except ValueError:
+            return default
+    return default
+
+
 def main() -> None:
     qt = _load_qt()
     application = qt["QApplication"](sys.argv)
@@ -245,7 +256,11 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 return
             input_path = Path(self.input_edit.text())
             stem = input_path.stem
-            selected_profile = self.target_combo.currentData()
+            selected_profile = _coerce_enum(
+                TargetProfile,
+                self.target_combo.currentData(),
+                TargetProfile.FHD,
+            )
             suffix = selected_profile.value if selected_profile else "output"
             self.output_edit.setText(str(Path.cwd() / "outputs" / f"{stem}_{suffix}.mp4"))
 
@@ -288,12 +303,28 @@ def _create_main_window_class(qt: dict[str, object], worker_class: type) -> type
                 q_message_box.warning(self, "缺少路径", "请输入输入视频路径和输出文件路径。")
                 return
 
+            target_profile = _coerce_enum(
+                TargetProfile,
+                self.target_combo.currentData(),
+                TargetProfile.FHD,
+            )
+            quality_mode = _coerce_enum(
+                QualityMode,
+                self.quality_combo.currentData(),
+                QualityMode.QUALITY,
+            )
+            backend = _coerce_enum(
+                BackendType,
+                self.backend_combo.currentData(),
+                BackendType.AUTO,
+            )
+
             config = EnhancementConfig(
                 input_path=Path(self.input_edit.text()),
                 output_path=Path(self.output_edit.text()),
-                target_profile=self.target_combo.currentData(),
-                quality_mode=self.quality_combo.currentData(),
-                backend=self.backend_combo.currentData(),
+                target_profile=target_profile,
+                quality_mode=quality_mode,
+                backend=backend,
                 preserve_audio=self.preserve_audio.isChecked(),
                 preserve_subtitles=self.preserve_subtitles.isChecked(),
                 preserve_metadata=self.preserve_metadata.isChecked(),
