@@ -92,8 +92,8 @@ class TemporalStabilizer:
         # Blend: static areas → warped previous; moving areas → current.
         stabilized = self._blend(frame, warped, blend_weight)
 
-        self._prev_frame = stabilized.copy()
-        self._prev_gray_small = self._to_gray_small(stabilized)
+        self._prev_frame = frame.copy()
+        self._prev_gray_small = gray_small
         return stabilized
 
     def reset(self) -> None:
@@ -114,11 +114,15 @@ class TemporalStabilizer:
 
     @staticmethod
     def _warp_frame(frame: np.ndarray, flow: np.ndarray) -> np.ndarray:
-        """Backward-warp *frame* using the forward optical flow."""
+        """Backward-warp *frame* using the forward optical flow.
+
+        Forward flow (prev→curr) gives displacement of each prev pixel.
+        To find the source in prev for each output pixel we subtract the flow.
+        """
         h, w = flow.shape[:2]
         map_x, map_y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-        remap_x = map_x + flow[..., 0]
-        remap_y = map_y + flow[..., 1]
+        remap_x = map_x - flow[..., 0]
+        remap_y = map_y - flow[..., 1]
         return cv2.remap(
             frame,
             remap_x,
