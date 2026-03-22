@@ -182,6 +182,70 @@ def run_realesrgan_video(
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def enhance_single_frame(
+    frame: np.ndarray,
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+) -> np.ndarray:
+    """Enhance a single BGR frame using the full pipeline (upscale + face + sharpen).
+
+    This is used by the preview feature to show a Before/After comparison
+    without launching the full streaming pipeline.
+    """
+    weights_dir = Path.cwd() / "weights" / "realesrgan"
+    model_key = resolve_upscale_model(config.upscale_model, config.quality_mode)
+    model_path = ensure_realesrgan_weights(weights_dir, model_key)
+    upsampler = _build_upsampler(config, model_path, model_key, metadata.width, metadata.height)
+
+    outscale = _resolve_outscale(metadata, output_width, output_height, config.target_profile)
+    enhanced, _ = upsampler.enhance(frame, outscale=outscale)
+
+    face_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
+    if face_restorer is not None:
+        enhanced = face_restorer.restore_faces(enhanced)
+
+    enhanced = _resize_for_target(enhanced, output_width, output_height, config.target_profile)
+
+    if config.sharpen_enabled and config.sharpen_strength > 0:
+        enhanced = apply_sharpening(enhanced, config.sharpen_strength)
+
+    return enhanced
+
+
+def extract_frame(video_path: Path, timestamp_sec: float = 0.0, width: int = 0, height: int = 0) -> np.ndarray:
+    """Extract a single frame from a video at the given timestamp using FFmpeg.
+
+    If *width*/*height* are provided they are used directly; otherwise
+    the video is probed to determine the dimensions.
+
+    Returns a BGR numpy array.
+    """
+    import subprocess
+
+    if width <= 0 or height <= 0:
+        from clearvid.app.io.probe import probe_video
+        meta = probe_video(video_path)
+        width, height = meta.width, meta.height
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-hwaccel", "auto",
+        "-ss", f"{timestamp_sec:.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        "-f", "image2pipe",
+        "-pix_fmt", "bgr24",
+        "-vcodec", "rawvideo",
+        "pipe:1",
+    ]
+    result = subprocess.run(command, capture_output=True, check=True)  # noqa: S603
+    return np.frombuffer(result.stdout, dtype=np.uint8).reshape((height, width, 3))
+
+
 def ensure_realesrgan_weights(weights_path: Path, model_key: str = "general_v3") -> Path:
     """Ensure weights for *model_key* exist, downloading if needed."""
     weights_path.mkdir(parents=True, exist_ok=True)
