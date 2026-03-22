@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 import yaml
@@ -281,6 +282,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "未选择视频", "请先选择一个输入视频文件。")
             return
 
+        # Cancel any in-flight preview to avoid dangling QThread crash.
+        self._cancel_preview_worker()
+
         config = self._export_panel.build_preview_config(input_path)
 
         self._preview_panel.set_preview_loading(True)
@@ -290,6 +294,24 @@ class MainWindow(QMainWindow):
         self._preview_worker.finished.connect(self._on_preview_finished)
         self._preview_worker.failed.connect(self._on_preview_failed)
         self._preview_worker.start()
+
+    def _cancel_preview_worker(self) -> None:
+        """Safely stop and dispose of any running PreviewWorker."""
+        worker = self._preview_worker
+        if worker is None:
+            return
+        try:
+            worker.finished.disconnect()
+            worker.failed.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if worker.isRunning():
+            worker.quit()
+            worker.wait(3000)  # wait up to 3 s
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(1000)
+        self._preview_worker = None
 
     def _on_preview_finished(self, original: object, enhanced: object) -> None:
         self._preview_panel.set_preview_loading(False)
@@ -808,6 +830,18 @@ class MainWindow(QMainWindow):
 
 def launch() -> None:
     """Create QApplication, apply theme, and show the main window."""
+    # Global exception hook — log crashes instead of silent exit.
+    _logger = logging.getLogger("clearvid.gui")
+
+    def _exception_hook(exc_type, exc_value, exc_tb):
+        _logger.critical(
+            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb),
+        )
+        # Also print to stderr so the console shows it.
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _exception_hook
+
     app = QApplication(sys.argv)
     app.setStyleSheet(get_dark_theme())
     window = MainWindow()
