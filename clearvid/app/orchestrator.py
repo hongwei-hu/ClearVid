@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from clearvid.app.export_control import ExportControl
 from clearvid.app.models.realesrgan_runner import enhance_single_frame, extract_frame, run_realesrgan_video
 from clearvid.app.io.probe import probe_video
 from clearvid.app.pipeline import build_execution_plan, resolve_output_size
@@ -35,6 +36,7 @@ class Orchestrator:
         self,
         config: EnhancementConfig,
         progress_callback: Callable[[int, str], None] | None = None,
+        control: ExportControl | None = None,
     ) -> BatchResult:
         _emit_progress(progress_callback, 2, "正在分析输入视频")
         metadata = probe_video(config.input_path)
@@ -59,6 +61,7 @@ class Orchestrator:
                 output_width=plan.output_width,
                 output_height=plan.output_height,
                 progress_callback=progress_callback,
+                control=control,
             )
         else:
             run_ffmpeg_with_progress(

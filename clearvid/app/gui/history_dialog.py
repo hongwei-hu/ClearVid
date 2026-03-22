@@ -74,7 +74,9 @@ def load_history() -> list[HistoryRecord]:
 def save_history(records: list[HistoryRecord]) -> None:
     _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = [asdict(r) for r in records[-_MAX_HISTORY:]]
-    _HISTORY_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = _HISTORY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(_HISTORY_FILE)
 
 
 def append_history(record: HistoryRecord) -> None:

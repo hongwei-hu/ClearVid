@@ -13,6 +13,7 @@ from clearvid.app.bootstrap.weight_manager import (
     download_weight,
     missing_weights_for_export,
 )
+from clearvid.app.export_control import ExportControl
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut
@@ -423,10 +424,12 @@ class MainWindow(QMainWindow):
         self._export_panel.set_progress(0, "正在准备任务...")
         self._export_start_time = time.monotonic()
 
-        self._worker = Worker(config)
+        self._export_control = ExportControl()
+        self._worker = Worker(config, control=self._export_control)
         self._worker.progress.connect(self._on_progress)
         self._worker.completed.connect(self._on_completed)
         self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.start()
 
     def _on_progress(self, percent: int, message: str) -> None:
@@ -463,6 +466,11 @@ class MainWindow(QMainWindow):
             success=False,
             error=message[:200],
         ))
+
+    def _on_cancelled(self) -> None:
+        self._export_panel.set_export_enabled(True)
+        self._export_panel.set_progress(0, "导出已取消")
+        self._log_message("导出已被用户取消")
 
     # ==================================================================
     # Export queue (all files in file list)
@@ -779,7 +787,10 @@ class MainWindow(QMainWindow):
             self._queue_worker.cancel()
             self._log_message("队列取消中…")
         elif self._worker and self._worker.isRunning():
-            self._worker.requestInterruption()
+            if hasattr(self, '_export_control') and self._export_control is not None:
+                self._export_control.cancel()
+            else:
+                self._worker.requestInterruption()
             self._log_message("任务取消中…")
         elif self._preview_worker and self._preview_worker.isRunning():
             self._preview_worker.requestInterruption()

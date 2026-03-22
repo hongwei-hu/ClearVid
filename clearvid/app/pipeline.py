@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from clearvid.app.bootstrap.paths import ffmpeg_path
+from clearvid.app.bootstrap.paths import REALESRGAN_WEIGHTS_DIR, ffmpeg_path
 from clearvid.app.io.probe import collect_environment_info
 from clearvid.app.models.realesrgan_runner import resolve_upscale_model, validate_realesrgan_environment
 from clearvid.app.preprocess.filters import build_preprocess_filters
@@ -32,7 +32,7 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
             notes=notes,
         )
 
-    available, message = validate_realesrgan_environment(Path("weights") / "realesrgan")
+    available, message = validate_realesrgan_environment(REALESRGAN_WEIGHTS_DIR)
     if not available:
         raise RuntimeError(message)
 

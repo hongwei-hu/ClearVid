@@ -38,6 +38,7 @@ from clearvid.app.schemas.models import (
     UpscaleModel,
     VideoMetadata,
 )
+from clearvid.app.export_control import ExportCancelled, ExportControl
 from clearvid.app.utils.subprocess_utils import run_command
 
 DEFAULT_MODEL_SCALE = 4
@@ -188,6 +189,7 @@ def run_realesrgan_video(
     output_width: int,
     output_height: int,
     progress_callback: Callable[[int, str], None] | None = None,
+    control: ExportControl | None = None,
 ) -> None:
     config = _apply_quality_mode_overrides(config)
 
@@ -236,6 +238,7 @@ def run_realesrgan_video(
             stabilizer=stabilizer,
             temp_video_path=temp_video_path,
             progress_callback=progress_callback,
+            control=control,
         )
         _emit_progress(progress_callback, 96, "正在封装音频与元数据")
         _mux_output(config, temp_video_path)
@@ -448,6 +451,7 @@ def _stream_process_video(
     stabilizer: TemporalStabilizer | None,
     temp_video_path: Path,
     progress_callback: Callable[[int, str], None] | None,
+    control: ExportControl | None = None,
 ) -> None:
     import subprocess
 
@@ -469,6 +473,7 @@ def _stream_process_video(
             decoder=decoder,
             encoder=encoder,
             progress_callback=progress_callback,
+            control=control,
         )
         _finalize_stream_processes(decoder, encoder)
     finally:
@@ -676,19 +681,28 @@ def _resolve_tile_size(config_tile_size: int, width: int, height: int, fp16: boo
 def _start_decode_thread(
     decoder_stdout: object,
     frame_size: int,
+    abort: threading.Event | None = None,
 ) -> tuple[queue.Queue, list[BaseException], threading.Thread]:
     raw_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_FRAME_QUEUE_DEPTH)
     errors: list[BaseException] = []
 
     def _loop() -> None:
         try:
-            while True:
+            while not (abort and abort.is_set()):
                 raw = _read_exact_bytes(decoder_stdout, frame_size)
                 if raw is None:
                     break
-                raw_queue.put(raw)
+                # Use timeout to avoid blocking forever if downstream crashed
+                while not (abort and abort.is_set()):
+                    try:
+                        raw_queue.put(raw, timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
+            if abort:
+                abort.set()
         finally:
             raw_queue.put(None)
 
@@ -845,6 +859,7 @@ def _process_stream_frames(
     decoder: object,
     encoder: object,
     progress_callback: Callable[[int, str], None] | None,
+    control: ExportControl | None = None,
 ) -> None:
     frame_size = metadata.width * metadata.height * 3
     total_frames = _estimate_total_frames(metadata, config.preview_seconds)
@@ -857,13 +872,15 @@ def _process_stream_frames(
         f"{'async' if config.async_pipeline else 'sync'})",
     )
 
-    raw_queue, decode_errors, reader = _start_decode_thread(decoder.stdout, frame_size)
+    abort = threading.Event()
+    raw_queue, decode_errors, reader = _start_decode_thread(decoder.stdout, frame_size, abort)
 
     if config.async_pipeline:
         _process_frames_async(
             config, metadata, output_width, output_height, outscale,
             upsampler, codeformer_restorer, stabilizer,
             raw_queue, encoder, total_frames, progress_callback,
+            abort=abort, control=control,
         )
     else:
         _process_frames_sync(
@@ -929,21 +946,38 @@ def _process_frames_async(
     encoder: object,
     total_frames: int | None,
     progress_callback: Callable[[int, str], None] | None,
+    *,
+    abort: threading.Event | None = None,
+    control: ExportControl | None = None,
 ) -> None:
-    """Async pipeline for maximum GPU utilisation.
+    """Async pipeline with abort-safe queue operations.
 
-    When postprocessing is needed (face restore / stabilize / sharpen):
-      Stage 1 (thread):  FFmpeg decode → raw_queue
-      Stage 2 (thread):  Super-resolution (GPU) → enhanced_queue
-      Stage 3 (thread):  Face restore + stabilize + sharpen → finalized_queue
-      Stage 4 (thread):  Resize + encode ← finalized_queue
-
-    When postprocessing is completely disabled (FAST mode):
-      Stage 1 (thread):  FFmpeg decode → raw_queue
-      Stage 2 (thread):  Super-resolution (GPU) → finalized_queue  (direct)
-      Stage 4 (thread):  Resize + encode ← finalized_queue
-      (Stage 3 is skipped — no intermediate queue, no extra thread hop)
+    All queue.put() calls use a timeout loop that checks ``abort``.
+    If any stage fails it sets ``abort`` so all other stages unblock
+    and drain promptly instead of deadlocking.
     """
+    if abort is None:
+        abort = threading.Event()
+
+    def _safe_put(q: queue.Queue, item: object) -> bool:
+        """Put item into queue, respecting abort. Returns False if aborted."""
+        while not abort.is_set():
+            try:
+                q.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _safe_get(q: queue.Queue) -> tuple[bool, object]:
+        """Get item from queue, respecting abort. Returns (ok, item)."""
+        while not abort.is_set():
+            try:
+                return True, q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+        return False, None
+
     sharpen_strength = config.sharpen_strength if config.sharpen_enabled else 0.0
     postprocess_needed = (
         codeformer_restorer is not None
@@ -951,8 +985,6 @@ def _process_frames_async(
         or sharpen_strength > 0
     )
 
-    # When postprocessing is a no-op, Stage 2 writes directly to
-    # finalized_queue, eliminating one queue + one thread.
     if postprocess_needed:
         enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
             maxsize=_ENHANCED_QUEUE_DEPTH,
@@ -962,30 +994,38 @@ def _process_frames_async(
         )
     else:
         finalized_queue = queue.Queue(maxsize=_ENHANCED_QUEUE_DEPTH)
-        enhanced_queue = finalized_queue  # alias — Stage 2 writes here directly
+        enhanced_queue = finalized_queue
 
     enhance_errors: list[BaseException] = []
     write_errors: list[BaseException] = []
-    frames_written = [0]  # mutable counter shared with write thread
+    frames_written = [0]
 
     # -- Stage 2: super-resolution thread -----------------------------------
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
 
     def _enhance_loop() -> None:
-        """Pull raw frames and run super-res inference (own CUDA stream)."""
         try:
-            while True:
+            while not abort.is_set():
+                if control is not None:
+                    control.check()
                 enhanced_list = _fetch_enhanced_frames(
                     raw_queue, use_batching, config.batch_size,
                     metadata.height, metadata.width, upsampler, outscale,
                 )
                 if enhanced_list is None:
                     break
-                enhanced_queue.put(enhanced_list)
+                if not _safe_put(enhanced_queue, enhanced_list):
+                    break
+        except ExportCancelled:
+            abort.set()
         except Exception as exc:  # noqa: BLE001
             enhance_errors.append(exc)
+            abort.set()
         finally:
-            enhanced_queue.put(None)  # sentinel
+            try:
+                enhanced_queue.put(None, timeout=2.0)
+            except queue.Full:
+                pass
 
     enhance_thread = threading.Thread(
         target=_enhance_loop, daemon=True, name="sr-enhance",
@@ -993,11 +1033,10 @@ def _process_frames_async(
 
     # -- Stage 4: write thread -----------------------------------------------
     def _write_loop() -> None:
-        """Resize finalized frames and write to encoder (pure I/O)."""
         try:
-            while True:
-                item = finalized_queue.get()
-                if item is None:
+            while not abort.is_set():
+                ok, item = _safe_get(finalized_queue)
+                if not ok or item is None:
                     break
                 frames_written[0] += _write_finalized_frames(
                     item, output_width, output_height,
@@ -1005,8 +1044,12 @@ def _process_frames_async(
                 )
         except Exception as exc:  # noqa: BLE001
             write_errors.append(exc)
+            abort.set()
         finally:
-            encoder.stdin.close()
+            try:
+                encoder.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     write_thread = threading.Thread(
         target=_write_loop, daemon=True, name="frame-writer",
@@ -1018,7 +1061,6 @@ def _process_frames_async(
 
     if postprocess_needed:
         def _postprocess_loop() -> None:
-            """Face restore + temporal stabilize + sharpen."""
             _stab_pool: ThreadPoolExecutor | None = (
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="stabilizer")
                 if stabilizer is not None else None
@@ -1032,13 +1074,17 @@ def _process_frames_async(
                 return result
 
             try:
-                while True:
-                    enhanced_list = enhanced_queue.get()
-                    if enhanced_list is None:
+                while not abort.is_set():
+                    ok, enhanced_list = _safe_get(enhanced_queue)
+                    if not ok or enhanced_list is None:
                         break
 
                     finalized_list: list[np.ndarray] = []
                     for enhanced in enhanced_list:
+                        if abort.is_set():
+                            break
+                        if control is not None:
+                            control.check()
                         if codeformer_restorer is not None:
                             enhanced = codeformer_restorer.restore_faces(enhanced)
 
@@ -1055,15 +1101,21 @@ def _process_frames_async(
                                 enhanced = apply_sharpening(enhanced, sharpen_strength)
                             finalized_list.append(enhanced)
 
-                    if finalized_list:
-                        finalized_queue.put(finalized_list)
+                    if finalized_list and not abort.is_set():
+                        _safe_put(finalized_queue, finalized_list)
 
-                if _stab_future is not None:
-                    finalized_queue.put([_stab_future.result()])
+                if _stab_future is not None and not abort.is_set():
+                    _safe_put(finalized_queue, [_stab_future.result()])
+            except ExportCancelled:
+                abort.set()
             except Exception as exc:  # noqa: BLE001
                 stage3_errors.append(exc)
+                abort.set()
             finally:
-                finalized_queue.put(None)
+                try:
+                    finalized_queue.put(None, timeout=2.0)
+                except queue.Full:
+                    pass
                 if _stab_pool is not None:
                     _stab_pool.shutdown(wait=False)
 
@@ -1078,7 +1130,6 @@ def _process_frames_async(
     write_thread.start()
 
     # -- Main thread: progress reporting only --------------------------------
-    # Wait on the last producer thread (postprocess or enhance)
     monitor_thread = postprocess_thread if postprocess_thread is not None else enhance_thread
     last_reported_progress = -1
     while monitor_thread.is_alive():
@@ -1087,17 +1138,16 @@ def _process_frames_async(
             frames_written[0], total_frames, last_reported_progress,
             progress_callback,
         )
-    # Final progress update
     _report_stream_progress(
         frames_written[0], total_frames, last_reported_progress,
         progress_callback,
     )
 
-    # -- Join background threads ---------------------------------------------
-    enhance_thread.join()
-    if postprocess_thread is not None:
-        postprocess_thread.join()
-    write_thread.join()
+    # -- Join background threads (with timeout to prevent hang) ---------------
+    for t in (enhance_thread, postprocess_thread, write_thread):
+        if t is not None:
+            t.join(timeout=10.0)
+
     if enhance_errors:
         raise enhance_errors[0]
     if stage3_errors:

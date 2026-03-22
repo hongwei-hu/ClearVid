@@ -34,7 +34,9 @@ def _ensure_lib_on_path() -> None:
     if lib_str not in sys.path:
         sys.path.insert(0, lib_str)
     # Also set PYTHONPATH so child processes (pip) inherit it
-    os.environ["PYTHONPATH"] = lib_str + os.pathsep + os.environ.get("PYTHONPATH", "")
+    existing = os.environ.get("PYTHONPATH", "")
+    if lib_str not in existing.split(os.pathsep):
+        os.environ["PYTHONPATH"] = lib_str + os.pathsep + existing
 
 
 def _needs_install() -> bool:
