@@ -8,8 +8,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from clearvid.app.models.codeformer_runner import CodeFormerRestorer
 from clearvid.app.schemas.models import EnhancementConfig, TargetProfile, VideoMetadata
-from clearvid.app.utils.subprocess_utils import ProcessError, run_command
+from clearvid.app.utils.subprocess_utils import run_command
 
 DEFAULT_MODEL_FILENAME = "realesr-general-x4v3.pth"
 DEFAULT_MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
@@ -92,6 +93,7 @@ def run_realesrgan_video(
     weights_dir = Path.cwd() / "weights" / "realesrgan"
     model_path = ensure_realesrgan_weights(weights_dir)
     upsampler = _build_upsampler(config, model_path)
+    codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
 
     temp_root = Path(tempfile.mkdtemp(prefix="clearvid-realesrgan-"))
     input_frames_dir = temp_root / "input_frames"
@@ -112,6 +114,8 @@ def run_realesrgan_video(
                 raise RuntimeError(f"无法读取提取帧: {frame_path}")
 
             enhanced, _ = upsampler.enhance(image, outscale=outscale)
+            if codeformer_restorer is not None:
+                enhanced = codeformer_restorer.restore_faces(enhanced)
             finalized = _resize_for_target(enhanced, output_width, output_height, config.target_profile)
             output_frame_path = output_frames_dir / frame_path.name
             if not cv2.imwrite(str(output_frame_path), finalized):
@@ -172,6 +176,23 @@ def _build_upsampler(config: EnhancementConfig, model_path: Path) -> object:
         tile_pad=config.tile_pad,
         pre_pad=0,
         half=config.fp16_enabled,
+    )
+
+
+def _build_codeformer_restorer(
+    config: EnhancementConfig,
+    metadata: VideoMetadata,
+    output_width: int,
+    output_height: int,
+) -> CodeFormerRestorer | None:
+    if not config.face_restore_enabled:
+        return None
+
+    upscale_factor = _resolve_outscale(metadata, output_width, output_height, config.target_profile)
+    return CodeFormerRestorer(
+        fidelity_weight=config.face_restore_strength,
+        upscale_factor=upscale_factor,
+        weights_root=Path.cwd() / "weights",
     )
 
 
