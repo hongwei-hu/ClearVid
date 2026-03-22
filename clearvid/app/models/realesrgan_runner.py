@@ -5,6 +5,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
@@ -193,6 +194,7 @@ def run_realesrgan_video(
     preview_callback: Callable[[str], None] | None = None,
 ) -> None:
     config = _apply_quality_mode_overrides(config)
+    t_start = time.perf_counter()
 
     _emit_progress(progress_callback, 6, "正在准备 Real-ESRGAN 权重")
     weights_dir = REALESRGAN_WEIGHTS_DIR
@@ -205,11 +207,14 @@ def run_realesrgan_video(
     model_label = _MODEL_REGISTRY[model_key]["filename"]
     _emit_progress(progress_callback, 10, f"正在初始化 Real-ESRGAN ({model_label})")
     upsampler = _build_upsampler(config, model_path, model_key, metadata.width, metadata.height)
+    tile_size = getattr(upsampler, "tile_size", getattr(upsampler, "tile", "?"))
 
     # Apply inference accelerator
     accel = _resolve_accelerator(config.inference_accelerator)
+    accel_label = describe_accelerator(accel)
     if accel != InferenceAccelerator.NONE:
-        _emit_progress(progress_callback, 11, f"正在应用推理加速: {describe_accelerator(accel)}")
+        _emit_progress(progress_callback, 11, f"正在应用推理加速: {accel_label}")
+        t_accel = time.perf_counter()
         upsampler.model = accelerate_model(
             upsampler.model,
             accel,
@@ -217,11 +222,26 @@ def run_realesrgan_video(
             tile_size=config.tile_size or 512,
             cache_dir=TRT_CACHE_DIR,
         )
+        _emit_progress(
+            progress_callback, 11,
+            f"推理加速就绪: {accel_label} ({time.perf_counter() - t_accel:.1f}s)",
+        )
 
     _emit_progress(progress_callback, 12, "正在初始化人脸修复")
     codeformer_restorer = _build_codeformer_restorer(config, metadata, output_width, output_height)
     _emit_progress(progress_callback, 14, "正在初始化时序稳定器")
     stabilizer = _build_temporal_stabilizer(config)
+
+    # Log pipeline configuration summary
+    t_init = time.perf_counter() - t_start
+    batching = "整帧" if tile_size == 0 else f"tile={tile_size}"
+    face_label = "关闭" if codeformer_restorer is None else type(codeformer_restorer).__name__
+    _emit_progress(
+        progress_callback, 15,
+        f"初始化完成 ({t_init:.1f}s) | 模型={model_label} 加速={accel_label} "
+        f"batch={config.batch_size} {batching} fp16={'是' if config.fp16_enabled else '否'} "
+        f"人脸={face_label} {'async' if config.async_pipeline else 'sync'}",
+    )
 
     temp_root = Path(tempfile.mkdtemp(prefix="clearvid-realesrgan-"))
     temp_video_path = temp_root / "enhanced_video.mp4"
@@ -254,6 +274,7 @@ def run_realesrgan_video(
 
     try:
         outscale = _resolve_outscale(metadata, output_width, output_height, config.target_profile)
+        t_process = time.perf_counter()
         _stream_process_video(
             config=config,
             metadata=metadata,
@@ -268,13 +289,25 @@ def run_realesrgan_video(
             control=control,
             preview_mux_trigger=_on_preview_mux_needed,
         )
+        t_process_elapsed = time.perf_counter() - t_process
+        total_frames = _estimate_total_frames(metadata, config.preview_seconds) or 0
+        avg_fps = total_frames / t_process_elapsed if t_process_elapsed > 0 and total_frames else 0
+        _emit_progress(
+            progress_callback, 95,
+            f"帧处理完成: {total_frames}帧 {t_process_elapsed:.1f}s (平均 {avg_fps:.2f} fps)",
+        )
         # Wait for any in-flight preview mux before final mux
         with _preview_mux_lock:
             if _preview_mux_thread[0] is not None:
                 _preview_mux_thread[0].join(timeout=10)
+        t_mux = time.perf_counter()
         _emit_progress(progress_callback, 96, "正在封装音频与元数据")
         _mux_output(config, temp_video_path)
-        _emit_progress(progress_callback, 100, "视频导出完成")
+        _emit_progress(
+            progress_callback, 100,
+            f"导出完成 | 总耗时 {time.perf_counter() - t_start:.1f}s "
+            f"(初始化 {t_init:.1f}s + 帧处理 {t_process_elapsed:.1f}s + 封装 {time.perf_counter() - t_mux:.1f}s)",
+        )
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -991,6 +1024,7 @@ def _process_frames_sync(
     fps = metadata.fps or 30.0
     _preview_interval_frames = int(fps * 60)  # ~60 seconds of video
     _last_preview_at = 0
+    _t_sync_start = time.perf_counter()
 
     while True:
         enhanced_list = _fetch_enhanced_frames(
@@ -1004,6 +1038,7 @@ def _process_frames_sync(
         )
         last_reported_progress = _report_stream_progress(
             processed_frames, total_frames, last_reported_progress, progress_callback,
+            start_time=_t_sync_start,
         )
         if preview_mux_trigger and processed_frames - _last_preview_at >= _preview_interval_frames:
             _last_preview_at = processed_frames
@@ -1218,19 +1253,20 @@ def _process_frames_async(
     fps = metadata.fps or 30.0
     _preview_interval_frames = int(fps * 60)  # ~60 seconds of video
     _last_preview_at = 0
+    _t_async_start = time.perf_counter()
     while monitor_thread.is_alive():
         monitor_thread.join(timeout=0.5)
         current_written = frames_written[0]
         last_reported_progress = _report_stream_progress(
             current_written, total_frames, last_reported_progress,
-            progress_callback,
+            progress_callback, start_time=_t_async_start,
         )
         if preview_mux_trigger and current_written - _last_preview_at >= _preview_interval_frames:
             _last_preview_at = current_written
             preview_mux_trigger(current_written)
     _report_stream_progress(
         frames_written[0], total_frames, last_reported_progress,
-        progress_callback,
+        progress_callback, start_time=_t_async_start,
     )
 
     # -- Join background threads (with timeout to prevent hang) ---------------
@@ -1251,10 +1287,16 @@ def _report_stream_progress(
     total_frames: int | None,
     last_reported_progress: int,
     progress_callback: Callable[[int, str], None] | None,
+    start_time: float = 0.0,
 ) -> int:
     progress = _map_frame_progress(processed_frames, total_frames)
     if progress > last_reported_progress:
-        _emit_progress(progress_callback, progress, f"正在增强视频帧 {processed_frames}/{total_frames or '?'}")
+        elapsed = time.perf_counter() - start_time if start_time > 0 else 0
+        fps_str = f" ({processed_frames / elapsed:.2f} fps)" if elapsed > 1 else ""
+        _emit_progress(
+            progress_callback, progress,
+            f"正在增强视频帧 {processed_frames}/{total_frames or '?'}{fps_str}",
+        )
         return progress
     return last_reported_progress
 
