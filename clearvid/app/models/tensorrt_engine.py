@@ -98,8 +98,24 @@ def check_engine_ready(
     prev = _read_failed_marker(failed_path)
     if prev is not None:
         age_h = (_time_module.time() - prev["timestamp"]) / 3600
-        return False, f"上次部署失败 ({age_h:.1f} 小时前)"
+        reason = _summarize_failed_marker_reason(str(prev.get("reason", "")))
+        suffix = f": {reason}" if reason else ""
+        return False, f"上次部署失败 ({age_h:.1f} 小时前){suffix}"
     return False, "TensorRT 引擎尚未部署"
+
+
+def _summarize_failed_marker_reason(reason: str) -> str:
+    if not reason:
+        return ""
+    if "ENGINE_BUILD_RETURNED_NONE_ALL_MODES" in reason:
+        return "TensorRT builder 未生成 engine"
+    if "ENGINE_BUILD_RETURNED_NONE" in reason:
+        return "TensorRT builder 未生成 engine"
+    if "超时" in reason or "timed out" in reason.lower():
+        return "构建超时"
+    if "CUDA out of memory" in reason or "OutOfMemoryError" in reason:
+        return "CUDA 显存不足"
+    return reason.splitlines()[0][:80]
 
 
 def list_trt_profile_cache(

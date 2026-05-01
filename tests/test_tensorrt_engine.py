@@ -9,6 +9,7 @@ from clearvid.app.models.tensorrt_engine import (
     _read_engine_profile_shapes,
     _resolve_trt_timeout,
     _score_trt_engine_for_video,
+    _summarize_failed_marker_reason,
     _trt_build_modes,
     find_compatible_engine,
     list_trt_profile_cache,
@@ -219,6 +220,16 @@ def test_trt_timeout_user_override_still_takes_precedence() -> None:
 def test_trt_warmup_detects_recent_failed_status() -> None:
     assert TrtWarmupWorker._is_recent_failed_status("上次部署失败 (2.5 小时前)") is True
     assert TrtWarmupWorker._is_recent_failed_status("TensorRT 引擎尚未部署") is False
+
+
+def test_trt_warmup_retries_timeout_failed_status() -> None:
+    assert TrtWarmupWorker._is_retryable_failed_status("上次部署失败 (0.2 小时前): 构建超时") is True
+    assert TrtWarmupWorker._is_retryable_failed_status("上次部署失败 (0.2 小时前): TensorRT builder 未生成 engine") is False
+
+
+def test_failed_marker_reason_summary_identifies_timeout_and_builder_failures() -> None:
+    assert _summarize_failed_marker_reason("TRT 引擎构建超时 (900s)") == "构建超时"
+    assert _summarize_failed_marker_reason("ENGINE_BUILD_RETURNED_NONE_ALL_MODES") == "TensorRT builder 未生成 engine"
 
 
 def test_trt_subprocess_failure_includes_stdout_context() -> None:

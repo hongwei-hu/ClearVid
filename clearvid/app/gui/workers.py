@@ -292,6 +292,7 @@ class TrtWarmupWorker(QThread):
             self._allow_fallbacks
             and profile_index > 1
             and self._is_recent_failed_status(message)
+            and not self._is_retryable_failed_status(message)
         )
 
     def _skip_failed_fallback(
@@ -359,6 +360,10 @@ class TrtWarmupWorker(QThread):
     @staticmethod
     def _is_recent_failed_status(message: str) -> bool:
         return message.startswith("上次部署失败")
+
+    @staticmethod
+    def _is_retryable_failed_status(message: str) -> bool:
+        return "构建超时" in message or "timed out" in message.lower()
 
     @staticmethod
     def _summarize_trt_failure(exc: Exception) -> str:
