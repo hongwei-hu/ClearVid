@@ -50,7 +50,6 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
     """Generate processing recommendations based on video and hardware analysis."""
     notes: list[str] = []
     vram = environment.gpu_memory_mb or 0
-    duration = metadata.duration_seconds
     bitrate_kbps = (metadata.bit_rate or 0) // 1000
 
     target_profile = choose_target_profile(metadata, notes)
@@ -64,9 +63,10 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
     face_restore_enabled = quality_mode != "fast"
     face_restore_model = "codeformer"
 
-    # --- Temporal stabilization ---
-    # FAST mode auto-disables in pipeline; here we set the GUI default.
-    temporal_stabilize_enabled = duration > 1.0 and quality_mode != "fast"
+    # --- Temporal flicker reduction ---
+    # Optical-flow temporal blending is expensive and can soften/ghost motion.
+    # Keep it opt-in unless the user chooses a repair-oriented preset.
+    temporal_stabilize_enabled = False
 
     # --- Sharpening ---
     sharpen_enabled = True
@@ -92,6 +92,7 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
     preprocess_denoise, bpp_val = should_denoise(metadata)
     if preprocess_denoise:
         notes.append(f"低码率源 (bpp={bpp_val:.3f})，自动开启降噪预处理")
+        notes.append("如预览中出现纹理闪烁，可手动开启『减少帧间闪烁（较慢）』")
 
     add_high_bitrate_note(metadata, bitrate_kbps, notes)
 

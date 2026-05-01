@@ -165,18 +165,23 @@ def test_encoder_libx264_cpu_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Temporal stabilization
+# Temporal flicker reduction
 # ---------------------------------------------------------------------------
 
 def test_temporal_stabilize_disabled_short_video() -> None:
-    """Very short clip (≤1s) → disable temporal stabilization."""
+    """Very short clip (≤1s) → keep temporal flicker reduction disabled."""
     rec = recommend(_make_meta(duration=0.5), _make_env(vram_mb=16_000))
     assert rec.temporal_stabilize_enabled is False
 
 
-def test_temporal_stabilize_enabled_long_video() -> None:
+def test_temporal_stabilize_disabled_by_default_for_long_video() -> None:
     rec = recommend(_make_meta(duration=30.0), _make_env(vram_mb=16_000))
-    assert rec.temporal_stabilize_enabled is True
+    assert rec.temporal_stabilize_enabled is False
+
+
+def test_temporal_stabilize_note_for_low_bitrate_source() -> None:
+    rec = recommend(_make_meta(bit_rate=10_000), _make_env(vram_mb=16_000))
+    assert any("减少帧间闪烁" in note for note in rec.notes)
 
 
 # ---------------------------------------------------------------------------

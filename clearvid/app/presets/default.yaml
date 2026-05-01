@@ -6,7 +6,7 @@ face_restore_enabled: true
 face_restore_strength: 0.55
 face_restore_model: codeformer
 face_poisson_blend: false
-temporal_stabilize_enabled: true
+temporal_stabilize_enabled: false
 temporal_stabilize_strength: 0.6
 preprocess_denoise: true
 preprocess_deblock: true

@@ -125,6 +125,7 @@ def test_enhancement_config_defaults() -> None:
     assert cfg.quality_mode == QualityMode.QUALITY
     assert cfg.backend == BackendType.AUTO
     assert cfg.face_restore_enabled is False
+    assert cfg.temporal_stabilize_enabled is False
     assert cfg.preserve_audio is True
 
 

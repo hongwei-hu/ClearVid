@@ -114,7 +114,7 @@ class EnhancementConfig(BaseModel):
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
     face_restore_model: FaceRestoreModel = FaceRestoreModel.CODEFORMER
     face_poisson_blend: bool = False
-    temporal_stabilize_enabled: bool = True
+    temporal_stabilize_enabled: bool = False
     temporal_stabilize_strength: float = Field(default=0.6, ge=0.0, le=1.0)
     preprocess_denoise: bool = False
     preprocess_deblock: bool = True

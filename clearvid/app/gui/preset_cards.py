@@ -45,7 +45,7 @@ BUILTIN_PRESETS: list[Preset] = [
             "face_poisson_blend": True,
             "sharpen_enabled": True,
             "sharpen_strength": 0.12,
-            "temporal_stabilize_enabled": True,
+            "temporal_stabilize_enabled": False,
         },
     ),
     Preset(
@@ -59,7 +59,7 @@ BUILTIN_PRESETS: list[Preset] = [
             "face_restore_enabled": False,
             "sharpen_enabled": True,
             "sharpen_strength": 0.20,
-            "temporal_stabilize_enabled": True,
+            "temporal_stabilize_enabled": False,
         },
     ),
     Preset(

@@ -416,7 +416,7 @@ def run_realesrgan_video(
     dur_s = metadata.duration_seconds or 0.0
     total_frames_est = int(dur_s * fps_src) if dur_s > 0 and fps_src > 0 else 0
     dur_str = f"{int(dur_s // 60)}m{int(dur_s % 60)}s" if dur_s > 0 else "未知"
-    stabilizer_label = "关闭" if not (getattr(config, 'temporal_stabilization', False)) else "开启"
+    stabilizer_label = "开启" if config.temporal_stabilize_enabled else "关闭"
     sharpen_label = f"{config.sharpen_strength:.1f}" if config.sharpen_enabled else "关闭"
     try:
         import torch as _torch

@@ -75,7 +75,7 @@ def estimate_export(
     upscale_model: str = "general_v3",
     accelerator: str = "pytorch",
     face_restore: bool = True,
-    temporal_stabilize: bool = True,
+    temporal_stabilize: bool = False,
     sharpen: bool = True,
 ) -> ExportEstimate:
     """Produce a rough export estimate.
@@ -101,7 +101,7 @@ def estimate_export(
     face_restore:
         Whether face restoration is enabled.
     temporal_stabilize:
-        Whether temporal stabilization is enabled.
+        Whether optical-flow temporal flicker reduction is enabled.
     sharpen:
         Whether sharpening is enabled.
     """

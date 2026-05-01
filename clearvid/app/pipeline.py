@@ -40,7 +40,7 @@ def build_execution_plan(config: EnhancementConfig, metadata: VideoMetadata) -> 
     resolved_model = resolve_upscale_model(config.upscale_model, config.quality_mode)
     notes.append(f"Upscale model: {resolved_model}")
     if config.temporal_stabilize_enabled:
-        notes.append(f"Temporal stabilization: ON (strength={config.temporal_stabilize_strength:.2f})")
+        notes.append(f"Temporal flicker reduction: ON (strength={config.temporal_stabilize_strength:.2f}, slow)")
     preprocess_filters = build_preprocess_filters(config, metadata)
     if preprocess_filters:
         notes.append(f"Preprocess filters: {', '.join(preprocess_filters)}")

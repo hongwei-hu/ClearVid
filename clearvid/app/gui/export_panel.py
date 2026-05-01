@@ -91,9 +91,9 @@ TOOLTIPS: dict[str, str] = {
     ),
     "quality_mode": (
         "控制 AI 超分精度和后处理流程。\n"
-        "快速: 轻量模型 + 跳过人脸修复和时序稳定，速度最快\n"
-        "平衡: 轻量模型 + 完整后处理\n"
-        "高质量: 重型模型 + 完整后处理，效果最好但约慢 6 倍"
+        "快速: 轻量模型 + 跳过重型修复，速度最快\n"
+        "平衡: 轻量模型 + 常规后处理\n"
+        "高质量: 重型模型 + 高质量后处理，耗时更长"
     ),
     "backend": (
         "Real-ESRGAN 是核心 AI 超分引擎，需要 NVIDIA 独显。\n"
@@ -122,8 +122,8 @@ TOOLTIPS: dict[str, str] = {
     ),
     "face_model": "CodeFormer 更自然保真；GFPGAN 偏向美化肤质",
     "poisson_blend": "让修复后的人脸与周围皮肤过渡更自然，减少色差和接缝感",
-    "temporal": "AI 超分逐帧独立处理可能导致纹理闪烁，开启后利用相邻帧信息抑制闪烁",
-    "temporal_strength": "越高越稳定但可能损失运动细节。快速运动视频建议调低",
+    "temporal": "利用光流混合相邻帧来减少 AI 超分后的纹理闪烁；速度较慢，普通视频建议关闭",
+    "temporal_strength": "越高越能抑制静态纹理闪烁，但更可能产生拖影或损失运动细节",
     "sharpen": "增强画面边缘清晰度。过高可能产生不自然的白边，建议 0.05-0.20",
     "denoise": "自动根据视频码率调整降噪力度。低码率视频强降噪，高码率轻降噪以保留细节",
     "deblock": "低码率 H.264 视频常见方块状伪影，此选项专门修复。高码率视频会自动跳过",
@@ -412,14 +412,14 @@ class ExportPanel(QWidget):
         self._sections["preprocess"] = sec
 
     def _build_temporal_section(self) -> None:
-        sec = CollapsibleSection("时序与稳定", name="temporal", expanded=False)
+        sec = CollapsibleSection("帧间闪烁", name="temporal", expanded=False)
         lay = sec.content_layout
 
-        self.temporal_enabled = QCheckBox("启用时序稳定")
-        self.temporal_enabled.setChecked(True)
+        self.temporal_enabled = QCheckBox("减少帧间闪烁（较慢）")
+        self.temporal_enabled.setChecked(False)
         self.temporal_enabled.setToolTip(TOOLTIPS["temporal"])
         lay.addWidget(self.temporal_enabled)
-        lay.addWidget(_hint("减少 AI 超分后相邻帧的闪烁"))
+        lay.addWidget(_hint("用于修复 AI 超分后的纹理跳动；普通视频建议关闭以保持高速"))
 
         self.temporal_strength = QDoubleSpinBox()
         self.temporal_strength.setDecimals(2)
@@ -427,9 +427,9 @@ class ExportPanel(QWidget):
         self.temporal_strength.setSingleStep(0.05)
         self.temporal_strength.setValue(0.6)
         lay.addLayout(
-            _labeled_row("稳定强度", self.temporal_strength, TOOLTIPS["temporal_strength"])
+            _labeled_row("闪烁抑制强度", self.temporal_strength, TOOLTIPS["temporal_strength"])
         )
-        lay.addWidget(_hint("快速运动视频建议调低"))
+        lay.addWidget(_hint("快速运动或拖影明显时建议调低"))
 
         self._layout.addWidget(sec)
         self._sections["temporal"] = sec
