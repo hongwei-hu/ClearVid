@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 import cv2
 import numpy as np
 
+from clearvid.app.models import stream_codec
 from clearvid.app.models.codeformer_runner import CodeFormerRestorer
 from clearvid.app.models.gfpgan_runner import GFPGANRestorer
 from clearvid.app.models.perf_diagnostics import (
@@ -38,11 +39,9 @@ from clearvid.app.bootstrap.paths import (
     REALESRGAN_WEIGHTS_DIR,
     TRT_CACHE_DIR,
     WEIGHTS_DIR,
-    ffmpeg_path,
 )
 from clearvid.app.postprocess.enhance import apply_sharpening
 from clearvid.app.postprocess.temporal_stabilizer import TemporalStabilizer
-from clearvid.app.preprocess.filters import build_preprocess_filters
 from clearvid.app.schemas.models import (
     EnhancementConfig,
     FaceRestoreModel,
@@ -541,35 +540,13 @@ def enhance_single_frame(
 
 
 def extract_frame(video_path: Path, timestamp_sec: float = 0.0, width: int = 0, height: int = 0) -> np.ndarray:
-    """Extract a single frame from a video at the given timestamp using FFmpeg.
-
-    If *width*/*height* are provided they are used directly; otherwise
-    the video is probed to determine the dimensions.
-
-    Returns a BGR numpy array.
-    """
-    import subprocess
-
-    if width <= 0 or height <= 0:
-        from clearvid.app.io.probe import probe_video
-        meta = probe_video(video_path)
-        width, height = meta.width, meta.height
-
-    command = [
-        ffmpeg_path() or "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-hwaccel", "auto",
-        "-ss", f"{timestamp_sec:.3f}",
-        "-i", str(video_path),
-        "-frames:v", "1",
-        "-f", "image2pipe",
-        "-pix_fmt", "bgr24",
-        "-vcodec", "rawvideo",
-        "pipe:1",
-    ]
-    result = subprocess.run(command, capture_output=True, check=True, timeout=30)  # noqa: S603
-    return np.frombuffer(result.stdout, dtype=np.uint8).reshape((height, width, 3))
+    return stream_codec.extract_frame(
+        video_path,
+        timestamp_sec=timestamp_sec,
+        width=width,
+        height=height,
+        run_factory=subprocess.run,
+    )
 
 
 def ensure_realesrgan_weights(weights_path: Path, model_key: str = "general_v3") -> Path:
@@ -758,21 +735,11 @@ def _start_stream_processes(
     decode_command: list[str],
     encode_command: list[str],
 ) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
-    decoder: subprocess.Popen[bytes] | None = None
-    try:
-        decoder = subprocess.Popen(decode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        encoder = subprocess.Popen(encode_command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as exc:
-        if decoder is not None and decoder.poll() is None:
-            decoder.kill()
-            decoder.wait()
-        executable = decode_command[0] if isinstance(exc, FileNotFoundError) else "FFmpeg"
-        raise RuntimeError(f"无法启动 {executable}: {exc}") from exc
-
-    if decoder.stdout is None or decoder.stderr is None or encoder.stdin is None or encoder.stderr is None:
-        _cleanup_stream_processes(decoder, encoder)
-        raise RuntimeError("FFmpeg 管道初始化失败")
-    return decoder, encoder
+    return stream_codec.start_stream_processes(
+        decode_command,
+        encode_command,
+        popen_factory=subprocess.Popen,
+    )
 
 
 def _mux_preview(
@@ -781,67 +748,17 @@ def _mux_preview(
     preview_path: Path,
     duration_sec: float,
 ) -> bool:
-    """Create a quick mux of the temp video + original audio for mid-export preview.
-
-    Uses ``-t`` to limit the audio to the already-encoded video duration.
-    Returns True on success, False on any error (non-fatal).
-    """
-    command = [
-        ffmpeg_path() or "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", str(temp_video_path),
-        "-i", str(config.input_path),
-        "-t", f"{duration_sec:.3f}",
-        "-map", "0:v:0",
-        "-c:v", "copy",
-    ]
-    if config.preserve_audio:
-        command.extend(["-map", "1:a?", "-c:a", "copy"])
-    else:
-        command.append("-an")
-    command.extend(["-sn", "-map_metadata", "-1", "-shortest", str(preview_path)])
-    try:
-        import subprocess as _sp
-        _sp.run(command, capture_output=True, check=True, timeout=30)  # noqa: S603
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return stream_codec.mux_preview(
+        config,
+        temp_video_path,
+        preview_path,
+        duration_sec,
+        run_factory=subprocess.run,
+    )
 
 
 def _mux_output(config: EnhancementConfig, temp_video_path: Path) -> None:
-    command = [
-        ffmpeg_path() or "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
-        str(temp_video_path),
-        "-i",
-        str(config.input_path),
-        "-map",
-        "0:v:0",
-        "-c:v",
-        "copy",
-    ]
-
-    if config.preserve_audio:
-        command.extend(["-map", "1:a?", "-c:a", "copy"])
-    else:
-        command.append("-an")
-
-    if config.preserve_subtitles:
-        command.extend(["-map", "1:s?", "-c:s", "copy"])
-    else:
-        command.append("-sn")
-
-    if config.preserve_metadata:
-        command.extend(["-map_metadata", "1", "-map_chapters", "1"])
-    else:
-        command.extend(["-map_metadata", "-1", "-map_chapters", "-1"])
-
-    command.extend(["-shortest", str(config.output_path)])
-    run_command(command)
+    stream_codec.mux_output(config, temp_video_path, command_runner=run_command)
 
 
 def _resolve_outscale(
@@ -919,28 +836,7 @@ def _map_frame_progress(processed_frames: int, total_frames: int | None) -> int:
 
 
 def _build_decode_command(config: EnhancementConfig, metadata: VideoMetadata) -> list[str]:
-    command = [
-        ffmpeg_path() or "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-hwaccel",
-        "auto",
-        "-threads",
-        "0",
-        "-i",
-        str(config.input_path),
-    ]
-    if config.preview_seconds:
-        command.extend(["-t", str(config.preview_seconds)])
-
-    # Build preprocessing filter chain
-    vf_filters = build_preprocess_filters(config, metadata)
-    if vf_filters:
-        command.extend(["-vf", ",".join(vf_filters)])
-
-    command.extend(["-vsync", "0", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"])
-    return command
+    return stream_codec.build_decode_command(config, metadata)
 
 
 def _build_encode_command(
@@ -950,45 +846,7 @@ def _build_encode_command(
     output_height: int,
     temp_video_path: Path,
 ) -> list[str]:
-    command = [
-        ffmpeg_path() or "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgr24",
-        "-s",
-        f"{output_width}x{output_height}",
-        "-r",
-        f"{metadata.fps:.6f}",
-        "-i",
-        "pipe:0",
-        "-c:v",
-        config.encoder,
-    ]
-    # AV1 NVENC uses different preset naming
-    if config.encoder == "av1_nvenc":
-        command.extend(["-preset", config.encoder_preset])
-        command.extend(["-tier", "1"])
-    else:
-        command.extend(["-preset", config.encoder_preset])
-
-    # Quality control: explicit CRF > explicit bitrate > default CQ
-    if config.encoder_crf is not None:
-        command.extend(["-cq", str(config.encoder_crf)])
-    elif config.video_bitrate:
-        command.extend(["-b:v", config.video_bitrate])
-    else:
-        command.extend(["-cq", "18"])
-
-    command.extend(["-pix_fmt", config.output_pixel_format])
-    # Fragmented MP4: makes the temp file playable before encoding finishes
-    command.extend(["-movflags", "frag_keyframe+empty_moov"])
-    command.extend(["-an", str(temp_video_path)])
-    return command
+    return stream_codec.build_encode_command(config, metadata, output_width, output_height, temp_video_path)
 
 
 _FRAME_QUEUE_DEPTH = 64
@@ -1966,29 +1824,11 @@ def _report_stream_progress(
 
 
 def _finalize_stream_processes(decoder: object, encoder: object) -> None:
-    decoder_stderr = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
-    encoder_stderr = encoder.stderr.read().decode("utf-8", errors="replace") if encoder.stderr else ""
-    decoder_return_code = decoder.wait()
-    encoder_return_code = encoder.wait()
-    if decoder_return_code != 0:
-        raise RuntimeError(decoder_stderr.strip() or "FFmpeg 解码失败")
-    if encoder_return_code != 0:
-        raise RuntimeError(encoder_stderr.strip() or "FFmpeg 编码失败")
+    stream_codec.finalize_stream_processes(decoder, encoder)
 
 
 def _cleanup_stream_processes(decoder: object, encoder: object) -> None:
-    if decoder.stdout:
-        decoder.stdout.close()
-    if decoder.stderr:
-        decoder.stderr.close()
-    if encoder.stdin and not encoder.stdin.closed:
-        encoder.stdin.close()
-    if encoder.stderr:
-        encoder.stderr.close()
-    if decoder.poll() is None:
-        decoder.kill()
-    if encoder.poll() is None:
-        encoder.kill()
+    stream_codec.cleanup_stream_processes(decoder, encoder)
 
 
 def _emit_progress(
