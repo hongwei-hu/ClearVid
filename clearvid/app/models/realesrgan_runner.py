@@ -1272,6 +1272,16 @@ _TrtTileInfo = tuple[int, int, int, int, int, int, int, int]
 _TrtPendingTile = tuple[object, _TrtTileInfo]
 
 
+def _pad_trt_tile_to_shape(tile: object, target_h: int, target_w: int) -> object:
+    tile_h = int(tile.shape[2])
+    tile_w = int(tile.shape[3])
+    if tile_h == target_h and tile_w == target_w:
+        return tile
+    padded = tile.new_zeros((tile.shape[0], tile.shape[1], target_h, target_w))
+    padded[:, :, :tile_h, :tile_w] = tile
+    return padded
+
+
 def _flush_trt_tile_batch(
     pending: list[_TrtPendingTile],
     upsampler: object,
@@ -1328,6 +1338,8 @@ def _enhance_frame_trt_tiled(
     max_batch = max(1, int(getattr(upsampler.model, "max_batch", 1)))
     tiles_x = math.ceil(width / tile_size)
     tiles_y = math.ceil(height / tile_size)
+    target_tile_h = min(height, tile_size + tile_pad * 2)
+    target_tile_w = min(width, tile_size + tile_pad * 2)
 
     pending: list[_TrtPendingTile] = []
     pending_hw: tuple[int, int] | None = None
@@ -1349,6 +1361,7 @@ def _enhance_frame_trt_tiled(
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
             input_tile = upsampler.img[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
+            input_tile = _pad_trt_tile_to_shape(input_tile, target_tile_h, target_tile_w)
             tile_hw = (int(input_tile.shape[2]), int(input_tile.shape[3]))
             if pending_hw is not None and (tile_hw != pending_hw or len(pending) >= max_batch):
                 _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
