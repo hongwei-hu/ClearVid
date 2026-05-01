@@ -19,6 +19,7 @@ from clearvid.app.models.tensorrt_engine import (
     InferenceAccelerator,
     accelerate_model,
     check_engine_ready,
+    trt_profile_fallbacks,
 )
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.schemas.models import EnhancementConfig, QualityMode, UpscaleModel
@@ -122,59 +123,97 @@ class TrtWarmupWorker(QThread):
             # Ensure weights exist
             model_path = ensure_realesrgan_weights(weights_dir, model_key)
 
-            # Build a minimal upsampler to get the model object
-            dummy_config = EnhancementConfig(
-                input_path=Path("warmup"),
-                output_path=Path("warmup"),
-                tile_size=self._tile_size,
-                batch_size=self._batch_size,
-                fp16_enabled=self._fp16,
-            )
-            self.progress.emit(10, f"加载模型架构: {entry['arch']}")
-            upsampler = _build_upsampler(
-                dummy_config, model_path, model_key,
-                self._tile_size, self._tile_size,
-            )
+            errors: list[str] = []
+            profiles = trt_profile_fallbacks(self._tile_size, self._batch_size)
+            for profile_index, (tile_size, batch_size) in enumerate(profiles, start=1):
+                try:
+                    self.progress.emit(
+                        10,
+                        f"加载模型架构: {entry['arch']} (tile={tile_size}, batch={batch_size})",
+                    )
+                    dummy_config = EnhancementConfig(
+                        input_path=Path("warmup"),
+                        output_path=Path("warmup"),
+                        tile_size=tile_size,
+                        batch_size=batch_size,
+                        fp16_enabled=self._fp16,
+                    )
+                    upsampler = _build_upsampler(
+                        dummy_config, model_path, model_key,
+                        tile_size, tile_size,
+                    )
 
-            # Check if already deployed
-            ready, msg = check_engine_ready(
-                upsampler.model,
-                fp16=self._fp16,
-                tile_size=self._tile_size,
-                batch_size=self._batch_size,
-                cache_dir=TRT_CACHE_DIR,
-                weight_path=model_path,
-            )
-            if ready:
-                self.progress.emit(100, "TensorRT 引擎已就绪")
-                return  # done emitted by finally
+                    ready, msg = check_engine_ready(
+                        upsampler.model,
+                        fp16=self._fp16,
+                        tile_size=tile_size,
+                        batch_size=batch_size,
+                        cache_dir=TRT_CACHE_DIR,
+                        weight_path=model_path,
+                    )
+                    if ready:
+                        self.progress.emit(100, f"TensorRT 引擎已就绪 (tile={tile_size}, batch={batch_size})")
+                        return
 
-            self.progress.emit(15, msg)
+                    self.progress.emit(15, msg)
 
-            # Build TRT engine
-            def _cb(pct: int, msg: str) -> None:
-                # Map 0-100 from builder to our progress range (15-95)
-                mapped = 15 + int(pct * 0.8)
-                self.progress.emit(mapped, msg)
+                    def _cb(pct: int, msg: str) -> None:
+                        mapped = 15 + int(pct * 0.8)
+                        self.progress.emit(mapped, msg)
 
-            try:
-                accelerate_model(
-                    upsampler.model,
-                    InferenceAccelerator.TENSORRT,
-                    fp16=self._fp16,
-                    tile_size=self._tile_size,
-                    batch_size=self._batch_size,
-                    cache_dir=TRT_CACHE_DIR,
-                    progress_callback=_cb,
-                    weight_path=model_path,
-                    trt_build_timeout=self._timeout,
-                    build_if_missing=True,
-                    low_load=self._low_load,
-                )
-                self.progress.emit(100, "TensorRT 引擎部署完成")
-            except Exception as exc:
-                self.failed.emit(f"{exc}\n\n--- 完整异常信息 ---\n{traceback.format_exc()}")  # noqa: BLE001
+                    accelerate_model(
+                        upsampler.model,
+                        InferenceAccelerator.TENSORRT,
+                        fp16=self._fp16,
+                        tile_size=tile_size,
+                        batch_size=batch_size,
+                        cache_dir=TRT_CACHE_DIR,
+                        progress_callback=_cb,
+                        weight_path=model_path,
+                        trt_build_timeout=self._timeout,
+                        build_if_missing=True,
+                        low_load=self._low_load,
+                    )
+                    self.progress.emit(100, f"TensorRT 引擎部署完成 (tile={tile_size}, batch={batch_size})")
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    reason = self._summarize_trt_failure(exc)
+                    errors.append(f"tile={tile_size}, batch={batch_size}: {reason}")
+                    if "upsampler" in locals():
+                        del upsampler
+                    if profile_index < len(profiles):
+                        self.progress.emit(
+                            15,
+                            f"当前配置失败 ({reason})，自动降档重试: {profiles[profile_index]}",
+                        )
+                        self._clear_cuda_cache()
+                        continue
+                    self.failed.emit(
+                        "TensorRT 引擎部署失败，已尝试以下配置:\n"
+                        + "\n".join(errors)
+                        + f"\n\n--- 完整异常信息 ---\n{traceback.format_exc()}"
+                    )
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{exc}\n\n--- 完整异常信息 ---\n{traceback.format_exc()}")
         finally:
             self.done.emit()
+
+    @staticmethod
+    def _clear_cuda_cache() -> None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _summarize_trt_failure(exc: Exception) -> str:
+        text = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if "ENGINE_BUILD_RETURNED_NONE" in str(exc):
+            return "TensorRT builder 未能为该 profile 生成 engine"
+        if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in str(exc):
+            return "CUDA 显存不足"
+        if "timed out" in str(exc).lower() or "超时" in str(exc):
+            return "构建超时"
+        return text[:160]

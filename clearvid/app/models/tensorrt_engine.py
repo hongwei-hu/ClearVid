@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 TRT_MAX_BATCH = 16
 TRT_PREFERRED_BATCHES = (16, 8, 4, 2, 1)
 TRT_PREFERRED_TILE_SIZES = (1024, 768, 512, 256, 128)
+TRT_ONNX_EXPORT_MAX_BATCH = 1
+TRT_ONNX_EXPORT_MAX_TILE = 512
 
 
 class InferenceAccelerator(str, Enum):
@@ -449,31 +451,7 @@ def _get_or_build_engine(
 
     # --- Step 1: export ONNX (in-process) ------------------------------------
     onnx_path = cache_dir / f"realesrgan_{digest}.onnx"
-    if not onnx_path.exists():
-        logger.info("正在导出 ONNX 模型 (tile=%d, batch=%d) ...", tile_size, batch_size)
-        export_model = copy.deepcopy(model)
-        dummy = torch.randn(batch_size, 3, tile_size, tile_size).to(
-            next(model.parameters()).device,
-        )
-        if fp16:
-            dummy = dummy.half()
-            export_model = export_model.half()
-        torch.onnx.export(
-            export_model,
-            dummy,
-            str(onnx_path),
-            opset_version=17,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch", 2: "h", 3: "w"},
-                "output": {0: "batch", 2: "h4", 3: "w4"},
-            },
-        )
-        logger.info("ONNX 导出完成: %s", onnx_path.name)
-        # Free GPU memory before the heavy build
-        del export_model, dummy
-        torch.cuda.empty_cache()
+    _export_onnx_model(model, onnx_path, fp16=fp16, tile_size=tile_size, batch_size=batch_size)
 
     # --- Step 2: resolve build timeout ---------------------------------------
     param_count = sum(p.numel() for p in model.parameters())
@@ -514,6 +492,85 @@ def _get_or_build_engine(
     _clear_failed_marker(failed_path)
     logger.info("TensorRT 引擎构建完成: %s", engine_path.name)
     return engine_path
+
+
+def _export_onnx_model(
+    model: object,
+    onnx_path: Path,
+    *,
+    fp16: bool,
+    tile_size: int,
+    batch_size: int,
+) -> None:
+    import torch
+
+    export_batch, export_tile = _onnx_export_shape(tile_size, batch_size)
+    logger.info(
+        "正在导出 ONNX 模型 (profile tile=%d batch=%d, export tile=%d batch=%d) ...",
+        tile_size, batch_size, export_tile, export_batch,
+    )
+    export_model = copy.deepcopy(model)
+    dummy = torch.randn(export_batch, 3, export_tile, export_tile).to(
+        next(model.parameters()).device,
+    )
+    if fp16:
+        dummy = dummy.half()
+        export_model = export_model.half()
+    try:
+        torch.onnx.export(
+            export_model,
+            dummy,
+            str(onnx_path),
+            opset_version=17,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={
+                "input": {0: "batch", 2: "h", 3: "w"},
+                "output": {0: "batch", 2: "h4", 3: "w4"},
+            },
+        )
+        logger.info("ONNX 导出完成: %s", onnx_path.name)
+    except Exception:
+        onnx_path.unlink(missing_ok=True)
+        raise
+    finally:
+        del export_model, dummy
+        torch.cuda.empty_cache()
+
+
+def _onnx_export_shape(tile_size: int, batch_size: int) -> tuple[int, int]:
+    """Return a conservative dynamic-ONNX tracing shape.
+
+    The TensorRT optimization profile still uses the requested tile/batch.  The
+    ONNX graph itself has dynamic axes, so tracing with a smaller input avoids
+    huge temporary PyTorch activations during deployment without changing the
+    inference profile or output quality.
+    """
+    export_batch = max(1, min(int(batch_size), TRT_ONNX_EXPORT_MAX_BATCH))
+    export_tile = max(32, min(int(tile_size), TRT_ONNX_EXPORT_MAX_TILE))
+    return export_batch, export_tile
+
+
+def trt_profile_fallbacks(tile_size: int, batch_size: int) -> list[tuple[int, int]]:
+    """Return deployment profiles from aggressive to conservative, no duplicates."""
+    requested_tile = int(tile_size)
+    requested_batch = _normalize_trt_batch(batch_size)
+    candidates = [
+        (requested_tile, requested_batch),
+        (requested_tile, min(requested_batch, 8)),
+        (min(requested_tile, 768), min(requested_batch, 8)),
+        (min(requested_tile, 512), min(requested_batch, 8)),
+        (min(requested_tile, 512), min(requested_batch, 4)),
+        (512, 4),
+    ]
+    seen: set[tuple[int, int]] = set()
+    unique: list[tuple[int, int]] = []
+    for tile, batch in candidates:
+        profile = (max(128, tile), max(1, batch))
+        if profile not in seen:
+            seen.add(profile)
+            unique.append(profile)
+    return unique
 
 
 # -- Self-contained build script executed in subprocess ---------------------

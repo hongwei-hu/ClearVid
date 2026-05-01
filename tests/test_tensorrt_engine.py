@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from clearvid.app.models.tensorrt_engine import (
     _engine_cache_key,
+    _onnx_export_shape,
     _read_engine_profile_shapes,
     find_compatible_engine,
+    trt_profile_fallbacks,
 )
+from clearvid.app.gui.workers import TrtWarmupWorker
 
 
 class _TensorProfileEngine:
@@ -56,3 +59,29 @@ def test_find_compatible_engine_prefers_larger_batch_and_tile(tmp_path) -> None:
         cache_dir=tmp_path,
         weight_path=weight_path,
     ) == (1024, 16, str(faster))
+
+
+def test_onnx_export_shape_caps_aggressive_profile() -> None:
+    assert _onnx_export_shape(tile_size=1024, batch_size=16) == (1, 512)
+
+
+def test_trt_profile_fallbacks_move_from_aggressive_to_safe_profiles() -> None:
+    assert trt_profile_fallbacks(1024, 16) == [
+        (1024, 16),
+        (1024, 8),
+        (768, 8),
+        (512, 8),
+        (512, 4),
+    ]
+
+
+def test_trt_failure_summary_identifies_builder_profile_failure() -> None:
+    assert TrtWarmupWorker._summarize_trt_failure(
+        RuntimeError("TRT 引擎构建失败 (exit=1): ENGINE_BUILD_RETURNED_NONE")
+    ) == "TensorRT builder 未能为该 profile 生成 engine"
+
+
+def test_trt_failure_summary_identifies_cuda_oom() -> None:
+    assert TrtWarmupWorker._summarize_trt_failure(
+        RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    ) == "CUDA 显存不足"
