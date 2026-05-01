@@ -68,6 +68,12 @@ class MainWindow(QMainWindow):
         self._video_frames: int = 0
         self._video_size_bytes: int = 0
         self._export_start_time: float = 0.0
+        self._eta_last_time: float = 0.0
+        self._eta_last_percent: int = 0
+        self._eta_ema_speed: float = 0.0  # percent per second
+        self._eta_samples: int = 0
+        self._eta_pause_started: float = 0.0
+        self._eta_paused_total: float = 0.0
 
         # Debounce timer for auto-preview refresh (#19)
         self._preview_debounce = QTimer(self)
@@ -418,8 +424,7 @@ class MainWindow(QMainWindow):
         # Safety checks
         if not check_overwrite(output_path, self):
             return
-        est = getattr(self._export_panel, "_last_estimate", None)
-        required_mb = est.estimated_size_mb * 1.2 if est else 500
+        required_mb = max(500.0, (self._video_size_bytes / (1024 * 1024)) * 1.5) if self._video_size_bytes > 0 else 500
         if not check_disk_space(output_path, required_mb, self):
             return
 
@@ -437,6 +442,9 @@ class MainWindow(QMainWindow):
         self._export_panel.set_export_enabled(False)
         self._export_panel.set_progress(0, "正在准备任务...")
         self._export_start_time = time.monotonic()
+        self._reset_eta_tracker()
+        self._export_panel.set_runtime_eta(None)
+        self._export_panel.set_pause_state(False)
 
         self._export_control = ExportControl()
         self._worker = Worker(config, control=self._export_control)
@@ -450,6 +458,7 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, percent: int, message: str) -> None:
         self._export_panel.set_progress(percent, message)
+        self._update_runtime_eta(percent)
         if message != self._last_progress_message:
             self._log_message(message)
             self._last_progress_message = message
@@ -458,6 +467,8 @@ class MainWindow(QMainWindow):
         elapsed = time.monotonic() - self._export_start_time
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_exporting_state(False)
+        self._export_panel.set_runtime_eta(None)
+        self._export_panel.set_pause_state(False)
         self._export_panel.set_progress(100, "\u2705 处理完成")
         self._export_panel.show_post_export(self._export_panel.output_edit.text())
         self._log_message("处理完成:\n" + payload)
@@ -475,6 +486,8 @@ class MainWindow(QMainWindow):
         elapsed = time.monotonic() - self._export_start_time
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_exporting_state(False)
+        self._export_panel.set_runtime_eta(None)
+        self._export_panel.set_pause_state(False)
         self._export_panel.set_progress(0, "\u274c 处理失败")
         self._log_message(f"处理失败: {message}")
         append_history(HistoryRecord.now(
@@ -488,6 +501,8 @@ class MainWindow(QMainWindow):
     def _on_cancelled(self) -> None:
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_exporting_state(False)
+        self._export_panel.set_runtime_eta(None)
+        self._export_panel.set_pause_state(False)
         self._export_panel.set_progress(0, "导出已取消")
         self._log_message("导出已被用户取消")
 
@@ -833,10 +848,58 @@ class MainWindow(QMainWindow):
             return
         if self._export_control.is_paused:
             self._export_control.resume()
+            if self._eta_pause_started > 0:
+                self._eta_paused_total += max(0.0, time.monotonic() - self._eta_pause_started)
+                self._eta_pause_started = 0.0
+            self._export_panel.set_pause_state(False)
             self._log_message("导出已继续")
         else:
             self._export_control.pause()
+            self._eta_pause_started = time.monotonic()
+            self._export_panel.set_pause_state(True)
             self._log_message("导出已暂停")
+
+    def _reset_eta_tracker(self) -> None:
+        self._eta_last_time = time.monotonic()
+        self._eta_last_percent = 0
+        self._eta_ema_speed = 0.0
+        self._eta_samples = 0
+        self._eta_pause_started = 0.0
+        self._eta_paused_total = 0.0
+
+    def _update_runtime_eta(self, percent: int) -> None:
+        """Update remaining-time estimate using EWMA of progress speed.
+
+        This is a broadly used approach in long-running jobs: estimate speed
+        from recent progress deltas and smooth it with an exponential moving
+        average to reduce jitter.
+        """
+        if percent <= 0 or percent >= 100:
+            return
+        now = time.monotonic()
+        if self._eta_pause_started > 0:
+            return
+        delta_percent = percent - self._eta_last_percent
+        delta_time = max(1e-6, now - self._eta_last_time)
+        if delta_percent <= 0:
+            return
+
+        instant_speed = delta_percent / delta_time
+        alpha = 0.2
+        if self._eta_ema_speed <= 0:
+            self._eta_ema_speed = instant_speed
+        else:
+            self._eta_ema_speed = alpha * instant_speed + (1.0 - alpha) * self._eta_ema_speed
+        self._eta_samples += 1
+        self._eta_last_percent = percent
+        self._eta_last_time = now
+
+        if self._eta_samples < 3 or percent < 5 or self._eta_ema_speed <= 1e-6:
+            return
+
+        remaining_percent = max(0.0, 100.0 - percent)
+        eta_seconds = remaining_percent / self._eta_ema_speed
+        self._export_panel.set_runtime_eta(eta_seconds)
 
     # ==================================================================
     # Onboarding (#20)

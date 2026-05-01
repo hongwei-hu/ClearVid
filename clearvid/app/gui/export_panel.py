@@ -22,12 +22,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from clearvid.app.gui._helpers import coerce_enum, populate_combo, set_combo_by_value
-from clearvid.app.gui.estimation import estimate_export, format_duration
 from clearvid.app.gui.naming import DEFAULT_TEMPLATE, render_output_name
 from clearvid.app.gui.preset_cards import BUILTIN_PRESETS, Preset, PresetCardsWidget
 from clearvid.app.gui.widgets.collapsible import CollapsibleSection
@@ -178,7 +178,6 @@ class ExportPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._sections: dict[str, CollapsibleSection] = {}
-        self._last_estimate: object | None = None
 
         # Outer layout: scrollable body + fixed bottom
         outer = QVBoxLayout(self)
@@ -541,11 +540,11 @@ class ExportPanel(QWidget):
         bottom.setContentsMargins(8, 8, 8, 8)
         bottom.setSpacing(6)
 
-        # Estimation label
+        # Runtime ETA label (updated during export)
         self.estimation_label = QLabel("")
         self.estimation_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.estimation_label.setStyleSheet(
-            "color: #81c784; font-size: 11px; padding: 2px;"
+            "color: #90caf9; font-size: 11px; padding: 2px;"
         )
         self.estimation_label.setVisible(False)
         bottom.addWidget(self.estimation_label)
@@ -560,36 +559,46 @@ class ExportPanel(QWidget):
         self.progress_label.setStyleSheet("color: #9e9e9e; font-size: 12px;")
         bottom.addWidget(self.progress_label)
 
+        # Unified action area with idle/running states
+        self._action_stack = QStackedWidget()
+
+        idle_page = QWidget()
+        idle_layout = QVBoxLayout(idle_page)
+        idle_layout.setContentsMargins(0, 0, 0, 0)
+        idle_layout.setSpacing(6)
+
         self.export_btn = QPushButton("\u25b6  开始导出")
         self.export_btn.setObjectName("exportButton")
         self.export_btn.setMinimumHeight(40)
         self.export_btn.clicked.connect(self.export_requested.emit)
-        bottom.addWidget(self.export_btn)
+        idle_layout.addWidget(self.export_btn)
 
-        # Queue export button
         self.export_all_btn = QPushButton("📋  全部导出")
         self.export_all_btn.setMinimumHeight(32)
         self.export_all_btn.setToolTip("将文件列表中的所有视频排入队列依次处理")
         self.export_all_btn.clicked.connect(self.export_all_requested.emit)
-        bottom.addWidget(self.export_all_btn)
+        idle_layout.addWidget(self.export_all_btn)
 
-        # Pause / Cancel buttons (visible only during export)
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(8)
+        running_page = QWidget()
+        running_layout = QHBoxLayout(running_page)
+        running_layout.setContentsMargins(0, 0, 0, 0)
+        running_layout.setSpacing(8)
         self._pause_btn = QPushButton("⏸ 暂停")
-        self._pause_btn.setMinimumHeight(32)
+        self._pause_btn.setMinimumHeight(36)
         self._pause_btn.setToolTip("暂停/继续当前导出")
-        self._pause_btn.setVisible(False)
-        self._pause_btn.clicked.connect(self._toggle_pause)
-        ctrl_row.addWidget(self._pause_btn)
+        self._pause_btn.clicked.connect(self.pause_requested.emit)
+        running_layout.addWidget(self._pause_btn)
 
         self._cancel_btn = QPushButton("⏹ 取消")
-        self._cancel_btn.setMinimumHeight(32)
+        self._cancel_btn.setMinimumHeight(36)
         self._cancel_btn.setToolTip("取消当前导出 (Esc)")
-        self._cancel_btn.setVisible(False)
         self._cancel_btn.clicked.connect(self.cancel_requested.emit)
-        ctrl_row.addWidget(self._cancel_btn)
-        bottom.addLayout(ctrl_row)
+        running_layout.addWidget(self._cancel_btn)
+
+        self._action_stack.addWidget(idle_page)
+        self._action_stack.addWidget(running_page)
+        self._action_stack.setCurrentIndex(0)
+        bottom.addWidget(self._action_stack)
 
         self._is_paused = False
 
@@ -998,6 +1007,7 @@ class ExportPanel(QWidget):
 
     def set_export_enabled(self, enabled: bool) -> None:
         self.export_btn.setEnabled(enabled)
+        self.export_all_btn.setEnabled(enabled)
 
     def set_exporting_state(self, active: bool) -> None:
         """Show/hide pause and cancel buttons based on export state.
@@ -1006,8 +1016,7 @@ class ExportPanel(QWidget):
         prevent VRAM exhaustion from two concurrent GPU-heavy tasks.
         """
         self._is_exporting = active
-        self._pause_btn.setVisible(active)
-        self._cancel_btn.setVisible(active)
+        self._action_stack.setCurrentIndex(1 if active else 0)
         # Disable TRT deploy during export to prevent OOM
         if hasattr(self, "trt_deploy_btn"):
             if active:
@@ -1019,11 +1028,28 @@ class ExportPanel(QWidget):
         if not active:
             self._is_paused = False
             self._pause_btn.setText("⏸ 暂停")
+            self.set_runtime_eta(None)
 
-    def _toggle_pause(self) -> None:
-        self._is_paused = not self._is_paused
-        self._pause_btn.setText("▶ 继续" if self._is_paused else "⏸ 暂停")
-        self.pause_requested.emit()
+    def set_pause_state(self, paused: bool) -> None:
+        self._is_paused = paused
+        self._pause_btn.setText("▶ 继续" if paused else "⏸ 暂停")
+
+    def set_runtime_eta(self, seconds_remaining: float | None) -> None:
+        if seconds_remaining is None:
+            self.estimation_label.setVisible(False)
+            self.estimation_label.setText("")
+            return
+        total_seconds = max(0, int(round(seconds_remaining)))
+        mins, secs = divmod(total_seconds, 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            text = f"预计剩余 {hours}小时{mins}分"
+        elif mins > 0:
+            text = f"预计剩余 {mins}分{secs}秒"
+        else:
+            text = f"预计剩余 {secs}秒"
+        self.estimation_label.setText(text)
+        self.estimation_label.setVisible(True)
 
     def autofill_output(self, input_path: str, output_dir: str = "") -> None:
         """Auto-generate output path using the naming template."""
@@ -1044,50 +1070,16 @@ class ExportPanel(QWidget):
         total_frames: int,
         source_size_bytes: int = 0,
     ) -> None:
-        """Update the estimation label with rough time and size predictions."""
-        # Store source metadata for re-computation when export duration changes.
+        """Store source metadata for runtime ETA context only."""
         self._src_duration = duration_sec
         self._src_frames = total_frames
         self._src_size_bytes = source_size_bytes
-        self._refresh_estimation()
+        self.estimation_label.setVisible(False)
+        self.estimation_label.setText("")
 
     def _on_export_duration_changed(self) -> None:
-        """Re-compute estimation when the user changes the export duration."""
-        if hasattr(self, "_src_duration"):
-            self._refresh_estimation()
-
-    def _refresh_estimation(self) -> None:
-        """(Re-)compute and display the estimation with current settings."""
-        dur = self._src_duration
-        frames = self._src_frames
-        size_bytes = self._src_size_bytes
-
-        # If user set a partial export duration, clamp to that.
-        export_sec = self.preview_seconds.value()
-        if export_sec > 0 and dur > 0:
-            ratio = min(export_sec / dur, 1.0)
-            dur = export_sec
-            frames = max(1, int(frames * ratio))
-            size_bytes = int(size_bytes * ratio)
-
-        quality = coerce_enum(
-            QualityMode, self.quality_combo.currentData(), QualityMode.QUALITY
-        )
-        profile = coerce_enum(
-            TargetProfile, self.target_combo.currentData(), TargetProfile.FHD
-        )
-        crf_val = self.encoder_crf.value() if self.encoder_crf.value() > 0 else 18
-        est = estimate_export(
-            duration_sec=dur,
-            total_frames=frames,
-            quality_mode=quality.value if quality else "quality",
-            target_profile=profile.value if profile else "fhd",
-            encoder_crf=crf_val,
-            source_size_bytes=size_bytes,
-        )
-        self.estimation_label.setText(f"📊 {est.description}")
-        self.estimation_label.setVisible(True)
-        self._last_estimate = est
+        """Keep source metadata only; static pre-export estimate is intentionally disabled."""
+        pass
 
     def show_post_export(self, output_path: str) -> None:
         """Show 'open folder' and 'play' buttons after successful export."""

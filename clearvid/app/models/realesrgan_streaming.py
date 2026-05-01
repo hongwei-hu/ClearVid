@@ -1110,12 +1110,16 @@ def _process_frames_async(
     def _write_loop() -> None:
         try:
             while not abort.is_set():
+                if control is not None:
+                    control.check()
                 ok, item = _safe_get(finalized_queue)
                 if not ok or item is None:
                     break
                 batch_payload, saw_sentinel = _coalesce_finalized_payloads(item, finalized_queue)
                 t_w = time.perf_counter()
                 write_stats: dict[str, float] = {}
+                if control is not None:
+                    control.check()
                 count = _write_finalized_frames(
                     batch_payload, output_width, output_height,
                     config.target_profile, encoder.stdin,
@@ -1128,6 +1132,8 @@ def _process_frames_async(
                 frames_written[0] += count
                 if saw_sentinel:
                     break
+        except ExportCancelled:
+            abort.set()
         except Exception as exc:
             write_errors.append(exc)
             abort.set()
