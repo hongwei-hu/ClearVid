@@ -508,6 +508,10 @@ def _resolve_trt_timeout(
     elif sm_version >= 80:              # Ampere / RTX 30 series
         base = int(base * 0.8)
 
+    if param_count > 10_000_000:
+        rrdb_minimum = 3600 if low_load else 1800
+        base = max(base, rrdb_minimum)
+
     return max(180, base)               # never shorter than 3 minutes
 
 

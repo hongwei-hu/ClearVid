@@ -7,6 +7,7 @@ from clearvid.app.models.tensorrt_engine import (
     _format_trt_subprocess_failure,
     _onnx_export_shape,
     _read_engine_profile_shapes,
+    _resolve_trt_timeout,
     _score_trt_engine_for_video,
     _trt_build_modes,
     find_compatible_engine,
@@ -189,6 +190,30 @@ def test_trt_build_modes_use_single_strategy_in_low_load_mode() -> None:
             "max_aux_streams": 1,
         }
     ]
+
+
+def test_rrdb_trt_timeout_is_not_shortened_below_build_floor_on_fast_gpus() -> None:
+    assert _resolve_trt_timeout(
+        param_count=16_700_000,
+        sm_version=120,
+        user_override=None,
+        low_load=False,
+    ) == 1800
+    assert _resolve_trt_timeout(
+        param_count=16_700_000,
+        sm_version=120,
+        user_override=None,
+        low_load=True,
+    ) == 3600
+
+
+def test_trt_timeout_user_override_still_takes_precedence() -> None:
+    assert _resolve_trt_timeout(
+        param_count=16_700_000,
+        sm_version=120,
+        user_override=900,
+        low_load=False,
+    ) == 900
 
 
 def test_trt_warmup_detects_recent_failed_status() -> None:
