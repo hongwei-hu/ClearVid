@@ -135,11 +135,8 @@ def _enhance_frames_batch(
     frame_count = len(frames)
     if frame_count == 0:
         return []
-    height, width = frames[0].shape[:2]
-    batch_np = np.empty((frame_count, 3, height, width), dtype=np.float32)
-    for index, frame in enumerate(frames):
-        # Keep per-frame layout conversion in NumPy, then transfer as one tensor.
-        batch_np[index] = frame[:, :, ::-1].transpose(2, 0, 1)
+    batch_np = np.stack(frames, axis=0)
+    batch_np = np.ascontiguousarray(batch_np[:, :, :, ::-1].transpose(0, 3, 1, 2), dtype=np.float32)
     batch_np *= (1.0 / 255.0)
 
     batch = torch.from_numpy(batch_np)
@@ -378,31 +375,75 @@ def _enhance_frames_trt_tiled(
     frame_count = len(frames)
     h_input, w_input = frames[0].shape[:2]
     preprocess = upsampler.pre_process
+
+    def _supports_fast_batch_preprocess() -> bool:
+        if not hasattr(upsampler, "device") or not hasattr(upsampler, "half"):
+            return False
+        pre_pad = int(getattr(upsampler, "pre_pad", 0) or 0)
+        if pre_pad != 0:
+            return False
+        mod_scale = None
+        if int(getattr(upsampler, "scale", 0) or 0) == 2:
+            mod_scale = 2
+        elif int(getattr(upsampler, "scale", 0) or 0) == 1:
+            mod_scale = 4
+        if mod_scale is None:
+            return True
+        return (h_input % mod_scale == 0) and (w_input % mod_scale == 0)
+
+    def _fast_batch_preprocess() -> object:
+        import torch
+
+        batch_np = np.stack(frames, axis=0)
+        batch_np = np.ascontiguousarray(batch_np[:, :, :, ::-1].transpose(0, 3, 1, 2), dtype=np.float32)
+        batch_np *= (1.0 / 255.0)
+        batch_tensor = torch.from_numpy(batch_np)
+        if upsampler.half:
+            batch_tensor = batch_tensor.half()
+        batch_tensor = batch_tensor.to(upsampler.device, non_blocking=True)
+        if hasattr(upsampler, "mod_scale"):
+            upsampler.mod_scale = None
+        if hasattr(upsampler, "mod_pad_h"):
+            upsampler.mod_pad_h = 0
+        if hasattr(upsampler, "mod_pad_w"):
+            upsampler.mod_pad_w = 0
+        if hasattr(upsampler, "img"):
+            upsampler.img = batch_tensor
+        return batch_tensor
+
+    def _legacy_batch_preprocess() -> object:
+        first = frames[0]
+        first_img = cv2.cvtColor(first.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
+        preprocess(first_img)
+        first_tensor = upsampler.img
+
+        import torch
+
+        batch_img = first_tensor.new_empty((
+            frame_count,
+            int(first_tensor.shape[1]),
+            int(first_tensor.shape[2]),
+            int(first_tensor.shape[3]),
+        ))
+        batch_img[0:1].copy_(first_tensor)
+
+        for index in range(1, frame_count):
+            frame = frames[index]
+            if frame.shape[:2] != (h_input, w_input):
+                raise ValueError("TRT frame batch requires equal frame sizes")
+            img = cv2.cvtColor(frame.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
+            preprocess(img)
+            batch_img[index:index + 1].copy_(upsampler.img)
+        return batch_img
+
     t_prep = time.perf_counter()
-    first = frames[0]
-    first_img = cv2.cvtColor(first.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
-    preprocess(first_img)
-    first_tensor = upsampler.img
-
-    import torch
-
-    batch_img = first_tensor.new_empty((
-        frame_count,
-        int(first_tensor.shape[1]),
-        int(first_tensor.shape[2]),
-        int(first_tensor.shape[3]),
-    ))
-    batch_img[0:1].copy_(first_tensor)
-
-    for index in range(1, frame_count):
-        frame = frames[index]
+    for frame in frames:
         if frame.shape[:2] != (h_input, w_input):
             raise ValueError("TRT frame batch requires equal frame sizes")
-        img = cv2.cvtColor(frame.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
-        preprocess(img)
-        batch_img[index:index + 1].copy_(upsampler.img)
-
-    upsampler.img = batch_img
+    if _supports_fast_batch_preprocess():
+        upsampler.img = _fast_batch_preprocess()
+    else:
+        upsampler.img = _legacy_batch_preprocess()
     if tile_stats is not None:
         prep_elapsed_ms = (time.perf_counter() - t_prep) * 1000
         tile_stats["trt_preprocess_ms"] = tile_stats.get("trt_preprocess_ms", 0.0) + prep_elapsed_ms
