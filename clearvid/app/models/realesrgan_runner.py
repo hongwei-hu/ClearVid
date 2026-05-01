@@ -945,7 +945,11 @@ def _start_decode_thread(
     return raw_queue, errors, thread
 
 
-def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
+def _collect_batch(
+    raw_queue: queue.Queue,
+    batch_size: int,
+    fetch_stats: dict[str, float] | None = None,
+) -> list[bytes]:
     """Collect up to *batch_size* frames.
 
     The first frame blocks indefinitely (waits for decode). Subsequent
@@ -954,7 +958,10 @@ def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
     """
     batch: list[bytes] = []
     # First frame: block until available
+    t_wait = time.perf_counter()
     raw = raw_queue.get()
+    if fetch_stats is not None:
+        fetch_stats["fetch_wait_ms"] = fetch_stats.get("fetch_wait_ms", 0.0) + (time.perf_counter() - t_wait) * 1000
     if raw is None:
         raw_queue.put(None)
         return batch
@@ -965,7 +972,10 @@ def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
     # even slightly bottlenecked (e.g. nlmeans on CPU), starving the GPU.
     for _ in range(batch_size - 1):
         try:
+            t_wait = time.perf_counter()
             raw = raw_queue.get(timeout=0.033)
+            if fetch_stats is not None:
+                fetch_stats["fetch_wait_ms"] = fetch_stats.get("fetch_wait_ms", 0.0) + (time.perf_counter() - t_wait) * 1000
         except queue.Empty:
             break
         if raw is None:
@@ -1032,6 +1042,7 @@ class _PendingTrtFrameBatch:
     tile_stats: dict[str, float] | None = None
 
     def resolve(self) -> np.ndarray:
+        t_resolve = time.perf_counter()
         t_cpu = time.perf_counter()
         if self.event is not None:
             self.event.synchronize()
@@ -1039,6 +1050,8 @@ class _PendingTrtFrameBatch:
             self.tile_stats["trt_cpu_ms"] = self.tile_stats.get("trt_cpu_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
         output_frames = self.cpu_tensor.numpy()
         self.gpu_tensor = None
+        if self.tile_stats is not None:
+            self.tile_stats["trt_resolve_ms"] = self.tile_stats.get("trt_resolve_ms", 0.0) + (time.perf_counter() - t_resolve) * 1000
         return np.ascontiguousarray(output_frames)
 
 
@@ -1082,6 +1095,7 @@ def _flush_trt_tile_batch(
         tile_stats["tiles"] = tile_stats.get("tiles", 0.0) + tile_items
         tile_stats["tile_infer_ms"] = tile_stats.get("tile_infer_ms", 0.0) + (time.perf_counter() - t0) * 1000
         tile_stats["tile_batch_max"] = max(tile_stats.get("tile_batch_max", 0.0), tile_items)
+    t_stitch = time.perf_counter()
     output_offset = 0
     for tile, info in pending:
         (
@@ -1097,6 +1111,8 @@ def _flush_trt_tile_batch(
             output_start_x_tile:output_end_x_tile,
         ]
         output_offset += tile_batch
+    if tile_stats is not None:
+        tile_stats["trt_stitch_ms"] = tile_stats.get("trt_stitch_ms", 0.0) + (time.perf_counter() - t_stitch) * 1000
 
 
 def _trt_output_to_frames(
@@ -1229,6 +1245,7 @@ def _enhance_frames_trt_tiled(
     if not frames:
         return []
     h_input, w_input = frames[0].shape[:2]
+    t_prep = time.perf_counter()
     preprocessed = []
     for frame in frames:
         if frame.shape[:2] != (h_input, w_input):
@@ -1239,6 +1256,8 @@ def _enhance_frames_trt_tiled(
     import torch
 
     upsampler.img = torch.cat(preprocessed, dim=0)
+    if tile_stats is not None:
+        tile_stats["trt_preprocess_ms"] = tile_stats.get("trt_preprocess_ms", 0.0) + (time.perf_counter() - t_prep) * 1000
 
     batch, channel, height, width = upsampler.img.shape
     output = upsampler.img.new_zeros((batch, channel, height * upsampler.scale, width * upsampler.scale))
@@ -1335,7 +1354,7 @@ def _fetch_enhanced_frames(
 ) -> _FramePayload | _PendingTrtFrameBatch | None:
     """Fetch and enhance the next frame(s). Returns None at end of stream."""
     if use_batching:
-        batch_raw = _collect_batch(raw_queue, batch_size)
+        batch_raw = _collect_batch(raw_queue, batch_size, trt_tile_stats)
         if not batch_raw:
             return None
         images = [np.frombuffer(r, dtype=np.uint8).reshape((height, width, 3)) for r in batch_raw]
@@ -1348,7 +1367,7 @@ def _fetch_enhanced_frames(
         and batch_size > 1
     ):
         trt_frame_batch = min(batch_size, max(1, int(getattr(upsampler.model, "max_batch", 1))))
-        batch_raw = _collect_batch(raw_queue, trt_frame_batch)
+        batch_raw = _collect_batch(raw_queue, trt_frame_batch, trt_tile_stats)
         if not batch_raw:
             return None
         images = [np.frombuffer(r, dtype=np.uint8).reshape((height, width, 3)) for r in batch_raw]
@@ -1358,7 +1377,10 @@ def _fetch_enhanced_frames(
             async_cpu_transfer=async_cpu_transfer,
         )
 
+    t_wait = time.perf_counter()
     raw_frame = raw_queue.get()
+    if trt_tile_stats is not None:
+        trt_tile_stats["fetch_wait_ms"] = trt_tile_stats.get("fetch_wait_ms", 0.0) + (time.perf_counter() - t_wait) * 1000
     if raw_frame is None:
         return None
     image = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width, 3))
@@ -1990,29 +2012,44 @@ def _process_frames_async(
         trt_tile_ms = _diag_trt_tile_stats.get("tile_infer_ms", 0.0)
         trt_tile_max_batch = _diag_trt_tile_stats.get("tile_batch_max", 0.0)
         trt_engine_max_batch = _diag_trt_tile_stats.get("engine_max_batch", 0.0)
+        trt_fetch_wait_ms = _diag_trt_tile_stats.get("fetch_wait_ms", 0.0)
+        trt_preprocess_ms = _diag_trt_tile_stats.get("trt_preprocess_ms", 0.0)
         trt_post_ms = _diag_trt_tile_stats.get("trt_post_ms", 0.0)
         trt_resize_ms = _diag_trt_tile_stats.get("trt_resize_ms", 0.0)
         trt_pack_ms = _diag_trt_tile_stats.get("trt_pack_ms", 0.0)
+        trt_stitch_ms = _diag_trt_tile_stats.get("trt_stitch_ms", 0.0)
+        trt_cpu_schedule_ms = _diag_trt_tile_stats.get("trt_cpu_schedule_ms", 0.0)
         trt_cpu_ms = _diag_trt_tile_stats.get("trt_cpu_ms", 0.0)
+        trt_resolve_ms = _diag_trt_tile_stats.get("trt_resolve_ms", 0.0)
         trt_avg_tile_batch = trt_tiles / trt_tile_batches if trt_tile_batches > 0 else 0.0
         trt_tile_ms_per_batch = trt_tile_ms / trt_tile_batches if trt_tile_batches > 0 else 0.0
         trt_frames = max(enh_frames, 1)
 
         # Stage throughput breakdown (ms/frame)
         infer_per_frame = avg_infer_ms / max(avg_batch, 1)
+        trt_fetch_wait_ms_per_frame = trt_fetch_wait_ms / trt_frames
+        trt_preprocess_ms_per_frame = trt_preprocess_ms / trt_frames
         trt_kernel_ms_per_frame = trt_tile_ms / trt_frames
+        trt_stitch_ms_per_frame = trt_stitch_ms / trt_frames
         trt_post_ms_per_frame = trt_post_ms / trt_frames
         trt_resize_ms_per_frame = trt_resize_ms / trt_frames
         trt_pack_ms_per_frame = trt_pack_ms / trt_frames
+        trt_cpu_schedule_ms_per_frame = trt_cpu_schedule_ms / trt_frames
         trt_cpu_ms_per_frame = trt_cpu_ms / trt_frames
+        trt_resolve_ms_per_frame = trt_resolve_ms / trt_frames
         trt_other_ms_per_frame = max(
             0.0,
             infer_per_frame
+            - trt_fetch_wait_ms_per_frame
+            - trt_preprocess_ms_per_frame
             - trt_kernel_ms_per_frame
+            - trt_stitch_ms_per_frame
             - trt_post_ms_per_frame
             - trt_resize_ms_per_frame
             - trt_pack_ms_per_frame
+            - trt_cpu_schedule_ms_per_frame
             - trt_cpu_ms_per_frame,
+            - trt_resolve_ms_per_frame
         )
 
         gpu_line = format_gpu_summary(_gpu_summary)
@@ -2028,11 +2065,18 @@ def _process_frames_async(
             f"engine_max_batch={trt_engine_max_batch:.0f}  TRT调用 {trt_tile_ms_per_batch:.1f}ms/批"
         ) if trt_tile_batches > 0 else "  TRT tiles: 未使用 TensorRT tile 批处理"
         trt_post_line = (
-            f"  TRT后处理: post={trt_post_ms_per_frame:.1f}ms/帧  "
+            f"  TRT拆分:    wait={trt_fetch_wait_ms_per_frame:.1f}ms/帧  "
+            f"prep={trt_preprocess_ms_per_frame:.1f}ms/帧  "
+            f"stitch={trt_stitch_ms_per_frame:.1f}ms/帧  "
+            f"post={trt_post_ms_per_frame:.1f}ms/帧  "
             f"resize={trt_resize_ms_per_frame:.1f}ms/帧  "
             f"pack={trt_pack_ms_per_frame:.1f}ms/帧  "
-            f"GPU→CPU={trt_cpu_ms_per_frame:.1f}ms/帧  "
-            f"其他={trt_other_ms_per_frame:.1f}ms/帧"
+            f"sched={trt_cpu_schedule_ms_per_frame:.1f}ms/帧  "
+            f"GPU→CPU={trt_cpu_ms_per_frame:.1f}ms/帧"
+        ) if trt_tile_batches > 0 else ""
+        trt_other_line = (
+            f"  TRT其他:    resolve={trt_resolve_ms_per_frame:.1f}ms/帧  "
+            f"residual={trt_other_ms_per_frame:.1f}ms/帧"
         ) if trt_tile_batches > 0 else ""
 
         report_lines = [
@@ -2045,6 +2089,7 @@ def _process_frames_async(
             f"  推理延迟:  {avg_infer_ms:.1f}ms/批  ({infer_per_frame:.1f}ms/帧)",
             trt_line,
             trt_post_line,
+            trt_other_line,
             f"  写入延迟:  {avg_write_ms:.2f}ms/帧",
             pp_line,
             f"  CPU占用:   进程平均 {cpu_total_pct:.0f}%  (按 {_cpu_tracker.cpu_count} 核归一化)",

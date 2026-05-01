@@ -148,6 +148,30 @@ def test_write_finalized_frames_list_avoids_extra_batch_copy() -> None:
     assert bytes(sink.data) == b"".join(frame.tobytes() for frame in frames)
 
 
+class _FakeCpuTensor:
+    def __init__(self, array: np.ndarray) -> None:
+        self._array = array
+
+    def numpy(self) -> np.ndarray:
+        return self._array
+
+
+def test_pending_trt_frame_batch_records_resolve_timing() -> None:
+    payload = realesrgan_runner._PendingTrtFrameBatch(
+        cpu_tensor=_FakeCpuTensor(np.zeros((1, 4, 4, 3), dtype=np.uint8)),
+        gpu_tensor=None,
+        event=None,
+        tile_stats={},
+    )
+
+    frames = payload.resolve()
+
+    assert frames.shape == (1, 4, 4, 3)
+    assert payload.tile_stats is not None
+    assert payload.tile_stats["trt_cpu_ms"] >= 0
+    assert payload.tile_stats["trt_resolve_ms"] >= 0
+
+
 def test_pack_trt_output_tensor_matches_original_bgr_rounding() -> None:
     result = torch.tensor(
         [[
@@ -279,6 +303,7 @@ def test_fetch_enhanced_frames_trt_batches_when_skipper_inactive() -> None:
     assert len(enhanced) == 2
     assert upsampler.model.batch_sizes == [2]
     assert tile_stats["tile_batch_max"] == 2
+    assert tile_stats["fetch_wait_ms"] >= 0
 
 
 def test_enhance_frame_trt_tiled_resizes_on_tensor_before_cpu() -> None:
@@ -292,6 +317,8 @@ def test_enhance_frame_trt_tiled_resizes_on_tensor_before_cpu() -> None:
 
     assert enhanced.shape == (4, 6, 3)
     assert enhanced.dtype == np.uint8
+    assert tile_stats["trt_preprocess_ms"] >= 0
+    assert tile_stats["trt_stitch_ms"] >= 0
     assert tile_stats["trt_resize_ms"] >= 0
     assert tile_stats["trt_pack_ms"] >= 0
     assert tile_stats["trt_cpu_ms"] >= 0
