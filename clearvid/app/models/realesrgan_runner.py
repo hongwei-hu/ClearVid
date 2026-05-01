@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import queue
 import shutil
 import subprocess
@@ -252,8 +253,10 @@ def _resolve_trt_batch(
         return config_batch
     if config_accel.value == "auto":
         return config_batch
-    # Explicitly selected TensorRT: always use batch=1 to match the GUI deploy profile
-    return 1
+    # Explicitly selected TensorRT: use a deployed high-throughput profile when
+    # available.  TensorRT batching here means batched tiles, not batched whole
+    # frames; cap to 4 because the engine builder currently sets max_batch <= 4.
+    return max(1, min(config_batch, 4))
 
 
 def run_realesrgan_video(
@@ -1087,6 +1090,122 @@ def _enhance_frames_batch(
     return results
 
 
+def _is_trt_upsampler(upsampler: object) -> bool:
+    return hasattr(getattr(upsampler, "model", None), "_engine")
+
+
+_TrtTileInfo = tuple[int, int, int, int, int, int, int, int]
+_TrtPendingTile = tuple[object, _TrtTileInfo]
+
+
+def _flush_trt_tile_batch(
+    pending: list[_TrtPendingTile],
+    upsampler: object,
+    output: object,
+) -> None:
+    if not pending:
+        return
+    import torch
+
+    tiles = torch.cat([item[0] for item in pending], dim=0)
+    with torch.inference_mode():
+        outputs = upsampler.model(tiles)
+    for idx, (_, info) in enumerate(pending):
+        (
+            output_start_x, output_end_x, output_start_y, output_end_y,
+            output_start_x_tile, output_end_x_tile,
+            output_start_y_tile, output_end_y_tile,
+        ) = info
+        output[:, :, output_start_y:output_end_y, output_start_x:output_end_x] = outputs[
+            idx:idx + 1,
+            :,
+            output_start_y_tile:output_end_y_tile,
+            output_start_x_tile:output_end_x_tile,
+        ]
+
+
+def _enhance_frame_trt_tiled(
+    frame: np.ndarray,
+    upsampler: object,
+    outscale: float,
+) -> np.ndarray:
+    """Enhance one frame by batching RealESRGAN tiles through TensorRT.
+
+    The upstream RealESRGANer processes tiles one at a time.  With TensorRT this
+    underutilizes high-end GPUs, so this path groups same-size padded tiles into
+    batches up to the engine profile's max batch.
+    """
+    h_input, w_input = frame.shape[:2]
+    img = cv2.cvtColor(frame.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
+    upsampler.pre_process(img)
+
+    batch, channel, height, width = upsampler.img.shape
+    output = upsampler.img.new_zeros((batch, channel, height * upsampler.scale, width * upsampler.scale))
+    tile_size = int(getattr(upsampler, "tile_size", 0) or 0)
+    tile_pad = int(getattr(upsampler, "tile_pad", 0) or 0)
+    max_batch = max(1, int(getattr(upsampler.model, "max_batch", 1)))
+    tiles_x = math.ceil(width / tile_size)
+    tiles_y = math.ceil(height / tile_size)
+
+    pending: list[_TrtPendingTile] = []
+    pending_hw: tuple[int, int] | None = None
+
+    for tile_y in range(tiles_y):
+        for tile_x in range(tiles_x):
+            ofs_x = tile_x * tile_size
+            ofs_y = tile_y * tile_size
+            input_start_x = ofs_x
+            input_end_x = min(ofs_x + tile_size, width)
+            input_start_y = ofs_y
+            input_end_y = min(ofs_y + tile_size, height)
+
+            input_start_x_pad = max(input_start_x - tile_pad, 0)
+            input_end_x_pad = min(input_end_x + tile_pad, width)
+            input_start_y_pad = max(input_start_y - tile_pad, 0)
+            input_end_y_pad = min(input_end_y + tile_pad, height)
+
+            input_tile_width = input_end_x - input_start_x
+            input_tile_height = input_end_y - input_start_y
+            input_tile = upsampler.img[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
+            tile_hw = (int(input_tile.shape[2]), int(input_tile.shape[3]))
+            if pending_hw is not None and (tile_hw != pending_hw or len(pending) >= max_batch):
+                _flush_trt_tile_batch(pending, upsampler, output)
+                pending = []
+                pending_hw = None
+            pending_hw = tile_hw
+
+            output_start_x = input_start_x * upsampler.scale
+            output_end_x = input_end_x * upsampler.scale
+            output_start_y = input_start_y * upsampler.scale
+            output_end_y = input_end_y * upsampler.scale
+
+            output_start_x_tile = (input_start_x - input_start_x_pad) * upsampler.scale
+            output_end_x_tile = output_start_x_tile + input_tile_width * upsampler.scale
+            output_start_y_tile = (input_start_y - input_start_y_pad) * upsampler.scale
+            output_end_y_tile = output_start_y_tile + input_tile_height * upsampler.scale
+            pending.append((
+                input_tile,
+                (
+                    output_start_x, output_end_x, output_start_y, output_end_y,
+                    output_start_x_tile, output_end_x_tile,
+                    output_start_y_tile, output_end_y_tile,
+                ),
+            ))
+    _flush_trt_tile_batch(pending, upsampler, output)
+
+    upsampler.output = output
+    output_img = upsampler.post_process().data.squeeze().float().cpu().clamp_(0, 1).numpy()
+    output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
+    output_frame = (output_img * 255.0).round().astype(np.uint8)
+    if outscale is not None and outscale != float(upsampler.scale):
+        output_frame = cv2.resize(
+            output_frame,
+            (int(w_input * outscale), int(h_input * outscale)),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+    return output_frame
+
+
 def _fetch_enhanced_frames(
     raw_queue: queue.Queue,
     use_batching: bool,
@@ -1114,10 +1233,33 @@ def _fetch_enhanced_frames(
         skipper.skip_count += 1
         return [skipper.get_cached()]
 
-    enhanced, _ = upsampler.enhance(image, outscale=outscale)
+    if _is_trt_upsampler(upsampler) and getattr(upsampler, "tile_size", 0) > 0:
+        enhanced = _enhance_frame_trt_tiled(image, upsampler, outscale)
+    else:
+        enhanced, _ = upsampler.enhance(image, outscale=outscale)
     if skipper is not None:
         skipper.record(image, enhanced)
     return [enhanced]
+
+
+def _prepare_encoder_frame(frame: np.ndarray, output_width: int, output_height: int) -> np.ndarray:
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.ndim != 3:
+        raise ValueError(f"编码帧维度异常: {frame.shape}")
+    elif frame.shape[2] == 1:
+        frame = np.repeat(frame, 3, axis=2)
+    elif frame.shape[2] > 3:
+        frame = frame[:, :, :3]
+
+    if frame.shape[1] != output_width or frame.shape[0] != output_height:
+        raise ValueError(
+            f"编码帧尺寸不匹配: got {frame.shape[1]}x{frame.shape[0]}, "
+            f"expected {output_width}x{output_height}"
+        )
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(frame)
 
 
 def _write_enhanced_frames(
@@ -1144,7 +1286,7 @@ def _write_enhanced_frames(
         if sharpen_strength > 0:
             enhanced = apply_sharpening(enhanced, sharpen_strength)
         finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
-        encoder_stdin.write(np.ascontiguousarray(finalized).tobytes())
+        encoder_stdin.write(_prepare_encoder_frame(finalized, output_width, output_height).tobytes())
         count += 1
     return count
 
@@ -1164,7 +1306,7 @@ def _write_finalized_frames(
     count = 0
     for frame in finalized_list:
         resized = _resize_for_target(frame, output_width, output_height, target_profile)
-        encoder_stdin.write(np.ascontiguousarray(resized).tobytes())
+        encoder_stdin.write(_prepare_encoder_frame(resized, output_width, output_height).tobytes())
         count += 1
     return count
 

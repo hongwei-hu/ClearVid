@@ -98,6 +98,7 @@ class TrtWarmupWorker(QThread):
         batch_size: int = 1,
         fp16: bool = True,
         timeout: int | None = None,
+        low_load: bool = False,
     ) -> None:
         super().__init__()
         self._model_key = model_key
@@ -105,6 +106,7 @@ class TrtWarmupWorker(QThread):
         self._batch_size = batch_size
         self._fp16 = fp16
         self._timeout = timeout
+        self._low_load = low_load
 
     def run(self) -> None:
         try:
@@ -167,7 +169,7 @@ class TrtWarmupWorker(QThread):
                     weight_path=model_path,
                     trt_build_timeout=self._timeout,
                     build_if_missing=True,
-                    low_load=True,
+                    low_load=self._low_load,
                 )
                 self.progress.emit(100, "TensorRT 引擎部署完成")
             except Exception as exc:

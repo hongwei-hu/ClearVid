@@ -683,11 +683,20 @@ class _TensorRTModelWrapper:
         with open(engine_path, "rb") as f:
             self._engine = runtime.deserialize_cuda_engine(f.read())
         self._context = self._engine.create_execution_context()
+        self.max_batch = 1
+        self.opt_shape: tuple[int, ...] | None = None
+        self.max_shape: tuple[int, ...] | None = None
+        try:
+            self.opt_shape = tuple(self._engine.get_profile_shape("input", 0)[1])
+            self.max_shape = tuple(self._engine.get_profile_shape("input", 0)[2])
+            self.max_batch = int(self.max_shape[0])
+        except Exception:
+            pass
 
         # Warm up: one dummy inference to trigger lazy CUDA init
         import torch
         try:
-            opt_shape = self._engine.get_profile_shape("input", 0)[1]
+            opt_shape = self.opt_shape or self._engine.get_profile_shape("input", 0)[1]
             dummy = torch.randn(*opt_shape, device="cuda", dtype=torch.float16 if fp16 else torch.float32)
             self.__call__(dummy)
             del dummy

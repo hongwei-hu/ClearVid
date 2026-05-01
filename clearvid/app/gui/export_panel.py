@@ -798,12 +798,7 @@ class ExportPanel(QWidget):
         )
         model_key_str = "general_v3" if model_key == UpscaleModel.AUTO else model_key.value
         tile = self.tile_size_spin.value() or 512
-        # TRT engine profiles are always built with batch=1.
-        # The pipeline's _resolve_trt_batch() also enforces batch=1 for
-        # explicitly-selected TensorRT because tiling disables multi-frame
-        # batching.  Using batch=1 here keeps the deploy hash consistent with
-        # the status check and avoids building a heavier engine that times out.
-        batch = 1
+        batch = self._recommended_trt_batch()
 
         self._trt_deploying = True
         self.trt_deploy_btn.setVisible(False)
@@ -820,6 +815,7 @@ class ExportPanel(QWidget):
             model_key=model_key_str,
             tile_size=tile,
             batch_size=batch,
+            low_load=False,
         )
         self._trt_warmup_worker.progress.connect(self._on_trt_deploy_progress)
         self._trt_warmup_worker.failed.connect(self._on_trt_deploy_failed)
@@ -867,7 +863,11 @@ class ExportPanel(QWidget):
         self.trt_deploy_btn.setVisible(True)
         # Lightweight check: try import + check cache
         try:
-            from clearvid.app.models.tensorrt_engine import check_engine_ready as _check, InferenceAccelerator as _IA
+            from clearvid.app.models.tensorrt_engine import (
+                InferenceAccelerator as _IA,
+                check_engine_ready as _check,
+                find_compatible_engine as _find_compatible,
+            )
             from clearvid.app.models.realesrgan_runner import (
                 _MODEL_REGISTRY,
                 _build_upsampler,
@@ -891,7 +891,7 @@ class ExportPanel(QWidget):
                 return
 
             tile = self.tile_size_spin.value() or 512
-            batch = 1  # TRT engine profiles are always built with batch=1
+            batch = self._recommended_trt_batch()
             model_path = ensure_realesrgan_weights(weights_dir, model_key)
             dummy_config = _EC(
                 input_path=Path("check"), output_path=Path("check"),
@@ -903,12 +903,29 @@ class ExportPanel(QWidget):
                 cache_dir=TRT_CACHE_DIR, weight_path=model_path,
             )
             if ready:
-                self.trt_status_label.setText("✓ 已就绪")
+                self.trt_status_label.setText(f"✓ 已就绪 (batch={batch})")
                 self.trt_status_label.setStyleSheet(
                     "font-size: 11px; color: #4caf50; padding-left: 4px;"
                 )
                 self.trt_deploy_btn.setVisible(False)
             else:
+                compat = _find_compatible(
+                    upsampler.model, fp16=True, cache_dir=TRT_CACHE_DIR,
+                    weight_path=model_path,
+                )
+                if compat is not None:
+                    _, found_batch, _ = compat
+                    self.trt_status_label.setText(
+                        f"✓ 已就绪 (batch={found_batch}，建议部署 batch={batch})"
+                    )
+                    self.trt_status_label.setStyleSheet(
+                        "font-size: 11px; color: #ff9800; padding-left: 4px;"
+                    )
+                    self.trt_deploy_btn.setEnabled(True)
+                    self.trt_deploy_btn.setVisible(True)
+                    self.trt_deploy_btn.setText(f"重新部署 batch={batch}")
+                    return
+                self.trt_deploy_btn.setText("部署 TensorRT 引擎")
                 self.trt_status_label.setText(msg)
                 self.trt_status_label.setStyleSheet(
                     "font-size: 11px; color: #ff9800; padding-left: 4px;"
@@ -919,6 +936,23 @@ class ExportPanel(QWidget):
             self.trt_status_label.setStyleSheet(
                 "font-size: 11px; color: #888; padding-left: 4px;"
             )
+
+    def _recommended_trt_batch(self) -> int:
+        raw_batch = self.batch_size_spin.value()
+        if raw_batch > 0:
+            return max(1, min(raw_batch, 4))
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_bytes, _ = torch.cuda.mem_get_info(0)
+                free_gb = free_bytes / (1024 ** 3)
+                if free_gb >= 8:
+                    return 4
+                if free_gb >= 4:
+                    return 2
+        except Exception:  # noqa: BLE001
+            pass
+        return 1
 
     def apply_recommendation(self, rec: Any) -> None:
         """Apply a Recommendation object to widget state."""
