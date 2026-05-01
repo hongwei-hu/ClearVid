@@ -137,6 +137,22 @@ def test_enhance_frame_trt_tiled_pads_edge_tiles_to_batch() -> None:
     assert tile_stats["engine_max_batch"] == 2
 
 
+def test_enhance_frame_trt_tiled_resizes_on_tensor_before_cpu() -> None:
+    frame = np.full((4, 6, 3), 128, dtype=np.uint8)
+    upsampler = _FakeUpsampler()
+    tile_stats: dict[str, float] = {}
+
+    enhanced = realesrgan_runner._enhance_frame_trt_tiled(
+        frame, upsampler, outscale=1.0, tile_stats=tile_stats,
+    )
+
+    assert enhanced.shape == (4, 6, 3)
+    assert enhanced.dtype == np.uint8
+    assert tile_stats["trt_resize_ms"] >= 0
+    assert tile_stats["trt_cpu_ms"] >= 0
+    assert tile_stats["trt_post_ms"] >= 0
+
+
 def test_gpu_sampler_selects_torch_device_uuid(monkeypatch) -> None:
     monkeypatch.setattr(GpuSampler, "_detect_torch_device_uuid", staticmethod(lambda: "bbbb"))
 

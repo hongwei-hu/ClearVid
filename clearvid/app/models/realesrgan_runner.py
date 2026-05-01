@@ -1176,6 +1176,42 @@ def _flush_trt_tile_batch(
         ]
 
 
+def _trt_output_to_frame(
+    output_tensor: object,
+    upsampler: object,
+    outscale: float,
+    input_width: int,
+    input_height: int,
+    tile_stats: dict[str, float] | None = None,
+) -> np.ndarray:
+    t_post = time.perf_counter()
+    upsampler.output = output_tensor
+    result_tensor = upsampler.post_process().float().clamp_(0, 1)
+    if tile_stats is not None:
+        tile_stats["trt_post_ms"] = tile_stats.get("trt_post_ms", 0.0) + (time.perf_counter() - t_post) * 1000
+
+    if outscale is not None and outscale != float(upsampler.scale):
+        import torch.nn.functional as F
+
+        t_resize = time.perf_counter()
+        result_tensor = F.interpolate(
+            result_tensor,
+            size=(max(1, int(input_height * outscale)), max(1, int(input_width * outscale))),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).clamp_(0, 1)
+        if tile_stats is not None:
+            tile_stats["trt_resize_ms"] = tile_stats.get("trt_resize_ms", 0.0) + (time.perf_counter() - t_resize) * 1000
+
+    t_cpu = time.perf_counter()
+    output_img = result_tensor[0].cpu().numpy()
+    if tile_stats is not None:
+        tile_stats["trt_cpu_ms"] = tile_stats.get("trt_cpu_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
+    output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
+    return (output_img * 255.0).round().astype(np.uint8)
+
+
 def _enhance_frame_trt_tiled(
     frame: np.ndarray,
     upsampler: object,
@@ -1251,17 +1287,7 @@ def _enhance_frame_trt_tiled(
             ))
     _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
 
-    upsampler.output = output
-    output_img = upsampler.post_process().data.squeeze().float().cpu().clamp_(0, 1).numpy()
-    output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
-    output_frame = (output_img * 255.0).round().astype(np.uint8)
-    if outscale is not None and outscale != float(upsampler.scale):
-        output_frame = cv2.resize(
-            output_frame,
-            (int(w_input * outscale), int(h_input * outscale)),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-    return output_frame
+    return _trt_output_to_frame(output, upsampler, outscale, w_input, h_input, tile_stats)
 
 
 def _fetch_enhanced_frames(
@@ -1807,8 +1833,12 @@ def _process_frames_async(
         trt_tile_ms = _diag_trt_tile_stats.get("tile_infer_ms", 0.0)
         trt_tile_max_batch = _diag_trt_tile_stats.get("tile_batch_max", 0.0)
         trt_engine_max_batch = _diag_trt_tile_stats.get("engine_max_batch", 0.0)
+        trt_post_ms = _diag_trt_tile_stats.get("trt_post_ms", 0.0)
+        trt_resize_ms = _diag_trt_tile_stats.get("trt_resize_ms", 0.0)
+        trt_cpu_ms = _diag_trt_tile_stats.get("trt_cpu_ms", 0.0)
         trt_avg_tile_batch = trt_tiles / trt_tile_batches if trt_tile_batches > 0 else 0.0
         trt_tile_ms_per_batch = trt_tile_ms / trt_tile_batches if trt_tile_batches > 0 else 0.0
+        trt_frames = max(enh_frames, 1)
 
         # Stage throughput breakdown (ms/frame)
         infer_per_frame = avg_infer_ms / max(avg_batch, 1)
@@ -1824,6 +1854,11 @@ def _process_frames_async(
             f"平均 {trt_avg_tile_batch:.2f} tiles/批  峰值 {trt_tile_max_batch:.0f}  "
             f"engine_max_batch={trt_engine_max_batch:.0f}  TRT调用 {trt_tile_ms_per_batch:.1f}ms/批"
         ) if trt_tile_batches > 0 else "  TRT tiles: 未使用 TensorRT tile 批处理"
+        trt_post_line = (
+            f"  TRT后处理: post={trt_post_ms / trt_frames:.1f}ms/帧  "
+            f"resize={trt_resize_ms / trt_frames:.1f}ms/帧  "
+            f"GPU→CPU={trt_cpu_ms / trt_frames:.1f}ms/帧"
+        ) if trt_tile_batches > 0 else ""
 
         report_lines = [
             "═" * 46,
@@ -1834,6 +1869,7 @@ def _process_frames_async(
             f"  推理批次:  {enh_batches}批  平均 {avg_batch:.2f}帧/批",
             f"  推理延迟:  {avg_infer_ms:.1f}ms/批  ({infer_per_frame:.1f}ms/帧)",
             trt_line,
+            trt_post_line,
             f"  写入延迟:  {avg_write_ms:.2f}ms/帧",
             pp_line,
             f"  CPU占用:   进程平均 {cpu_total_pct:.0f}%  (按 {_cpu_tracker.cpu_count} 核归一化)",
