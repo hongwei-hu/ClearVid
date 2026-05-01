@@ -573,6 +573,39 @@ def trt_profile_fallbacks(tile_size: int, batch_size: int) -> list[tuple[int, in
     return unique
 
 
+def _trt_build_modes(low_load: bool) -> list[dict[str, int | str]]:
+    """Return build strategies to try within a single tile/batch profile."""
+    if low_load:
+        return [
+            {
+                "label": "low-load",
+                "workspace_mb": 256,
+                "opt_level": 0,
+                "max_aux_streams": 1,
+            }
+        ]
+    return [
+        {
+            "label": "standard",
+            "workspace_mb": 1024,
+            "opt_level": 2,
+            "max_aux_streams": 2,
+        },
+        {
+            "label": "high-workspace",
+            "workspace_mb": 4096,
+            "opt_level": 2,
+            "max_aux_streams": 2,
+        },
+        {
+            "label": "compatibility",
+            "workspace_mb": 6144,
+            "opt_level": 1,
+            "max_aux_streams": 1,
+        },
+    ]
+
+
 # -- Self-contained build script executed in subprocess ---------------------
 _TRT_BUILD_SCRIPT = r'''
 import json, os, sys
@@ -598,28 +631,17 @@ if not ok:
 
 config = builder.create_builder_config()
 
-# --- Low-load build settings ---
-# Reduce GPU workspace and skip heavy kernel auto-tuning to keep the system
-# responsive during the build.  The resulting engine is ~5-10% slower at
-# inference but the build completes without freezing the desktop.
-low_load = args.get("low_load", True)
-if low_load:
-    # 256 MB workspace (was 1 GB) -- enough for SR models, less GPU pressure
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 28)
-    # Level 0: skip most kernel auto-tuning. Builds 3-5x faster with minimal
-    # inference speed penalty for the simple feed-forward SR architectures.
+def make_config(mode):
+    config = builder.create_builder_config()
+    workspace_mb = int(mode.get("workspace_mb", 1024))
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_mb << 20)
     if hasattr(config, "builder_optimization_level"):
-        config.builder_optimization_level = 0
-    # Limit auxiliary streams to reduce GPU context switching overhead
+        config.builder_optimization_level = int(mode.get("opt_level", 2))
     if hasattr(config, "max_aux_streams"):
-        config.max_aux_streams = 1
-else:
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1 GB
-    if hasattr(config, "builder_optimization_level"):
-        config.builder_optimization_level = 2
-
-if args["fp16"]:
-    config.set_flag(trt.BuilderFlag.FP16)
+        config.max_aux_streams = int(mode.get("max_aux_streams", 1))
+    if args["fp16"]:
+        config.set_flag(trt.BuilderFlag.FP16)
+    return config
 
 tile = args["tile_size"]
 batch = args["batch_size"]
@@ -628,24 +650,38 @@ min_hw = max(32, tile // 4)
 max_hw = tile + 32
 max_batch = min(batch, 16)
 
-profile = builder.create_optimization_profile()
-profile.set_shape(
-    "input",
-    min=(1, 3, min_hw, min_hw),
-    opt=(batch, 3, tile, tile),
-    max=(max_batch, 3, max_hw, max_hw),
-)
-config.add_optimization_profile(profile)
+build_modes = args.get("build_modes") or [
+    {"label": "standard", "workspace_mb": 1024, "opt_level": 2, "max_aux_streams": 2}
+]
 
-mode_label = "low-load" if low_load else "standard"
-print(
-    f"Building TRT engine ({mode_label}): opt=({batch},3,{tile},{tile}) "
-    f"range=[{min_hw}..{max_hw}] max_batch={max_batch}",
-    flush=True,
-)
-engine_bytes = builder.build_serialized_network(network, config)
+last_label = "unknown"
+engine_bytes = None
+for mode in build_modes:
+    mode_label = str(mode.get("label", "custom"))
+    last_label = mode_label
+    config = make_config(mode)
+    profile = builder.create_optimization_profile()
+    profile.set_shape(
+        "input",
+        min=(1, 3, min_hw, min_hw),
+        opt=(batch, 3, tile, tile),
+        max=(max_batch, 3, max_hw, max_hw),
+    )
+    config.add_optimization_profile(profile)
+
+    print(
+        f"Building TRT engine ({mode_label}): opt=({batch},3,{tile},{tile}) "
+        f"range=[{min_hw}..{max_hw}] max_batch={max_batch} "
+        f"workspace={mode.get('workspace_mb', 'n/a')}MB",
+        flush=True,
+    )
+    engine_bytes = builder.build_serialized_network(network, config)
+    if engine_bytes is not None:
+        break
+    print(f"ENGINE_BUILD_RETURNED_NONE mode={mode_label}", file=sys.stderr, flush=True)
+
 if engine_bytes is None:
-    print("ENGINE_BUILD_RETURNED_NONE", file=sys.stderr)
+    print(f"ENGINE_BUILD_RETURNED_NONE_ALL_MODES last_mode={last_label}", file=sys.stderr)
     sys.exit(1)
 
 with open(args["engine_path"], "wb") as f:
@@ -680,6 +716,7 @@ def _build_trt_engine_subprocess(
         "tile_size": tile_size,
         "batch_size": batch_size,
         "low_load": low_load,
+        "build_modes": _trt_build_modes(low_load),
     })
 
     creation_flags = 0

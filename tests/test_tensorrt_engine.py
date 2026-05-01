@@ -4,6 +4,7 @@ from clearvid.app.models.tensorrt_engine import (
     _engine_cache_key,
     _onnx_export_shape,
     _read_engine_profile_shapes,
+    _trt_build_modes,
     find_compatible_engine,
     trt_profile_fallbacks,
 )
@@ -75,10 +76,40 @@ def test_trt_profile_fallbacks_move_from_aggressive_to_safe_profiles() -> None:
     ]
 
 
+def test_trt_build_modes_use_multi_strategy_in_standard_mode() -> None:
+    modes = _trt_build_modes(low_load=False)
+
+    assert [mode["label"] for mode in modes] == [
+        "standard",
+        "high-workspace",
+        "compatibility",
+    ]
+    assert int(modes[1]["workspace_mb"]) > int(modes[0]["workspace_mb"])
+
+
+def test_trt_build_modes_use_single_strategy_in_low_load_mode() -> None:
+    modes = _trt_build_modes(low_load=True)
+
+    assert modes == [
+        {
+            "label": "low-load",
+            "workspace_mb": 256,
+            "opt_level": 0,
+            "max_aux_streams": 1,
+        }
+    ]
+
+
 def test_trt_failure_summary_identifies_builder_profile_failure() -> None:
     assert TrtWarmupWorker._summarize_trt_failure(
         RuntimeError("TRT 引擎构建失败 (exit=1): ENGINE_BUILD_RETURNED_NONE")
     ) == "TensorRT builder 未能为该 profile 生成 engine"
+
+
+def test_trt_failure_summary_identifies_all_mode_failure() -> None:
+    assert TrtWarmupWorker._summarize_trt_failure(
+        RuntimeError("TRT 引擎构建失败 (exit=1): ENGINE_BUILD_RETURNED_NONE_ALL_MODES")
+    ) == "TensorRT builder 在当前 profile 的所有构建模式下均未生成 engine"
 
 
 def test_trt_failure_summary_identifies_cuda_oom() -> None:

@@ -210,6 +210,8 @@ class TrtWarmupWorker(QThread):
     @staticmethod
     def _summarize_trt_failure(exc: Exception) -> str:
         text = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if "ENGINE_BUILD_RETURNED_NONE_ALL_MODES" in str(exc):
+            return "TensorRT builder 在当前 profile 的所有构建模式下均未生成 engine"
         if "ENGINE_BUILD_RETURNED_NONE" in str(exc):
             return "TensorRT builder 未能为该 profile 生成 engine"
         if "CUDA out of memory" in str(exc) or "OutOfMemoryError" in str(exc):
