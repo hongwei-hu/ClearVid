@@ -1,6 +1,9 @@
 """Tests for Real-ESRGAN stream process startup."""
 from __future__ import annotations
 
+import io
+import queue
+
 import pytest
 import numpy as np
 import torch
@@ -73,6 +76,15 @@ def test_prepare_encoder_frame_converts_gray_to_bgr24() -> None:
     assert prepared.flags.c_contiguous is True
 
 
+def test_write_encoder_frame_writes_raw_bgr_bytes() -> None:
+    frame = np.arange(8 * 16 * 3, dtype=np.uint8).reshape((8, 16, 3))
+    sink = io.BytesIO()
+
+    realesrgan_runner._write_encoder_frame(sink, frame, output_width=16, output_height=8)
+
+    assert sink.getvalue() == frame.tobytes()
+
+
 class _FakeTrtModel:
     _engine = object()
     max_batch = 2
@@ -135,6 +147,52 @@ def test_enhance_frame_trt_tiled_pads_edge_tiles_to_batch() -> None:
     assert tile_stats["tile_batches"] == 1
     assert tile_stats["tile_batch_max"] == 2
     assert tile_stats["engine_max_batch"] == 2
+
+
+def test_enhance_frames_trt_tiled_batches_tiles_across_frames() -> None:
+    frames = [
+        np.full((8, 8, 3), 64, dtype=np.uint8),
+        np.full((8, 8, 3), 128, dtype=np.uint8),
+    ]
+    upsampler = _FakeUpsampler()
+    upsampler.model.max_batch = 4
+    tile_stats: dict[str, float] = {}
+
+    enhanced = realesrgan_runner._enhance_frames_trt_tiled(
+        frames, upsampler, outscale=2.0, tile_stats=tile_stats,
+    )
+
+    assert len(enhanced) == 2
+    assert [frame.shape for frame in enhanced] == [(16, 16, 3), (16, 16, 3)]
+    assert upsampler.model.batch_sizes == [4, 4]
+    assert tile_stats["tiles"] == 8
+    assert tile_stats["tile_batches"] == 2
+    assert tile_stats["tile_batch_max"] == 4
+
+
+def test_fetch_enhanced_frames_trt_batches_when_skipper_inactive() -> None:
+    raw_queue: queue.Queue[bytes | None] = queue.Queue()
+    for value in (64, 128, 192):
+        raw_queue.put(np.full((4, 4, 3), value, dtype=np.uint8).tobytes())
+    raw_queue.put(None)
+    upsampler = _FakeUpsampler()
+    tile_stats: dict[str, float] = {}
+
+    enhanced = realesrgan_runner._fetch_enhanced_frames(
+        raw_queue,
+        use_batching=False,
+        batch_size=4,
+        height=4,
+        width=4,
+        upsampler=upsampler,
+        outscale=2.0,
+        trt_tile_stats=tile_stats,
+    )
+
+    assert enhanced is not None
+    assert len(enhanced) == 2
+    assert upsampler.model.batch_sizes == [2]
+    assert tile_stats["tile_batch_max"] == 2
 
 
 def test_enhance_frame_trt_tiled_resizes_on_tensor_before_cpu() -> None:

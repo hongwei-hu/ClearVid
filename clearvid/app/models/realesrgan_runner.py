@@ -1016,32 +1016,36 @@ def _flush_trt_tile_batch(
     with torch.inference_mode():
         outputs = upsampler.model(tiles)
     if tile_stats is not None:
+        tile_items = float(tiles.shape[0])
         tile_stats["tile_batches"] = tile_stats.get("tile_batches", 0.0) + 1.0
-        tile_stats["tiles"] = tile_stats.get("tiles", 0.0) + float(len(pending))
+        tile_stats["tiles"] = tile_stats.get("tiles", 0.0) + tile_items
         tile_stats["tile_infer_ms"] = tile_stats.get("tile_infer_ms", 0.0) + (time.perf_counter() - t0) * 1000
-        tile_stats["tile_batch_max"] = max(tile_stats.get("tile_batch_max", 0.0), float(len(pending)))
-    for idx, (_, info) in enumerate(pending):
+        tile_stats["tile_batch_max"] = max(tile_stats.get("tile_batch_max", 0.0), tile_items)
+    output_offset = 0
+    for tile, info in pending:
         (
             output_start_x, output_end_x, output_start_y, output_end_y,
             output_start_x_tile, output_end_x_tile,
             output_start_y_tile, output_end_y_tile,
         ) = info
+        tile_batch = int(tile.shape[0])
         output[:, :, output_start_y:output_end_y, output_start_x:output_end_x] = outputs[
-            idx:idx + 1,
+            output_offset:output_offset + tile_batch,
             :,
             output_start_y_tile:output_end_y_tile,
             output_start_x_tile:output_end_x_tile,
         ]
+        output_offset += tile_batch
 
 
-def _trt_output_to_frame(
+def _trt_output_to_frames(
     output_tensor: object,
     upsampler: object,
     outscale: float,
     input_width: int,
     input_height: int,
     tile_stats: dict[str, float] | None = None,
-) -> np.ndarray:
+) -> list[np.ndarray]:
     t_post = time.perf_counter()
     upsampler.output = output_tensor
     result_tensor = upsampler.post_process().float().clamp_(0, 1)
@@ -1077,27 +1081,50 @@ def _trt_output_to_frame(
         tile_stats["trt_pack_ms"] = tile_stats.get("trt_pack_ms", 0.0) + (time.perf_counter() - t_pack) * 1000
 
     t_cpu = time.perf_counter()
-    output_frame = packed_tensor[0].cpu().numpy()
+    output_frames = packed_tensor.cpu().numpy()
     if tile_stats is not None:
         tile_stats["trt_cpu_ms"] = tile_stats.get("trt_cpu_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
-    return output_frame
+    return [np.ascontiguousarray(output_frames[i]) for i in range(output_frames.shape[0])]
 
 
-def _enhance_frame_trt_tiled(
-    frame: np.ndarray,
+def _trt_output_to_frame(
+    output_tensor: object,
+    upsampler: object,
+    outscale: float,
+    input_width: int,
+    input_height: int,
+    tile_stats: dict[str, float] | None = None,
+) -> np.ndarray:
+    return _trt_output_to_frames(
+        output_tensor, upsampler, outscale, input_width, input_height, tile_stats,
+    )[0]
+
+
+def _enhance_frames_trt_tiled(
+    frames: list[np.ndarray],
     upsampler: object,
     outscale: float,
     tile_stats: dict[str, float] | None = None,
-) -> np.ndarray:
-    """Enhance one frame by batching RealESRGAN tiles through TensorRT.
+) -> list[np.ndarray]:
+    """Enhance one or more frames by batching RealESRGAN tiles through TensorRT.
 
     The upstream RealESRGANer processes tiles one at a time.  With TensorRT this
-    underutilizes high-end GPUs, so this path groups same-size padded tiles into
-    batches up to the engine profile's max batch.
+    underutilizes high-end GPUs, so this path groups same-size padded tiles from
+    one or more frames into batches up to the engine profile's max batch.
     """
-    h_input, w_input = frame.shape[:2]
-    img = cv2.cvtColor(frame.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
-    upsampler.pre_process(img)
+    if not frames:
+        return []
+    h_input, w_input = frames[0].shape[:2]
+    preprocessed = []
+    for frame in frames:
+        if frame.shape[:2] != (h_input, w_input):
+            raise ValueError("TRT frame batch requires equal frame sizes")
+        img = cv2.cvtColor(frame.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
+        upsampler.pre_process(img)
+        preprocessed.append(upsampler.img)
+    import torch
+
+    upsampler.img = torch.cat(preprocessed, dim=0)
 
     batch, channel, height, width = upsampler.img.shape
     output = upsampler.img.new_zeros((batch, channel, height * upsampler.scale, width * upsampler.scale))
@@ -1113,6 +1140,7 @@ def _enhance_frame_trt_tiled(
 
     pending: list[_TrtPendingTile] = []
     pending_hw: tuple[int, int] | None = None
+    pending_items = 0
 
     for tile_y in range(tiles_y):
         for tile_x in range(tiles_x):
@@ -1133,10 +1161,14 @@ def _enhance_frame_trt_tiled(
             input_tile = upsampler.img[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
             input_tile = _pad_trt_tile_to_shape(input_tile, target_tile_h, target_tile_w)
             tile_hw = (int(input_tile.shape[2]), int(input_tile.shape[3]))
-            if pending_hw is not None and (tile_hw != pending_hw or len(pending) >= max_batch):
+            tile_items = int(input_tile.shape[0])
+            if pending_hw is not None and (
+                tile_hw != pending_hw or pending_items + tile_items > max_batch
+            ):
                 _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
                 pending = []
                 pending_hw = None
+                pending_items = 0
             pending_hw = tile_hw
 
             output_start_x = input_start_x * upsampler.scale
@@ -1156,9 +1188,19 @@ def _enhance_frame_trt_tiled(
                     output_start_y_tile, output_end_y_tile,
                 ),
             ))
+            pending_items += tile_items
     _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
 
-    return _trt_output_to_frame(output, upsampler, outscale, w_input, h_input, tile_stats)
+    return _trt_output_to_frames(output, upsampler, outscale, w_input, h_input, tile_stats)
+
+
+def _enhance_frame_trt_tiled(
+    frame: np.ndarray,
+    upsampler: object,
+    outscale: float,
+    tile_stats: dict[str, float] | None = None,
+) -> np.ndarray:
+    return _enhance_frames_trt_tiled([frame], upsampler, outscale, tile_stats=tile_stats)[0]
 
 
 def _fetch_enhanced_frames(
@@ -1179,6 +1221,19 @@ def _fetch_enhanced_frames(
             return None
         images = [np.frombuffer(r, dtype=np.uint8).reshape((height, width, 3)) for r in batch_raw]
         return _enhance_frames_batch(images, upsampler, outscale)
+
+    if (
+        not (skipper is not None and skipper.active)
+        and _is_trt_upsampler(upsampler)
+        and getattr(upsampler, "tile_size", 0) > 0
+        and batch_size > 1
+    ):
+        trt_frame_batch = min(batch_size, max(1, int(getattr(upsampler.model, "max_batch", 1))))
+        batch_raw = _collect_batch(raw_queue, trt_frame_batch)
+        if not batch_raw:
+            return None
+        images = [np.frombuffer(r, dtype=np.uint8).reshape((height, width, 3)) for r in batch_raw]
+        return _enhance_frames_trt_tiled(images, upsampler, outscale, tile_stats=trt_tile_stats)
 
     raw_frame = raw_queue.get()
     if raw_frame is None:
@@ -1218,6 +1273,16 @@ def _prepare_encoder_frame(frame: np.ndarray, output_width: int, output_height: 
     return np.ascontiguousarray(frame)
 
 
+def _write_encoder_frame(
+    encoder_stdin: object,
+    frame: np.ndarray,
+    output_width: int,
+    output_height: int,
+) -> None:
+    prepared = _prepare_encoder_frame(frame, output_width, output_height)
+    encoder_stdin.write(memoryview(prepared).cast("B"))
+
+
 def _write_enhanced_frames(
     enhanced_list: list[np.ndarray],
     codeformer_restorer: CodeFormerRestorer | GFPGANRestorer | None,
@@ -1242,7 +1307,7 @@ def _write_enhanced_frames(
         if sharpen_strength > 0:
             enhanced = apply_sharpening(enhanced, sharpen_strength)
         finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
-        encoder_stdin.write(_prepare_encoder_frame(finalized, output_width, output_height).tobytes())
+        _write_encoder_frame(encoder_stdin, finalized, output_width, output_height)
         count += 1
     return count
 
@@ -1262,7 +1327,7 @@ def _write_finalized_frames(
     count = 0
     for frame in finalized_list:
         resized = _resize_for_target(frame, output_width, output_height, target_profile)
-        encoder_stdin.write(_prepare_encoder_frame(resized, output_width, output_height).tobytes())
+        _write_encoder_frame(encoder_stdin, resized, output_width, output_height)
         count += 1
     return count
 
