@@ -100,6 +100,77 @@ def test_write_encoder_frame_writes_raw_bgr_bytes() -> None:
     assert sink.getvalue() == frame.tobytes()
 
 
+class _CountingSink:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.write_count = 0
+
+    def write(self, data) -> int:  # noqa: ANN001
+        self.write_count += 1
+        self.data.extend(data)
+        return len(data)
+
+
+def test_write_finalized_frames_writes_batch_in_one_pipe_call() -> None:
+    frames = np.arange(2 * 8 * 16 * 3, dtype=np.uint8).reshape((2, 8, 16, 3))
+    sink = _CountingSink()
+
+    count = realesrgan_runner._write_finalized_frames(
+        frames,
+        output_width=16,
+        output_height=8,
+        target_profile=realesrgan_runner.TargetProfile.SOURCE,
+        encoder_stdin=sink,
+    )
+
+    assert count == 2
+    assert sink.write_count == 1
+    assert bytes(sink.data) == frames.tobytes()
+
+
+def test_write_finalized_frames_list_avoids_extra_batch_copy() -> None:
+    frames = [
+        np.arange(8 * 16 * 3, dtype=np.uint8).reshape((8, 16, 3)),
+        np.full((8, 16, 3), 7, dtype=np.uint8),
+    ]
+    sink = _CountingSink()
+
+    count = realesrgan_runner._write_finalized_frames(
+        frames,
+        output_width=16,
+        output_height=8,
+        target_profile=realesrgan_runner.TargetProfile.SOURCE,
+        encoder_stdin=sink,
+    )
+
+    assert count == 2
+    assert sink.write_count == 2
+    assert bytes(sink.data) == b"".join(frame.tobytes() for frame in frames)
+
+
+def test_pack_trt_output_tensor_matches_original_bgr_rounding() -> None:
+    result = torch.tensor(
+        [[
+            [[0.0, 0.25], [0.5, 1.0]],
+            [[1.0, 0.5], [0.25, 0.0]],
+            [[0.1, 0.2], [0.3, 0.4]],
+        ]],
+        dtype=torch.float32,
+    )
+    expected = (
+        (result[:, [2, 1, 0], :, :] * 255.0)
+        .round()
+        .clamp_(0, 255)
+        .to(dtype=torch.uint8)
+        .permute(0, 2, 3, 1)
+        .contiguous()
+    )
+
+    packed = realesrgan_runner._pack_trt_output_tensor(result.clone())
+
+    assert torch.equal(packed, expected)
+
+
 class _FakeTrtModel:
     _engine = object()
     max_batch = 2

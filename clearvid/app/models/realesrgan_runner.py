@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -1020,6 +1021,35 @@ def _is_trt_upsampler(upsampler: object) -> bool:
 
 _TrtTileInfo = tuple[int, int, int, int, int, int, int, int]
 _TrtPendingTile = tuple[object, _TrtTileInfo]
+_FramePayload = list[np.ndarray] | np.ndarray
+
+
+@dataclass
+class _PendingTrtFrameBatch:
+    cpu_tensor: object
+    gpu_tensor: object | None
+    event: object | None
+    tile_stats: dict[str, float] | None = None
+
+    def resolve(self) -> np.ndarray:
+        t_cpu = time.perf_counter()
+        if self.event is not None:
+            self.event.synchronize()
+        if self.tile_stats is not None:
+            self.tile_stats["trt_cpu_ms"] = self.tile_stats.get("trt_cpu_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
+        output_frames = self.cpu_tensor.numpy()
+        self.gpu_tensor = None
+        return np.ascontiguousarray(output_frames)
+
+
+def _resolve_frame_payload(payload: _FramePayload | _PendingTrtFrameBatch) -> _FramePayload:
+    if isinstance(payload, _PendingTrtFrameBatch):
+        return payload.resolve()
+    return payload
+
+
+def _frame_payload_count(payload: _FramePayload) -> int:
+    return int(payload.shape[0]) if isinstance(payload, np.ndarray) and payload.ndim == 4 else len(payload)
 
 
 def _pad_trt_tile_to_shape(tile: object, target_h: int, target_w: int) -> object:
@@ -1076,7 +1106,9 @@ def _trt_output_to_frames(
     input_width: int,
     input_height: int,
     tile_stats: dict[str, float] | None = None,
-) -> list[np.ndarray]:
+    *,
+    async_cpu_transfer: bool = False,
+) -> _FramePayload | _PendingTrtFrameBatch:
     t_post = time.perf_counter()
     upsampler.output = output_tensor
     result_tensor = upsampler.post_process().float().clamp_(0, 1)
@@ -1097,25 +1129,73 @@ def _trt_output_to_frames(
         if tile_stats is not None:
             tile_stats["trt_resize_ms"] = tile_stats.get("trt_resize_ms", 0.0) + (time.perf_counter() - t_resize) * 1000
 
+    packed_tensor = _pack_trt_output_tensor(result_tensor, tile_stats)
+    return _copy_trt_frames_to_cpu(packed_tensor, tile_stats, async_cpu_transfer=async_cpu_transfer)
+
+
+def _pack_trt_output_tensor(result_tensor: object, tile_stats: dict[str, float] | None = None) -> object:
     import torch
 
     t_pack = time.perf_counter()
-    packed_tensor = (
-        (result_tensor[:, [2, 1, 0], :, :] * 255.0)
-        .round()
-        .clamp_(0, 255)
-        .to(dtype=torch.uint8)
-        .permute(0, 2, 3, 1)
-        .contiguous()
+    scaled_tensor = result_tensor.mul(255.0).round_().clamp_(0, 255).to(dtype=torch.uint8)
+    batch, _, height, width = scaled_tensor.shape
+    packed_tensor = torch.empty(
+        (batch, height, width, 3),
+        dtype=torch.uint8,
+        device=scaled_tensor.device,
     )
+    packed_tensor[..., 0].copy_(scaled_tensor[:, 2, :, :])
+    packed_tensor[..., 1].copy_(scaled_tensor[:, 1, :, :])
+    packed_tensor[..., 2].copy_(scaled_tensor[:, 0, :, :])
     if tile_stats is not None:
         tile_stats["trt_pack_ms"] = tile_stats.get("trt_pack_ms", 0.0) + (time.perf_counter() - t_pack) * 1000
+    return packed_tensor
 
+
+def _copy_trt_frames_to_cpu(
+    packed_tensor: object,
+    tile_stats: dict[str, float] | None = None,
+    *,
+    async_cpu_transfer: bool = False,
+) -> np.ndarray | _PendingTrtFrameBatch:
     t_cpu = time.perf_counter()
+    if async_cpu_transfer:
+        pending = _try_async_trt_cpu_transfer(packed_tensor, tile_stats)
+        if pending is not None:
+            if tile_stats is not None:
+                tile_stats["trt_cpu_schedule_ms"] = tile_stats.get("trt_cpu_schedule_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
+            return pending
+
     output_frames = packed_tensor.cpu().numpy()
     if tile_stats is not None:
         tile_stats["trt_cpu_ms"] = tile_stats.get("trt_cpu_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
-    return [np.ascontiguousarray(output_frames[i]) for i in range(output_frames.shape[0])]
+    return np.ascontiguousarray(output_frames)
+
+
+def _try_async_trt_cpu_transfer(
+    packed_tensor: object,
+    tile_stats: dict[str, float] | None,
+) -> _PendingTrtFrameBatch | None:
+    try:
+        import torch
+
+        if not getattr(packed_tensor, "is_cuda", False) or not torch.cuda.is_available():
+            return None
+        copy_stream = torch.cuda.Stream(device=packed_tensor.device)
+        cpu_tensor = torch.empty(
+            tuple(packed_tensor.shape),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        copy_stream.wait_stream(torch.cuda.current_stream(packed_tensor.device))
+        with torch.cuda.stream(copy_stream):
+            cpu_tensor.copy_(packed_tensor, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(copy_stream)
+        return _PendingTrtFrameBatch(cpu_tensor=cpu_tensor, gpu_tensor=packed_tensor, event=event, tile_stats=tile_stats)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _trt_output_to_frame(
@@ -1126,9 +1206,10 @@ def _trt_output_to_frame(
     input_height: int,
     tile_stats: dict[str, float] | None = None,
 ) -> np.ndarray:
-    return _trt_output_to_frames(
+    frames = _resolve_frame_payload(_trt_output_to_frames(
         output_tensor, upsampler, outscale, input_width, input_height, tile_stats,
-    )[0]
+    ))
+    return np.ascontiguousarray(frames[0])
 
 
 def _enhance_frames_trt_tiled(
@@ -1136,7 +1217,9 @@ def _enhance_frames_trt_tiled(
     upsampler: object,
     outscale: float,
     tile_stats: dict[str, float] | None = None,
-) -> list[np.ndarray]:
+    *,
+    async_cpu_transfer: bool = False,
+) -> _FramePayload | _PendingTrtFrameBatch:
     """Enhance one or more frames by batching RealESRGAN tiles through TensorRT.
 
     The upstream RealESRGANer processes tiles one at a time.  With TensorRT this
@@ -1222,7 +1305,10 @@ def _enhance_frames_trt_tiled(
             pending_items += tile_items
     _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
 
-    return _trt_output_to_frames(output, upsampler, outscale, w_input, h_input, tile_stats)
+    return _trt_output_to_frames(
+        output, upsampler, outscale, w_input, h_input, tile_stats,
+        async_cpu_transfer=async_cpu_transfer,
+    )
 
 
 def _enhance_frame_trt_tiled(
@@ -1231,7 +1317,8 @@ def _enhance_frame_trt_tiled(
     outscale: float,
     tile_stats: dict[str, float] | None = None,
 ) -> np.ndarray:
-    return _enhance_frames_trt_tiled([frame], upsampler, outscale, tile_stats=tile_stats)[0]
+    frames = _resolve_frame_payload(_enhance_frames_trt_tiled([frame], upsampler, outscale, tile_stats=tile_stats))
+    return np.ascontiguousarray(frames[0])
 
 
 def _fetch_enhanced_frames(
@@ -1244,7 +1331,8 @@ def _fetch_enhanced_frames(
     outscale: float,
     skipper: FrameSkipper | None = None,
     trt_tile_stats: dict[str, float] | None = None,
-) -> list[np.ndarray] | None:
+    async_cpu_transfer: bool = False,
+) -> _FramePayload | _PendingTrtFrameBatch | None:
     """Fetch and enhance the next frame(s). Returns None at end of stream."""
     if use_batching:
         batch_raw = _collect_batch(raw_queue, batch_size)
@@ -1264,7 +1352,11 @@ def _fetch_enhanced_frames(
         if not batch_raw:
             return None
         images = [np.frombuffer(r, dtype=np.uint8).reshape((height, width, 3)) for r in batch_raw]
-        return _enhance_frames_trt_tiled(images, upsampler, outscale, tile_stats=trt_tile_stats)
+        return _enhance_frames_trt_tiled(
+            images, upsampler, outscale,
+            tile_stats=trt_tile_stats,
+            async_cpu_transfer=async_cpu_transfer,
+        )
 
     raw_frame = raw_queue.get()
     if raw_frame is None:
@@ -1314,6 +1406,57 @@ def _write_encoder_frame(
     encoder_stdin.write(memoryview(prepared).cast("B"))
 
 
+def _iter_frame_payload(frames: _FramePayload):
+    if isinstance(frames, np.ndarray) and frames.ndim == 4:
+        for index in range(frames.shape[0]):
+            yield frames[index]
+        return
+    yield from frames
+
+
+def _prepare_encoder_frame_batch(
+    frames: _FramePayload,
+    output_width: int,
+    output_height: int,
+    target_profile: TargetProfile,
+) -> np.ndarray:
+    if (
+        isinstance(frames, np.ndarray)
+        and frames.ndim == 4
+        and frames.dtype == np.uint8
+        and frames.shape[1:] == (output_height, output_width, 3)
+        and frames.flags.c_contiguous
+    ):
+        return frames
+
+    count = _frame_payload_count(frames)
+    prepared_batch = np.empty((count, output_height, output_width, 3), dtype=np.uint8)
+    for index, frame in enumerate(_iter_frame_payload(frames)):
+        resized = _resize_for_target(frame, output_width, output_height, target_profile)
+        prepared_batch[index] = _prepare_encoder_frame(resized, output_width, output_height)
+    return prepared_batch
+
+
+def _write_encoder_frame_batch(
+    encoder_stdin: object,
+    frames: _FramePayload,
+    output_width: int,
+    output_height: int,
+    target_profile: TargetProfile,
+) -> int:
+    if isinstance(frames, np.ndarray) and frames.ndim == 4:
+        prepared_batch = _prepare_encoder_frame_batch(frames, output_width, output_height, target_profile)
+        encoder_stdin.write(memoryview(prepared_batch).cast("B"))
+        return int(prepared_batch.shape[0])
+
+    count = 0
+    for frame in frames:
+        resized = _resize_for_target(frame, output_width, output_height, target_profile)
+        _write_encoder_frame(encoder_stdin, resized, output_width, output_height)
+        count += 1
+    return count
+
+
 def _write_enhanced_frames(
     enhanced_list: list[np.ndarray],
     codeformer_restorer: CodeFormerRestorer | GFPGANRestorer | None,
@@ -1329,7 +1472,7 @@ def _write_enhanced_frames(
     Used by the synchronous pipeline path.  The async pipeline uses
     ``_write_finalized_frames`` instead (GPU work done in Stage 2).
     """
-    count = 0
+    finalized_list: list[np.ndarray] = []
     for enhanced in enhanced_list:
         if codeformer_restorer is not None:
             enhanced = codeformer_restorer.restore_faces(enhanced)
@@ -1337,14 +1480,14 @@ def _write_enhanced_frames(
             enhanced = stabilizer.stabilize(enhanced)
         if sharpen_strength > 0:
             enhanced = apply_sharpening(enhanced, sharpen_strength)
-        finalized = _resize_for_target(enhanced, output_width, output_height, target_profile)
-        _write_encoder_frame(encoder_stdin, finalized, output_width, output_height)
-        count += 1
-    return count
+        finalized_list.append(enhanced)
+    return _write_encoder_frame_batch(
+        encoder_stdin, finalized_list, output_width, output_height, target_profile,
+    )
 
 
 def _write_finalized_frames(
-    finalized_list: list[np.ndarray],
+    finalized_list: _FramePayload,
     output_width: int,
     output_height: int,
     target_profile: TargetProfile,
@@ -1355,12 +1498,30 @@ def _write_finalized_frames(
     Used by the async pipeline Stage 3 — all GPU-heavy work (face restore,
     temporal stabilize, sharpen) has already been done in Stage 2.
     """
-    count = 0
-    for frame in finalized_list:
-        resized = _resize_for_target(frame, output_width, output_height, target_profile)
-        _write_encoder_frame(encoder_stdin, resized, output_width, output_height)
-        count += 1
-    return count
+    return _write_encoder_frame_batch(
+        encoder_stdin, finalized_list, output_width, output_height, target_profile,
+    )
+
+
+def _record_and_queue_enhanced_payload(
+    payload: _FramePayload | _PendingTrtFrameBatch,
+    elapsed_ms: float,
+    enhanced_queue: queue.Queue,
+    safe_put: Callable[[queue.Queue, object], bool],
+    diag_infer_ms: list[float],
+    diag_batches: list[int],
+    diag_frames: list[int],
+    diag_batch_sizes: list[int],
+) -> bool:
+    enhanced_payload = _resolve_frame_payload(payload)
+    n = _frame_payload_count(enhanced_payload)
+    diag_infer_ms[0] += elapsed_ms
+    diag_batches[0] += 1
+    diag_frames[0] += n
+    if len(diag_batch_sizes) >= 100:
+        diag_batch_sizes.pop(0)
+    diag_batch_sizes.append(n)
+    return safe_put(enhanced_queue, enhanced_payload)
 
 
 def _process_stream_frames(
@@ -1532,10 +1693,10 @@ def _process_frames_async(
         # depth of 4 still gives the async stages enough room to overlap.
         _enhanced_item_bytes = output_width * output_height * 3 * max(1, config.batch_size)
         _eq_depth = max(4, min(16, 128 * 1024 * 1024 // max(_enhanced_item_bytes, 1)))
-        enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+        enhanced_queue: queue.Queue[_FramePayload | None] = queue.Queue(
             maxsize=_eq_depth,
         )
-        finalized_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
+        finalized_queue: queue.Queue[_FramePayload | None] = queue.Queue(
             maxsize=_eq_depth,
         )
     else:
@@ -1568,29 +1729,37 @@ def _process_frames_async(
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
 
     def _enhance_loop() -> None:
+        pending_payload: _FramePayload | _PendingTrtFrameBatch | None = None
+        pending_elapsed_ms = 0.0
         try:
             while not abort.is_set():
                 if control is not None:
                     control.check()
                 t_wait = time.perf_counter()
-                enhanced_list = _fetch_enhanced_frames(
+                enhanced_payload = _fetch_enhanced_frames(
                     raw_queue, use_batching, config.batch_size,
                     metadata.height, metadata.width, upsampler, outscale,
                     skipper=skipper,
                     trt_tile_stats=_diag_trt_tile_stats,
+                    async_cpu_transfer=True,
                 )
                 t_done = time.perf_counter()
-                if enhanced_list is None:
+                if enhanced_payload is None:
                     break
-                n = len(enhanced_list)
-                _diag_enhance_infer_ms[0] += (t_done - t_wait) * 1000
-                _diag_enhance_batches[0] += 1
-                _diag_enhance_frames[0] += n
-                if len(_diag_batch_sizes) >= 100:
-                    _diag_batch_sizes.pop(0)
-                _diag_batch_sizes.append(n)
-                if not _safe_put(enhanced_queue, enhanced_list):
+                if pending_payload is not None and not _record_and_queue_enhanced_payload(
+                    pending_payload, pending_elapsed_ms, enhanced_queue, _safe_put,
+                    _diag_enhance_infer_ms, _diag_enhance_batches,
+                    _diag_enhance_frames, _diag_batch_sizes,
+                ):
                     break
+                pending_payload = enhanced_payload
+                pending_elapsed_ms = (t_done - t_wait) * 1000
+            if pending_payload is not None:
+                _record_and_queue_enhanced_payload(
+                    pending_payload, pending_elapsed_ms, enhanced_queue, _safe_put,
+                    _diag_enhance_infer_ms, _diag_enhance_batches,
+                    _diag_enhance_frames, _diag_batch_sizes,
+                )
         except ExportCancelled:
             abort.set()
         except Exception as exc:  # noqa: BLE001
