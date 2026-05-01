@@ -386,10 +386,10 @@ class ExportPanel(QWidget):
         lay = sec.content_layout
 
         self.preprocess_denoise = QCheckBox("智能降噪")
-        self.preprocess_denoise.setChecked(True)
+        self.preprocess_denoise.setChecked(False)  # default off; auto-enabled by recommend()
         self.preprocess_denoise.setToolTip(TOOLTIPS["denoise"])
         lay.addWidget(self.preprocess_denoise)
-        lay.addWidget(_hint("去除噪点颗粒，对低码率视频效果明显"))
+        lay.addWidget(_hint("去除噪点颗粒，对低码率视频效果明显（会降低解码吞吐，建议由『一键最佳』自动判断）"))
 
         self.preprocess_deblock = QCheckBox("去块效应")
         self.preprocess_deblock.setChecked(True)
@@ -497,6 +497,7 @@ class ExportPanel(QWidget):
 
         self._trt_deploying = False
         self._trt_warmup_worker = None
+        self._is_exporting = False  # set by MainWindow via set_exporting_state()
 
         self.trt_deploy_btn.clicked.connect(self._start_trt_deploy)
 
@@ -755,6 +756,40 @@ class ExportPanel(QWidget):
     def _start_trt_deploy(self) -> None:
         """Launch background TensorRT engine deployment."""
         from clearvid.app.gui.workers import TrtWarmupWorker
+        from PySide6.QtWidgets import QMessageBox
+
+        # Guard: refuse if export is in progress
+        if getattr(self, "_is_exporting", False):
+            QMessageBox.warning(
+                self,
+                "正在导出中",
+                "当前正在进行视频导出，GPU 显存已被占用。\n"
+                "请等待导出完成后再部署 TensorRT 引擎，\n"
+                "否则两个任务同时抢占显存会导致 OOM 崩溃。",
+            )
+            return
+
+        # Guard: VRAM check — warn if less than 6 GB free
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+                free_mb = free_bytes // (1024 * 1024)
+                total_mb = total_bytes // (1024 * 1024)
+                if free_mb < 6144:
+                    reply = QMessageBox.warning(
+                        self,
+                        "可用显存不足",
+                        f"GPU 当前剩余显存仅 {free_mb / 1024:.1f} GB / {total_mb / 1024:.0f} GB。\n"
+                        "TensorRT 引擎构建通常需要 6 GB 以上空闲显存。\n\n"
+                        "建议先关闭其他占用 GPU 的程序后再部署。\n\n继续强制部署？",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+        except Exception:  # noqa: BLE001
+            pass
 
         # Gather current config parameters
         model_key = coerce_enum(
@@ -895,9 +930,22 @@ class ExportPanel(QWidget):
         self.export_btn.setEnabled(enabled)
 
     def set_exporting_state(self, active: bool) -> None:
-        """Show/hide pause and cancel buttons based on export state."""
+        """Show/hide pause and cancel buttons based on export state.
+
+        Also disables the TRT deploy button while an export is running to
+        prevent VRAM exhaustion from two concurrent GPU-heavy tasks.
+        """
+        self._is_exporting = active
         self._pause_btn.setVisible(active)
         self._cancel_btn.setVisible(active)
+        # Disable TRT deploy during export to prevent OOM
+        if hasattr(self, "trt_deploy_btn"):
+            if active:
+                self.trt_deploy_btn.setEnabled(False)
+                self.trt_deploy_btn.setToolTip("正在导出中，请等待导出完成后再部署 TensorRT 引擎")
+            elif not self._trt_deploying:
+                self.trt_deploy_btn.setEnabled(True)
+                self.trt_deploy_btn.setToolTip("")
         if not active:
             self._is_paused = False
             self._pause_btn.setText("⏸ 暂停")

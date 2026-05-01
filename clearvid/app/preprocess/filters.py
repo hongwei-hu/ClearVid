@@ -98,14 +98,16 @@ def _deblock_filter(
 def _colorspace_filter(config: EnhancementConfig) -> list[str]:
     """Normalize color matrix to BT.709 for consistent model input.
 
-    Uses ``iall=auto`` so FFmpeg reads the declared colorspace from the
-    stream metadata.  Hardcoding ``iall=bt601-6-625`` caused visible colour
-    shifts on NTSC, BT.709, and HDR sources.
+    Omits ``iall`` so FFmpeg reads the declared colorspace from stream
+    metadata automatically.  When input is already BT.709, ``fast=1``
+    makes the filter a no-op.  Hardcoding ``iall=bt601-6-625`` caused
+    visible colour shifts on NTSC, BT.709, and HDR sources.
     """
     if not config.preprocess_colorspace_normalize:
         return []
-    # iall=auto: let FFmpeg detect input colorspace from stream metadata
-    return ["colorspace=all=bt709:iall=auto:fast=1"]
+    # No iall: FFmpeg reads input colorspace from stream metadata.
+    # fast=1: skip conversion when input == output (BT.709 sources).
+    return ["colorspace=all=bt709:fast=1"]
 
 
 # ---------------------------------------------------------------------------

@@ -403,6 +403,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少路径", "请设置输入视频路径和输出文件路径。")
             return
 
+        # Guard: refuse if TRT deploy is in progress
+        if getattr(self._export_panel, "_trt_deploying", False):
+            QMessageBox.warning(
+                self,
+                "TensorRT 部署中",
+                "当前正在部署 TensorRT 引擎，GPU 显存已被占用。\n"
+                "请等待部署完成（进度条达到 100%）后再开始导出，\n"
+                "否则两个任务同时抢占显存会导致 OOM 崩溃。",
+            )
+            return
+
         # Safety checks
         if not check_overwrite(output_path, self):
             return
