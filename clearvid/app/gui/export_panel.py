@@ -601,6 +601,7 @@ class ExportPanel(QWidget):
         bottom.addWidget(self._action_stack)
 
         self._is_paused = False
+        self._is_cancelling = False
 
         # Mid-export preview button (hidden until preview is available)
         self._preview_progress_btn = QPushButton("👁 预览已完成部分")
@@ -1017,6 +1018,10 @@ class ExportPanel(QWidget):
         """
         self._is_exporting = active
         self._action_stack.setCurrentIndex(1 if active else 0)
+        self._is_cancelling = False
+        self._cancel_btn.setEnabled(True)
+        self._pause_btn.setEnabled(True)
+        self._cancel_btn.setText("⏹ 取消")
         # Disable TRT deploy during export to prevent OOM
         if hasattr(self, "trt_deploy_btn"):
             if active:
@@ -1034,6 +1039,15 @@ class ExportPanel(QWidget):
         self._is_paused = paused
         self._pause_btn.setText("▶ 继续" if paused else "⏸ 暂停")
 
+    def set_cancel_pending(self) -> None:
+        """Mark export as cancelling to avoid repeated cancel/pause clicks."""
+        if not self._is_exporting or self._is_cancelling:
+            return
+        self._is_cancelling = True
+        self._pause_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("⏳ 取消中")
+
     def set_runtime_eta(self, seconds_remaining: float | None) -> None:
         if seconds_remaining is None:
             self.estimation_label.setVisible(False)
@@ -1042,7 +1056,9 @@ class ExportPanel(QWidget):
         total_seconds = max(0, int(round(seconds_remaining)))
         mins, secs = divmod(total_seconds, 60)
         hours, mins = divmod(mins, 60)
-        if hours > 0:
+        if total_seconds == 0:
+            text = "即将完成"
+        elif hours > 0:
             text = f"预计剩余 {hours}小时{mins}分"
         elif mins > 0:
             text = f"预计剩余 {mins}分{secs}秒"

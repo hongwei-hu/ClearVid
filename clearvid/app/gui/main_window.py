@@ -74,6 +74,8 @@ class MainWindow(QMainWindow):
         self._eta_samples: int = 0
         self._eta_pause_started: float = 0.0
         self._eta_paused_total: float = 0.0
+        self._single_job_terminal_emitted: bool = False
+        self._cancel_request_logged: bool = False
 
         # Debounce timer for auto-preview refresh (#19)
         self._preview_debounce = QTimer(self)
@@ -448,11 +450,14 @@ class MainWindow(QMainWindow):
 
         self._export_control = ExportControl()
         self._worker = Worker(config, control=self._export_control)
+        self._single_job_terminal_emitted = False
+        self._cancel_request_logged = False
         self._worker.progress.connect(self._on_progress)
         self._worker.completed.connect(self._on_completed)
         self._worker.failed.connect(self._on_failed)
         self._worker.cancelled.connect(self._on_cancelled)
         self._worker.preview_ready.connect(self._on_preview_ready)
+        self._worker.finished.connect(self._on_worker_finished)
         self._export_panel.set_exporting_state(True)
         self._worker.start()
 
@@ -464,6 +469,7 @@ class MainWindow(QMainWindow):
             self._last_progress_message = message
 
     def _on_completed(self, payload: str) -> None:
+        self._single_job_terminal_emitted = True
         elapsed = time.monotonic() - self._export_start_time
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_exporting_state(False)
@@ -483,6 +489,7 @@ class MainWindow(QMainWindow):
         ))
 
     def _on_failed(self, message: str) -> None:
+        self._single_job_terminal_emitted = True
         elapsed = time.monotonic() - self._export_start_time
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_exporting_state(False)
@@ -499,12 +506,24 @@ class MainWindow(QMainWindow):
         ))
 
     def _on_cancelled(self) -> None:
+        self._single_job_terminal_emitted = True
         self._export_panel.set_export_enabled(True)
         self._export_panel.set_exporting_state(False)
         self._export_panel.set_runtime_eta(None)
         self._export_panel.set_pause_state(False)
         self._export_panel.set_progress(0, "导出已取消")
         self._log_message("导出已被用户取消")
+
+    def _on_worker_finished(self) -> None:
+        """Fallback cleanup: ensure UI resets even if terminal signals are missed."""
+        if not self._single_job_terminal_emitted and getattr(self, "_export_control", None) is not None:
+            if self._export_control.is_cancelled:
+                self._on_cancelled()
+            else:
+                self._on_failed("任务意外结束，请检查日志")
+        self._worker = None
+        self._export_control = None
+        self._cancel_request_logged = False
 
     def _on_preview_ready(self, preview_path: str) -> None:
         self._export_panel.update_preview_progress(preview_path)
@@ -833,11 +852,14 @@ class MainWindow(QMainWindow):
             self._queue_worker.cancel()
             self._log_message("队列取消中…")
         elif self._worker and self._worker.isRunning():
+            self._export_panel.set_cancel_pending()
             if hasattr(self, '_export_control') and self._export_control is not None:
                 self._export_control.cancel()
             else:
                 self._worker.requestInterruption()
-            self._log_message("任务取消中…")
+            if not self._cancel_request_logged:
+                self._log_message("任务取消中…")
+                self._cancel_request_logged = True
         elif self._preview_worker and self._preview_worker.isRunning():
             self._preview_worker.requestInterruption()
             self._log_message("预览取消中…")
@@ -895,6 +917,8 @@ class MainWindow(QMainWindow):
         self._eta_last_time = now
 
         if self._eta_samples < 3 or percent < 5 or self._eta_ema_speed <= 1e-6:
+            # 冷启动阶段: 确保标签保持隐藏，避免残留旧值显示
+            self._export_panel.set_runtime_eta(None)
             return
 
         remaining_percent = max(0.0, 100.0 - percent)

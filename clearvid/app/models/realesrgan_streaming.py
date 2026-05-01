@@ -909,6 +909,27 @@ def _process_stream_frames(
     )
 
     abort = threading.Event()
+    cancel_triggered = [False]
+
+    def _cancel_watch_loop() -> None:
+        if control is None:
+            return
+        while not abort.is_set():
+            if control.is_cancelled:
+                cancel_triggered[0] = True
+                abort.set()
+                # Force-stop ffmpeg processes to unblock pipe read/write quickly.
+                _cleanup_stream_processes(decoder, encoder)
+                return
+            time.sleep(0.05)
+
+    cancel_watcher = threading.Thread(
+        target=_cancel_watch_loop,
+        daemon=True,
+        name="cancel-watcher",
+    )
+    cancel_watcher.start()
+
     raw_queue, decode_errors, reader = _start_decode_thread(decoder.stdout, frame_size, abort)
 
     if config.async_pipeline:
@@ -937,6 +958,9 @@ def _process_stream_frames(
         )
 
     reader.join()
+    cancel_watcher.join(timeout=0.2)
+    if cancel_triggered[0] or (control is not None and control.is_cancelled):
+        raise ExportCancelled("导出已被用户取消")
     if decode_errors:
         raise decode_errors[0]
 
@@ -1264,6 +1288,8 @@ def _process_frames_async(
     start_time = time.perf_counter()
     last_diag_time = start_time
     diag_interval = 10.0
+    diag_initial_interval = 3.0   # 前几次报告缩短到 3s，便于短时运行也能采集到数据
+    diag_count = 0                # 已发送的诊断报告次数
     while monitor_thread.is_alive():
         monitor_thread.join(timeout=0.5)
         current_written = frames_written[0]
@@ -1275,7 +1301,8 @@ def _process_frames_async(
         if preview_mux_trigger and current_written - last_preview_at >= preview_interval_frames:
             last_preview_at = current_written
             preview_mux_trigger(current_written)
-        if now - last_diag_time >= diag_interval and progress_callback:
+        effective_interval = diag_initial_interval if diag_count < 3 else diag_interval
+        if now - last_diag_time >= effective_interval and progress_callback:
             last_diag_time = now
             cpu_pct = cpu_tracker.sample_percent(now)
             rq = raw_queue.qsize()
@@ -1304,11 +1331,20 @@ def _process_frames_async(
                 f"[诊断] {queue_info} | 增强 {enh_fps:.1f}fps 写入 {wr_fps:.1f}fps"
                 f" | 平均帧batch={avg_batch:.1f}{trt_info}{infer_info}{pp_info} CPU={cpu_pct:.0f}%{gpu_info}",
             )
+            diag_count += 1
+
+        if control is not None and control.is_cancelled:
+            abort.set()
+            break
 
     _report_stream_progress(
         frames_written[0], total_frames, last_reported_progress,
         progress_callback, start_time=start_time,
     )
+
+    if control is not None and control.is_cancelled:
+        abort.set()
+        raise ExportCancelled("导出已被用户取消")
 
     gpu_sampler.stop()
     gpu_summary = gpu_sampler.summary()
@@ -1425,6 +1461,9 @@ def _process_frames_async(
     for thread in (enhance_thread, postprocess_thread, write_thread):
         if thread is not None:
             thread.join(timeout=10.0)
+
+    if control is not None and control.is_cancelled:
+        raise ExportCancelled("导出已被用户取消")
 
     if enhance_errors:
         raise enhance_errors[0]
