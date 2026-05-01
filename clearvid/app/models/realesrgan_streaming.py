@@ -132,12 +132,17 @@ def _enhance_frames_batch(
 ) -> list[np.ndarray]:
     import torch
 
-    tensors = []
-    for frame in frames:
-        img = frame[:, :, ::-1].astype(np.float32) * (1.0 / 255.0)
-        tensors.append(torch.from_numpy(np.ascontiguousarray(img).transpose(2, 0, 1)))
+    frame_count = len(frames)
+    if frame_count == 0:
+        return []
+    height, width = frames[0].shape[:2]
+    batch_np = np.empty((frame_count, 3, height, width), dtype=np.float32)
+    for index, frame in enumerate(frames):
+        # Keep per-frame layout conversion in NumPy, then transfer as one tensor.
+        batch_np[index] = frame[:, :, ::-1].transpose(2, 0, 1)
+    batch_np *= (1.0 / 255.0)
 
-    batch = torch.stack(tensors)
+    batch = torch.from_numpy(batch_np)
     if upsampler.half:
         batch = batch.half()
     batch = batch.to(upsampler.device, non_blocking=True)
@@ -370,20 +375,37 @@ def _enhance_frames_trt_tiled(
 ) -> _FramePayload | _PendingTrtFrameBatch:
     if not frames:
         return []
+    frame_count = len(frames)
     h_input, w_input = frames[0].shape[:2]
+    preprocess = upsampler.pre_process
     t_prep = time.perf_counter()
-    preprocessed = []
-    for frame in frames:
+    first = frames[0]
+    first_img = cv2.cvtColor(first.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
+    preprocess(first_img)
+    first_tensor = upsampler.img
+
+    import torch
+
+    batch_img = first_tensor.new_empty((
+        frame_count,
+        int(first_tensor.shape[1]),
+        int(first_tensor.shape[2]),
+        int(first_tensor.shape[3]),
+    ))
+    batch_img[0:1].copy_(first_tensor)
+
+    for index in range(1, frame_count):
+        frame = frames[index]
         if frame.shape[:2] != (h_input, w_input):
             raise ValueError("TRT frame batch requires equal frame sizes")
         img = cv2.cvtColor(frame.astype(np.float32) * (1.0 / 255.0), cv2.COLOR_BGR2RGB)
-        upsampler.pre_process(img)
-        preprocessed.append(upsampler.img)
-    import torch
+        preprocess(img)
+        batch_img[index:index + 1].copy_(upsampler.img)
 
-    upsampler.img = torch.cat(preprocessed, dim=0)
+    upsampler.img = batch_img
     if tile_stats is not None:
-        tile_stats["trt_preprocess_ms"] = tile_stats.get("trt_preprocess_ms", 0.0) + (time.perf_counter() - t_prep) * 1000
+        prep_elapsed_ms = (time.perf_counter() - t_prep) * 1000
+        tile_stats["trt_preprocess_ms"] = tile_stats.get("trt_preprocess_ms", 0.0) + prep_elapsed_ms
 
     batch, channel, height, width = upsampler.img.shape
     output = upsampler.img.new_zeros((batch, channel, height * upsampler.scale, width * upsampler.scale))
