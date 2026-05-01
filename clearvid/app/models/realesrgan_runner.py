@@ -1204,12 +1204,25 @@ def _trt_output_to_frame(
         if tile_stats is not None:
             tile_stats["trt_resize_ms"] = tile_stats.get("trt_resize_ms", 0.0) + (time.perf_counter() - t_resize) * 1000
 
+    import torch
+
+    t_pack = time.perf_counter()
+    packed_tensor = (
+        (result_tensor[:, [2, 1, 0], :, :] * 255.0)
+        .round()
+        .clamp_(0, 255)
+        .to(dtype=torch.uint8)
+        .permute(0, 2, 3, 1)
+        .contiguous()
+    )
+    if tile_stats is not None:
+        tile_stats["trt_pack_ms"] = tile_stats.get("trt_pack_ms", 0.0) + (time.perf_counter() - t_pack) * 1000
+
     t_cpu = time.perf_counter()
-    output_img = result_tensor[0].cpu().numpy()
+    output_frame = packed_tensor[0].cpu().numpy()
     if tile_stats is not None:
         tile_stats["trt_cpu_ms"] = tile_stats.get("trt_cpu_ms", 0.0) + (time.perf_counter() - t_cpu) * 1000
-    output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
-    return (output_img * 255.0).round().astype(np.uint8)
+    return output_frame
 
 
 def _enhance_frame_trt_tiled(
@@ -1835,6 +1848,7 @@ def _process_frames_async(
         trt_engine_max_batch = _diag_trt_tile_stats.get("engine_max_batch", 0.0)
         trt_post_ms = _diag_trt_tile_stats.get("trt_post_ms", 0.0)
         trt_resize_ms = _diag_trt_tile_stats.get("trt_resize_ms", 0.0)
+        trt_pack_ms = _diag_trt_tile_stats.get("trt_pack_ms", 0.0)
         trt_cpu_ms = _diag_trt_tile_stats.get("trt_cpu_ms", 0.0)
         trt_avg_tile_batch = trt_tiles / trt_tile_batches if trt_tile_batches > 0 else 0.0
         trt_tile_ms_per_batch = trt_tile_ms / trt_tile_batches if trt_tile_batches > 0 else 0.0
@@ -1842,6 +1856,20 @@ def _process_frames_async(
 
         # Stage throughput breakdown (ms/frame)
         infer_per_frame = avg_infer_ms / max(avg_batch, 1)
+        trt_kernel_ms_per_frame = trt_tile_ms / trt_frames
+        trt_post_ms_per_frame = trt_post_ms / trt_frames
+        trt_resize_ms_per_frame = trt_resize_ms / trt_frames
+        trt_pack_ms_per_frame = trt_pack_ms / trt_frames
+        trt_cpu_ms_per_frame = trt_cpu_ms / trt_frames
+        trt_other_ms_per_frame = max(
+            0.0,
+            infer_per_frame
+            - trt_kernel_ms_per_frame
+            - trt_post_ms_per_frame
+            - trt_resize_ms_per_frame
+            - trt_pack_ms_per_frame
+            - trt_cpu_ms_per_frame,
+        )
 
         gpu_line = format_gpu_summary(_gpu_summary)
 
@@ -1855,9 +1883,11 @@ def _process_frames_async(
             f"engine_max_batch={trt_engine_max_batch:.0f}  TRT调用 {trt_tile_ms_per_batch:.1f}ms/批"
         ) if trt_tile_batches > 0 else "  TRT tiles: 未使用 TensorRT tile 批处理"
         trt_post_line = (
-            f"  TRT后处理: post={trt_post_ms / trt_frames:.1f}ms/帧  "
-            f"resize={trt_resize_ms / trt_frames:.1f}ms/帧  "
-            f"GPU→CPU={trt_cpu_ms / trt_frames:.1f}ms/帧"
+            f"  TRT后处理: post={trt_post_ms_per_frame:.1f}ms/帧  "
+            f"resize={trt_resize_ms_per_frame:.1f}ms/帧  "
+            f"pack={trt_pack_ms_per_frame:.1f}ms/帧  "
+            f"GPU→CPU={trt_cpu_ms_per_frame:.1f}ms/帧  "
+            f"其他={trt_other_ms_per_frame:.1f}ms/帧"
         ) if trt_tile_batches > 0 else ""
 
         report_lines = [

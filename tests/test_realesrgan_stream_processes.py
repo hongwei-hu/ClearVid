@@ -149,6 +149,7 @@ def test_enhance_frame_trt_tiled_resizes_on_tensor_before_cpu() -> None:
     assert enhanced.shape == (4, 6, 3)
     assert enhanced.dtype == np.uint8
     assert tile_stats["trt_resize_ms"] >= 0
+    assert tile_stats["trt_pack_ms"] >= 0
     assert tile_stats["trt_cpu_ms"] >= 0
     assert tile_stats["trt_post_ms"] >= 0
 
