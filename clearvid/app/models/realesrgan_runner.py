@@ -1605,6 +1605,9 @@ def _process_frames_async(
     _diag_face_frames = [0]                 # frames where faces were detected
     _diag_face_total = [0]                  # total faces restored
     _diag_postprocess_ms = [0.0]
+    _diag_face_ms = [0.0]
+    _diag_stabilize_ms = [0.0]
+    _diag_sharpen_ms = [0.0]
     _diag_trt_tile_stats: dict[str, float] = {}
 
     # -- Stage 2: super-resolution thread -----------------------------------
@@ -1692,9 +1695,17 @@ def _process_frames_async(
             _stab_future: Future[np.ndarray] | None = None
 
             def _stabilize_and_sharpen(frame: np.ndarray) -> np.ndarray:
-                result = stabilizer.stabilize(frame)  # type: ignore[union-attr]
+                t_stage = time.perf_counter()
+                result = frame
+                if stabilizer is not None:
+                    t_stab = time.perf_counter()
+                    result = stabilizer.stabilize(result)
+                    _diag_stabilize_ms[0] += (time.perf_counter() - t_stab) * 1000
                 if sharpen_strength > 0:
+                    t_sharp = time.perf_counter()
                     result = apply_sharpening(result, sharpen_strength)
+                    _diag_sharpen_ms[0] += (time.perf_counter() - t_sharp) * 1000
+                _diag_postprocess_ms[0] += (time.perf_counter() - t_stage) * 1000
                 return result
 
             try:
@@ -1710,9 +1721,11 @@ def _process_frames_async(
                         if control is not None:
                             control.check()
                         if codeformer_restorer is not None:
-                            t_pp = time.perf_counter()
+                            t_face = time.perf_counter()
                             enhanced = codeformer_restorer.restore_faces(enhanced)
-                            _diag_postprocess_ms[0] += (time.perf_counter() - t_pp) * 1000
+                            face_ms = (time.perf_counter() - t_face) * 1000
+                            _diag_face_ms[0] += face_ms
+                            _diag_postprocess_ms[0] += face_ms
 
                         if _stab_future is not None:
                             finalized_list.append(_stab_future.result())
@@ -1724,7 +1737,11 @@ def _process_frames_async(
                             )
                         else:
                             if sharpen_strength > 0:
+                                t_pp = time.perf_counter()
+                                t_sharp = time.perf_counter()
                                 enhanced = apply_sharpening(enhanced, sharpen_strength)
+                                _diag_sharpen_ms[0] += (time.perf_counter() - t_sharp) * 1000
+                                _diag_postprocess_ms[0] += (time.perf_counter() - t_pp) * 1000
                             finalized_list.append(enhanced)
 
                     if finalized_list and not abort.is_set():
@@ -1833,10 +1850,14 @@ def _process_frames_async(
         enh_batches = _diag_enhance_batches[0]
         enh_frames = _diag_enhance_frames[0]
         wr_frames = _diag_write_frames[0]
+        frame_denominator = max(wr_frames, 1)
         avg_batch = enh_frames / enh_batches if enh_batches else 0
         avg_infer_ms = _diag_enhance_infer_ms[0] / enh_batches if enh_batches else 0
         avg_write_ms = _diag_write_ms[0] / wr_frames if wr_frames else 0
-        avg_pp_ms = _diag_postprocess_ms[0] / wr_frames if wr_frames else 0
+        avg_pp_ms = _diag_postprocess_ms[0] / frame_denominator
+        avg_face_ms = _diag_face_ms[0] / frame_denominator
+        avg_stabilize_ms = _diag_stabilize_ms[0] / frame_denominator
+        avg_sharpen_ms = _diag_sharpen_ms[0] / frame_denominator
         total_fps = enh_frames / total_elapsed
         cpu_total_pct = _cpu_tracker.total_percent(total_elapsed)
         skip_frames = skipper.skip_count if skipper is not None else 0
@@ -1874,9 +1895,10 @@ def _process_frames_async(
         gpu_line = format_gpu_summary(_gpu_summary)
 
         pp_line = (
-            f"  后处理:    平均 {avg_pp_ms:.1f}ms/帧  (人脸={_diag_face_frames[0]}帧 "
-            f"共{_diag_face_total[0]}张)"
-        ) if avg_pp_ms > 0 else "  后处理: 未启用"
+            f"  后处理:    平均 {avg_pp_ms:.1f}ms/帧  "
+            f"face={avg_face_ms:.1f}ms  stabilize={avg_stabilize_ms:.1f}ms  "
+            f"sharpen={avg_sharpen_ms:.1f}ms"
+        ) if postprocess_needed else "  后处理: 未启用"
         trt_line = (
             f"  TRT tiles: {trt_tiles:.0f}个 / {trt_tile_batches:.0f}批  "
             f"平均 {trt_avg_tile_batch:.2f} tiles/批  峰值 {trt_tile_max_batch:.0f}  "
