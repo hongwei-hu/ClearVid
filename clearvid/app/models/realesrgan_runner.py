@@ -30,6 +30,7 @@ from clearvid.app.models.perf_diagnostics import (
 )
 from clearvid.app.models.tensorrt_engine import (
     InferenceAccelerator,
+    TRT_MAX_BATCH,
     accelerate_model,
     check_engine_ready,
     describe_accelerator,
@@ -224,12 +225,22 @@ def _auto_batch_size(
         return config.batch_size
     megapixels = (width * height) / 1_000_000
     if model_arch == "srvgg":
-        # SRVGG is lightweight; keep batch small to reduce decode-wait latency
-        if vram_mb >= 16_000 and megapixels <= 1.0:
-            return 8
-        if vram_mb >= 8_000:
-            return 4
-        return 2
+        return _auto_srvgg_batch_size(vram_mb, megapixels)
+    return _auto_rrdb_batch_size(vram_mb, megapixels)
+
+
+def _auto_srvgg_batch_size(vram_mb: int, megapixels: float) -> int:
+    # SRVGG is lightweight; high-VRAM GPUs benefit from fatter TRT tile batches.
+    if vram_mb >= 24_000 and megapixels <= 0.6:
+        return 16
+    if vram_mb >= 16_000 and megapixels <= 1.0:
+        return 8
+    if vram_mb >= 8_000:
+        return 4
+    return 2
+
+
+def _auto_rrdb_batch_size(vram_mb: int, megapixels: float) -> int:
     # RRDB: conservative — intermediate activations are VRAM-hungry
     if vram_mb >= 24_000 and megapixels <= 0.5:
         return 4
@@ -262,8 +273,28 @@ def _resolve_trt_batch(
         return config_batch
     # Explicitly selected TensorRT: use a deployed high-throughput profile when
     # available.  TensorRT batching here means batched tiles, not batched whole
-    # frames; cap to 4 because the engine builder currently sets max_batch <= 4.
-    return max(1, min(config_batch, 4))
+    # frames; cap to the engine builder's supported maximum.
+    return max(1, min(config_batch, TRT_MAX_BATCH))
+
+
+def _auto_trt_tile_size(config_tile_size: int, width: int, height: int) -> int:
+    """Choose a TRT tile profile that spends more VRAM to reduce tile calls."""
+    if config_tile_size > 0:
+        return config_tile_size
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 512
+        vram_mb = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        return 512
+    long_edge = max(width, height)
+    if vram_mb >= 24_000 and long_edge <= 1080:
+        return 1024
+    if vram_mb >= 12_000 and long_edge <= 1080:
+        return 768
+    return 512
 
 
 def run_realesrgan_video(
@@ -297,7 +328,7 @@ def run_realesrgan_video(
     if accel != InferenceAccelerator.NONE:
         _emit_progress(progress_callback, 11, f"正在应用推理加速: {accel_label}")
         t_accel = time.perf_counter()
-        trt_tile = config.tile_size if config.tile_size > 0 else 512
+        trt_tile = _auto_trt_tile_size(config.tile_size, metadata.width, metadata.height)
 
         # When TensorRT is explicitly selected (not AUTO), require a pre-built
         # engine.  TRT engines are built for a specific (tile, batch) profile.

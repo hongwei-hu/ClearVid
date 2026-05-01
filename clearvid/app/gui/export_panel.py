@@ -797,7 +797,7 @@ class ExportPanel(QWidget):
             UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO,
         )
         model_key_str = "general_v3" if model_key == UpscaleModel.AUTO else model_key.value
-        tile = self.tile_size_spin.value() or 512
+        tile = self._recommended_trt_tile()
         batch = self._recommended_trt_batch()
 
         self._trt_deploying = True
@@ -890,7 +890,7 @@ class ExportPanel(QWidget):
                 self.trt_deploy_btn.setEnabled(False)
                 return
 
-            tile = self.tile_size_spin.value() or 512
+            tile = self._recommended_trt_tile()
             batch = self._recommended_trt_batch()
             model_path = ensure_realesrgan_weights(weights_dir, model_key)
             dummy_config = _EC(
@@ -940,12 +940,16 @@ class ExportPanel(QWidget):
     def _recommended_trt_batch(self) -> int:
         raw_batch = self.batch_size_spin.value()
         if raw_batch > 0:
-            return max(1, min(raw_batch, 4))
+            return max(1, min(raw_batch, 16))
         try:
             import torch
             if torch.cuda.is_available():
                 free_bytes, _ = torch.cuda.mem_get_info(0)
                 free_gb = free_bytes / (1024 ** 3)
+                if free_gb >= 24:
+                    return 16
+                if free_gb >= 12:
+                    return 8
                 if free_gb >= 8:
                     return 4
                 if free_gb >= 4:
@@ -953,6 +957,23 @@ class ExportPanel(QWidget):
         except Exception:  # noqa: BLE001
             pass
         return 1
+
+    def _recommended_trt_tile(self) -> int:
+        raw_tile = self.tile_size_spin.value()
+        if raw_tile > 0:
+            return raw_tile
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_bytes, _ = torch.cuda.mem_get_info(0)
+                free_gb = free_bytes / (1024 ** 3)
+                if free_gb >= 24:
+                    return 1024
+                if free_gb >= 12:
+                    return 768
+        except Exception:  # noqa: BLE001
+            pass
+        return 512
 
     def apply_recommendation(self, rec: Any) -> None:
         """Apply a Recommendation object to widget state."""

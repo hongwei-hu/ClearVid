@@ -53,10 +53,25 @@ def test_start_stream_processes_cleans_decoder_when_encoder_start_fails(monkeypa
 
 def test_resolve_trt_batch_caps_to_engine_max_profile() -> None:
     assert realesrgan_runner._resolve_trt_batch(
-        8,
+        32,
         InferenceAccelerator.TENSORRT,
         ConfigAccelerator.TENSORRT,
-    ) == 4
+    ) == 16
+
+
+def test_auto_trt_tile_size_uses_larger_profile_on_high_vram(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _idx: type("Props", (), {"total_memory": 32 * 1024 ** 3})(),
+    )
+
+    assert realesrgan_runner._auto_trt_tile_size(0, width=854, height=480) == 1024
+
+
+def test_auto_trt_tile_size_respects_explicit_value() -> None:
+    assert realesrgan_runner._auto_trt_tile_size(512, width=854, height=480) == 512
 
 
 def test_prepare_encoder_frame_rejects_wrong_size() -> None:

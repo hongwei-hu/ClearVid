@@ -28,6 +28,10 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
+TRT_MAX_BATCH = 16
+TRT_PREFERRED_BATCHES = (16, 8, 4, 2, 1)
+TRT_PREFERRED_TILE_SIZES = (1024, 768, 512, 256, 128)
+
 
 class InferenceAccelerator(str, Enum):
     NONE = "none"
@@ -57,6 +61,7 @@ def check_engine_ready(
     if cache_dir is None:
         from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
         cache_dir = TRT_CACHE_DIR
+    batch_size = _normalize_trt_batch(batch_size)
 
     digest = _engine_cache_key(model, fp16, tile_size, batch_size, weight_path)
     engine_path = cache_dir / f"realesrgan_{digest}.engine"
@@ -80,8 +85,8 @@ def find_compatible_engine(
 ) -> tuple[int, int, str] | None:
     """Scan *cache_dir* for any deployed engine matching the same weight + fp16.
 
-    Searches across common tile sizes (512, 256, 1024, 128, 768) AND batch
-    sizes (4, 2, 1, 8), preferring higher batch engines first since they give
+    Searches across common tile sizes and batch sizes, preferring higher batch
+    engines first since they give
     better GPU utilisation.  Returns ``(tile_size, batch_size, engine_path_str)``
     for the first match found, or ``None`` if no compatible engine exists.
     """
@@ -89,9 +94,9 @@ def find_compatible_engine(
         from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
         cache_dir = TRT_CACHE_DIR
 
-    # Prefer larger batch (better GPU utilisation), then common tile sizes
-    for candidate_batch in (4, 2, 1, 8):
-        for candidate_tile in (512, 256, 1024, 128, 768):
+    # Prefer larger batch (better GPU utilisation), then larger tiles (fewer calls)
+    for candidate_batch in TRT_PREFERRED_BATCHES:
+        for candidate_tile in TRT_PREFERRED_TILE_SIZES:
             digest = _engine_cache_key(model, fp16, candidate_tile, candidate_batch, weight_path)
             engine_path = cache_dir / f"realesrgan_{digest}.engine"
             if engine_path.exists() and engine_path.stat().st_size > 0:
@@ -224,6 +229,7 @@ def _apply_tensorrt(
         from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
         cache_dir = TRT_CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
+    batch_size = _normalize_trt_batch(batch_size)
 
     try:
         engine_path = _get_or_build_engine(
@@ -341,6 +347,10 @@ def _engine_cache_key(
     ).hexdigest()[:16]
 
 
+def _normalize_trt_batch(batch_size: int) -> int:
+    return max(1, min(int(batch_size), TRT_MAX_BATCH))
+
+
 # ---------------------------------------------------------------------------
 # Failed-marker helpers
 # ---------------------------------------------------------------------------
@@ -401,6 +411,7 @@ def _get_or_build_engine(
     ``RuntimeError`` immediately so the caller can prompt the user to deploy.
     """
     import torch
+    batch_size = _normalize_trt_batch(batch_size)
 
     digest = _engine_cache_key(model, fp16, tile_size, batch_size, weight_path)
     engine_path = cache_dir / f"realesrgan_{digest}.engine"
@@ -558,7 +569,7 @@ batch = args["batch_size"]
 
 min_hw = max(32, tile // 4)
 max_hw = tile + 32
-max_batch = min(batch, 4)
+max_batch = min(batch, 16)
 
 profile = builder.create_optimization_profile()
 profile.set_shape(
