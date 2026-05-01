@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
@@ -64,26 +64,18 @@ class SplitCompareWidget(QWidget):
             return
 
         split_x = int(w * self._split)
-
-        # Scale pixmaps to widget size, keeping aspect ratio
-        before_scaled = self._before.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        after_scaled = self._after.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-
-        # Centre offset (if aspect ratio doesn't fill full width/height)
-        bx = (w - before_scaled.width()) // 2
-        by = (h - before_scaled.height()) // 2
-        ax = (w - after_scaled.width()) // 2
-        ay = (h - after_scaled.height()) // 2
+        image_rect = _fit_rect(self._before.size(), self.size())
+        after_source_rect = _center_crop_rect(self._after.size(), self._before.size())
 
         # -- Draw Before on the left side --
         painter.setClipRect(QRect(0, 0, split_x, h))
         painter.fillRect(0, 0, w, h, QColor("#111122"))
-        painter.drawPixmap(bx, by, before_scaled)
+        painter.drawPixmap(image_rect, self._before)
 
         # -- Draw After on the right side --
         painter.setClipRect(QRect(split_x, 0, w - split_x, h))
         painter.fillRect(0, 0, w, h, QColor("#111122"))
-        painter.drawPixmap(ax, ay, after_scaled)
+        painter.drawPixmap(image_rect, self._after, after_source_rect)
 
         painter.setClipping(False)
 
@@ -151,3 +143,36 @@ class SplitCompareWidget(QWidget):
         if ratio != self._split:
             self._split = ratio
             self.update()
+
+
+def _fit_rect(source_size: QSize, target_size: QSize) -> QRect:
+    source_w = max(1, source_size.width())
+    source_h = max(1, source_size.height())
+    target_w = max(1, target_size.width())
+    target_h = max(1, target_size.height())
+    scale = min(target_w / source_w, target_h / source_h)
+    width = max(1, int(round(source_w * scale)))
+    height = max(1, int(round(source_h * scale)))
+    x = (target_w - width) // 2
+    y = (target_h - height) // 2
+    return QRect(x, y, width, height)
+
+
+def _center_crop_rect(source_size: QSize, reference_size: QSize) -> QRect:
+    source_w = max(1, source_size.width())
+    source_h = max(1, source_size.height())
+    reference_w = max(1, reference_size.width())
+    reference_h = max(1, reference_size.height())
+    source_ratio = source_w / source_h
+    reference_ratio = reference_w / reference_h
+
+    if abs(source_ratio - reference_ratio) < 1e-6:
+        return QRect(0, 0, source_w, source_h)
+    if source_ratio > reference_ratio:
+        crop_w = max(1, int(round(source_h * reference_ratio)))
+        crop_x = (source_w - crop_w) // 2
+        return QRect(crop_x, 0, crop_w, source_h)
+
+    crop_h = max(1, int(round(source_w / reference_ratio)))
+    crop_y = (source_h - crop_h) // 2
+    return QRect(0, crop_y, source_w, crop_h)
