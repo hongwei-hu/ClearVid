@@ -27,7 +27,7 @@ def build_preprocess_filters(
     filters.extend(_deinterlace_filter(config, metadata))
     filters.extend(_denoise_filter(config, metadata))
     filters.extend(_deblock_filter(config, metadata))
-    filters.extend(_colorspace_filter(config))
+    filters.extend(_colorspace_filter(config, metadata))
     return filters
 
 
@@ -95,18 +95,28 @@ def _deblock_filter(
     return [f"deblock=filter=weak:alpha={alpha}:beta={beta}"]
 
 
-def _colorspace_filter(config: EnhancementConfig) -> list[str]:
+def _colorspace_filter(config: EnhancementConfig, metadata: VideoMetadata) -> list[str]:
     """Normalize color matrix to BT.709 for consistent model input.
 
-    Omits ``iall`` so FFmpeg reads the declared colorspace from stream
-    metadata automatically.  When input is already BT.709, ``fast=1``
-    makes the filter a no-op.  Hardcoding ``iall=bt601-6-625`` caused
-    visible colour shifts on NTSC, BT.709, and HDR sources.
+    Only applied when:
+    - the option is enabled in config, AND
+    - the source has **known** color primaries that are NOT already BT.709.
+
+    When primaries are unspecified / unknown (e.g. many mobile/web videos),
+    the colorspace filter raises "Unsupported input primaries 2 (unknown)" and
+    we skip it silently.  BT.709 sources are handled with fast=1 (no-op).
     """
     if not config.preprocess_colorspace_normalize:
         return []
-    # No iall: FFmpeg reads input colorspace from stream metadata.
-    # fast=1: skip conversion when input == output (BT.709 sources).
+
+    primaries = metadata.color_primaries  # None if unspecified/unknown
+    # Skip when we cannot determine input primaries — FFmpeg can't convert them
+    if primaries is None:
+        return []
+    # Skip when already BT.709 (fast=1 would be a no-op anyway, save the filter)
+    if primaries == "bt709":
+        return []
+    # Apply conversion for known non-BT.709 primaries (e.g. smpte170m, bt470bg)
     return ["colorspace=all=bt709:fast=1"]
 
 

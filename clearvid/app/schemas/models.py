@@ -76,6 +76,8 @@ class VideoMetadata(BaseModel):
     subtitle_streams: int = 0
     is_interlaced: bool = False
     streams: list[StreamInfo] = Field(default_factory=list)
+    color_primaries: str | None = None  # e.g. "bt709", "smpte170m"; None = unspecified
+    color_space: str | None = None      # color matrix, e.g. "bt709", "smpte170m"
 
     @computed_field
     @property

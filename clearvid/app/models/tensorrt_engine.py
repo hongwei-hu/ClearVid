@@ -71,6 +71,33 @@ def check_engine_ready(
     return False, "TensorRT 引擎尚未部署"
 
 
+def find_compatible_engine(
+    model: object,
+    *,
+    fp16: bool = True,
+    batch_size: int = 1,
+    cache_dir: Path | None = None,
+    weight_path: Path | None = None,
+) -> tuple[int, str] | None:
+    """Scan *cache_dir* for any deployed engine matching the same weight + fp16 + batch.
+
+    Returns ``(tile_size, engine_path_str)`` for the first match found, or
+    ``None`` if no compatible engine exists.  Used as a fallback when the
+    requested tile_size has no cached engine — allows the runner to
+    transparently reuse a different-tile engine rather than raising an error.
+    """
+    if cache_dir is None:
+        from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
+        cache_dir = TRT_CACHE_DIR
+
+    for candidate_tile in (512, 256, 1024, 128, 768):
+        digest = _engine_cache_key(model, fp16, candidate_tile, batch_size, weight_path)
+        engine_path = cache_dir / f"realesrgan_{digest}.engine"
+        if engine_path.exists() and engine_path.stat().st_size > 0:
+            return candidate_tile, str(engine_path)
+    return None
+
+
 def accelerate_model(
     model: object,
     accelerator: InferenceAccelerator,

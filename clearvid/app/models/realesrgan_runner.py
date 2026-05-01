@@ -304,12 +304,30 @@ def run_realesrgan_video(
                 weight_path=model_path,
             )
             if not ready:
-                raise RuntimeError(
-                    f"TensorRT 引擎尚未部署 (tile={trt_tile}, batch={trt_batch})。"
-                    "请先使用 GUI 中的'部署 TensorRT 引擎'按钮 "
-                    "或运行 `clearvid warmup` 命令完成首次构建。\n"
-                    "或切换到'自动检测'模式以自动选择可用加速方案。"
+                # Try to find a compatible engine with a different tile size
+                from clearvid.app.models.tensorrt_engine import find_compatible_engine
+                compat = find_compatible_engine(
+                    upsampler.model,
+                    fp16=config.fp16_enabled,
+                    batch_size=trt_batch,
+                    cache_dir=TRT_CACHE_DIR,
+                    weight_path=model_path,
                 )
+                if compat is not None:
+                    found_tile, _ = compat
+                    logger.info(
+                        "TRT 引擎 tile=%d 未找到，自动切换到已部署的 tile=%d 引擎",
+                        trt_tile, found_tile,
+                    )
+                    trt_tile = found_tile
+                    config = config.model_copy(update={"tile_size": found_tile})
+                else:
+                    raise RuntimeError(
+                        f"TensorRT 引擎尚未部署 (tile={trt_tile}, batch={trt_batch})。"
+                        "请先使用 GUI 中的'部署 TensorRT 引擎'按钮 "
+                        "或运行 `clearvid warmup` 命令完成首次构建。\n"
+                        "或切换到'自动检测'模式以自动选择可用加速方案。"
+                    )
             build_if_missing = True
             # TRT forces tiling → batching is disabled in the pipeline.  Pin
             # config.batch_size to match the deployed engine profile so logs

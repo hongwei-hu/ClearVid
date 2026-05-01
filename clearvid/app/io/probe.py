@@ -86,6 +86,8 @@ def probe_video(input_path: Path) -> VideoMetadata:
         subtitle_streams=len(subtitle_streams),
         is_interlaced=_detect_interlaced(video_stream),
         streams=normalized_streams,
+        color_primaries=_normalise_color_tag(video_stream.get("color_primaries")),
+        color_space=_normalise_color_tag(video_stream.get("color_space")),
     )
 
 
@@ -190,3 +192,19 @@ def _detect_interlaced(video_stream: dict) -> bool:
     if coded_height > 0 and height > 0 and coded_height != height:
         return True
     return False
+
+
+def _normalise_color_tag(value: object) -> str | None:
+    """Return the colour tag string if known, or None for unspecified/unknown.
+
+    ffprobe reports 'unknown' for streams where the codec bitstream does not
+    carry colour metadata (ITU-T H.264 colour_primaries = 2).  We treat this
+    the same as a missing field so callers can safely skip colour-space
+    conversion when the value is None.
+    """
+    if not value:
+        return None
+    s = str(value).lower().strip()
+    if s in {"unknown", "unspecified", "reserved", ""}:
+        return None
+    return s
