@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from clearvid.app.models import realesrgan_runner
+from clearvid.app.models.perf_diagnostics import GpuSampler
 from clearvid.app.models.tensorrt_engine import InferenceAccelerator
 from clearvid.app.schemas.models import InferenceAccelerator as ConfigAccelerator
 
@@ -137,9 +138,9 @@ def test_enhance_frame_trt_tiled_pads_edge_tiles_to_batch() -> None:
 
 
 def test_gpu_sampler_selects_torch_device_uuid(monkeypatch) -> None:
-    monkeypatch.setattr(realesrgan_runner._GpuSampler, "_detect_torch_device_uuid", staticmethod(lambda: "bbbb"))
+    monkeypatch.setattr(GpuSampler, "_detect_torch_device_uuid", staticmethod(lambda: "bbbb"))
 
-    sampler = realesrgan_runner._GpuSampler.__new__(realesrgan_runner._GpuSampler)
+    sampler = GpuSampler.__new__(GpuSampler)
     sampler._target_uuid = "bbbb"
 
     selected = sampler._select_gpu_line([

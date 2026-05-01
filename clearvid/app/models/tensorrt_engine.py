@@ -243,7 +243,7 @@ def _apply_tensorrt(
         if progress_callback is not None:
             progress_callback(
                 11,
-                f"TensorRT 构建失败，尝试 torch.compile 降级加速...",
+                "TensorRT 构建失败，尝试 torch.compile 降级加速...",
             )
         compiled = _apply_torch_compile(model)
         if compiled is not model:
@@ -257,7 +257,7 @@ def _apply_tensorrt(
         if progress_callback is not None:
             progress_callback(
                 11,
-                f"推理加速不可用，使用标准 PyTorch (TensorRT/torch.compile 均失败)",
+                "推理加速不可用，使用标准 PyTorch (TensorRT/torch.compile 均失败)",
             )
         return model
 
