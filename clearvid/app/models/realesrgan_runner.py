@@ -202,7 +202,9 @@ def _auto_batch_size(
     RRDB is very VRAM-hungry (23 residual blocks) — keep batches small.
     SRVGG is lightweight — moderate batches to balance latency vs throughput.
     """
-    if config.batch_size != 4:  # user explicitly set a custom value
+    # 0 = GUI "auto"; 4 = legacy schema default / CLI default — both trigger VRAM detection.
+    # Any other explicit value is respected as-is.
+    if config.batch_size not in (0, 4):
         return config.batch_size
     try:
         import torch
@@ -489,7 +491,7 @@ def extract_frame(video_path: Path, timestamp_sec: float = 0.0, width: int = 0, 
         "-vcodec", "rawvideo",
         "pipe:1",
     ]
-    result = subprocess.run(command, capture_output=True, check=True)  # noqa: S603
+    result = subprocess.run(command, capture_output=True, check=True, timeout=30)  # noqa: S603
     return np.frombuffer(result.stdout, dtype=np.uint8).reshape((height, width, 3))
 
 
@@ -921,7 +923,11 @@ def _start_decode_thread(
     frame_size: int,
     abort: threading.Event,
 ) -> tuple[queue.Queue, list[BaseException], threading.Thread]:
-    raw_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_FRAME_QUEUE_DEPTH)
+    # Limit raw-frame queue to ~256 MB so 4K processing doesn't exhaust RAM.
+    # 1080p (6 MB/frame) → ~42 frames capped at 48.
+    # 4K   (24 MB/frame) → ~10 frames (well within limit).
+    _depth = max(4, min(48, 256 * 1024 * 1024 // max(frame_size, 1)))
+    raw_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_depth)
     errors: list[BaseException] = []
 
     def _loop() -> None:
@@ -968,10 +974,13 @@ def _collect_batch(raw_queue: queue.Queue, batch_size: int) -> list[bytes]:
         raw_queue.put(None)
         return batch
     batch.append(raw)
-    # Remaining frames: short timeout to allow a few more frames to arrive
+    # Remaining frames: timeout = ~1 video frame at 30 fps (33 ms) so the GPU
+    # collects a reasonably full batch without stalling on slow-decode sources.
+    # The original 5 ms timeout caused near-constant batch=1 when decode was
+    # even slightly bottlenecked (e.g. nlmeans on CPU), starving the GPU.
     for _ in range(batch_size - 1):
         try:
-            raw = raw_queue.get(timeout=0.005)
+            raw = raw_queue.get(timeout=0.033)
         except queue.Empty:
             break
         if raw is None:
@@ -1267,14 +1276,21 @@ def _process_frames_async(
     )
 
     if postprocess_needed:
+        # Limit enhanced-frame queue to ~128 MB.  Each queue slot is a *batch*
+        # of frames; with batch=4 and 4K output each slot is ~96 MB, so minimum
+        # depth of 4 still gives the async stages enough room to overlap.
+        _enhanced_item_bytes = output_width * output_height * 3 * max(1, config.batch_size)
+        _eq_depth = max(4, min(16, 128 * 1024 * 1024 // max(_enhanced_item_bytes, 1)))
         enhanced_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
-            maxsize=_ENHANCED_QUEUE_DEPTH,
+            maxsize=_eq_depth,
         )
         finalized_queue: queue.Queue[list[np.ndarray] | None] = queue.Queue(
-            maxsize=_ENHANCED_QUEUE_DEPTH,
+            maxsize=_eq_depth,
         )
     else:
-        finalized_queue = queue.Queue(maxsize=_ENHANCED_QUEUE_DEPTH)
+        _enhanced_item_bytes = output_width * output_height * 3 * max(1, config.batch_size)
+        _eq_depth = max(4, min(16, 128 * 1024 * 1024 // max(_enhanced_item_bytes, 1)))
+        finalized_queue = queue.Queue(maxsize=_eq_depth)
         enhanced_queue = finalized_queue
 
     enhance_errors: list[BaseException] = []

@@ -68,6 +68,13 @@ class PreviewPanel(QWidget):
         self._time_label.setMinimumWidth(60)
         slider_row.addWidget(self._time_label)
 
+        from PySide6.QtWidgets import QPushButton
+        self._preview_btn = QPushButton("生成预览")
+        self._preview_btn.setToolTip("手动生成当前时间点的预览帧（无需开启自动预览）")
+        self._preview_btn.setFixedWidth(84)
+        self._preview_btn.clicked.connect(self._request_preview)
+        slider_row.addWidget(self._preview_btn)
+
         self._auto_preview_cb = QCheckBox("自动生成预览")
         self._auto_preview_cb.setChecked(False)
         self._auto_preview_cb.setToolTip(
@@ -87,6 +94,7 @@ class PreviewPanel(QWidget):
         self._video_duration = duration
 
     def set_preview_loading(self, loading: bool) -> None:
+        self._preview_btn.setEnabled(not loading)
         self._auto_preview_cb.setEnabled(not loading)
         self._auto_preview_cb.setText("预览生成中..." if loading else "自动生成预览")
 

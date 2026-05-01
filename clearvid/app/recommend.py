@@ -31,6 +31,7 @@ class Recommendation:
     inference_accelerator: str
     async_pipeline: bool
     tile_size: int
+    preprocess_denoise: bool
     notes: list[str]
 
 
@@ -131,6 +132,14 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
     # --- Async pipeline ---
     async_pipeline = True
 
+    # --- Denoise preprocess ---
+    # Enable nlmeans only for low-bitrate sources where noise/block artifacts are visible.
+    # nlmeans is CPU-heavy; enabling it on all sources kills decode throughput.
+    bpp_val = (metadata.bit_rate or 0) / max(metadata.width * metadata.height * metadata.fps, 1)
+    preprocess_denoise = bpp_val > 0 and bpp_val < 0.08
+    if preprocess_denoise:
+        notes.append(f"低码率源 (bpp={bpp_val:.3f})，自动开启降噪预处理")
+
     # --- High bitrate warning ---
     if bitrate_kbps > 15_000 and pixels >= 2_073_600:
         notes.append(
@@ -153,5 +162,6 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
         inference_accelerator=inference_accelerator,
         async_pipeline=async_pipeline,
         tile_size=tile_size,
+        preprocess_denoise=preprocess_denoise,
         notes=notes,
     )

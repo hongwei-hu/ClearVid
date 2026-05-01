@@ -685,7 +685,7 @@ class ExportPanel(QWidget):
                 InferenceAccelerator.AUTO,
             ),
             async_pipeline=self.async_pipeline.isChecked(),
-            batch_size=self.batch_size_spin.value() or 4,
+            batch_size=self.batch_size_spin.value(),
             tile_size=self.tile_size_spin.value(),
             face_restore_enabled=self.face_restore_enabled.isChecked(),
             face_restore_strength=self.face_restore_strength.value(),
@@ -882,6 +882,10 @@ class ExportPanel(QWidget):
         self.sharpen_enabled.setChecked(rec.sharpen_enabled)
         self.sharpen_strength.setValue(rec.sharpen_strength)
         self.async_pipeline.setChecked(rec.async_pipeline)
+        if hasattr(rec, "tile_size"):
+            self.tile_size_spin.setValue(rec.tile_size)
+        if hasattr(rec, "preprocess_denoise"):
+            self.preprocess_denoise.setChecked(rec.preprocess_denoise)
 
     def set_progress(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(max(0, min(100, percent)))

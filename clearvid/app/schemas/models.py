@@ -114,7 +114,7 @@ class EnhancementConfig(BaseModel):
     face_poisson_blend: bool = False
     temporal_stabilize_enabled: bool = True
     temporal_stabilize_strength: float = Field(default=0.6, ge=0.0, le=1.0)
-    preprocess_denoise: bool = True
+    preprocess_denoise: bool = False
     preprocess_deblock: bool = True
     preprocess_deinterlace: str = Field(default="auto", pattern=r"^(auto|off)$")
     preprocess_colorspace_normalize: bool = True
