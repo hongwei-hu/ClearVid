@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 _FRAME_QUEUE_DEPTH = 64
 _ENHANCED_QUEUE_DEPTH = 16
 _PACKED_LIST_WRITE_MIN_BATCH = 4
+_WRITE_COALESCE_MAX_ITEMS = 4
+_WRITE_COALESCE_MAX_FRAMES = 64
 _TrtTileInfo = tuple[int, int, int, int, int, int, int, int]
 _TrtPendingTile = tuple[object, _TrtTileInfo]
 _FramePayload = list[np.ndarray] | np.ndarray
@@ -647,12 +649,79 @@ def _prepare_encoder_frame_batch(
     ):
         return frames
 
+    if isinstance(frames, list) and frames:
+        if all(
+            frame.ndim == 3
+            and frame.shape == (output_height, output_width, 3)
+            and frame.dtype == np.uint8
+            and frame.flags.c_contiguous
+            for frame in frames
+        ):
+            return np.ascontiguousarray(np.stack(frames, axis=0), dtype=np.uint8)
+
     count = _frame_payload_count(frames)
     prepared_batch = np.empty((count, output_height, output_width, 3), dtype=np.uint8)
     for index, frame in enumerate(_iter_frame_payload(frames)):
         resized = _resize_for_target(frame, output_width, output_height, target_profile)
         prepared_batch[index] = _prepare_encoder_frame(resized, output_width, output_height)
     return prepared_batch
+
+
+def _payload_to_frame_list(payload: _FramePayload) -> list[np.ndarray]:
+    if isinstance(payload, np.ndarray) and payload.ndim == 4:
+        return [payload[index] for index in range(payload.shape[0])]
+    return payload
+
+
+def _can_pack_frame_list(payload: _FramePayload) -> bool:
+    if not isinstance(payload, list) or not payload:
+        return False
+    first = payload[0]
+    if first.ndim != 3 or first.shape[2] != 3:
+        return False
+    target_shape = first.shape
+    return all(
+        frame.ndim == 3
+        and frame.shape == target_shape
+        and frame.dtype == np.uint8
+        and frame.flags.c_contiguous
+        for frame in payload
+    )
+
+
+def _coalesce_finalized_payloads(
+    first_item: _FramePayload,
+    finalized_queue: queue.Queue,
+) -> tuple[_FramePayload, bool]:
+    if isinstance(first_item, np.ndarray) and first_item.ndim == 4:
+        # Keep already-packed batches as-is to avoid converting ndarray payloads
+        # back into lists, which would trigger extra prepare work in writer.
+        return first_item, False
+
+    payloads: list[_FramePayload] = [first_item]
+    total_frames = _frame_payload_count(first_item)
+    saw_sentinel = False
+
+    for _ in range(_WRITE_COALESCE_MAX_ITEMS - 1):
+        if total_frames >= _WRITE_COALESCE_MAX_FRAMES:
+            break
+        try:
+            item = finalized_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item is None:
+            saw_sentinel = True
+            break
+        payloads.append(item)
+        total_frames += _frame_payload_count(item)
+
+    if len(payloads) == 1:
+        return first_item, saw_sentinel
+
+    merged_frames: list[np.ndarray] = []
+    for payload in payloads:
+        merged_frames.extend(_payload_to_frame_list(payload))
+    return merged_frames, saw_sentinel
 
 
 def _write_encoder_frame_batch(
@@ -994,10 +1063,11 @@ def _process_frames_async(
                 ok, item = _safe_get(finalized_queue)
                 if not ok or item is None:
                     break
+                batch_payload, saw_sentinel = _coalesce_finalized_payloads(item, finalized_queue)
                 t_w = time.perf_counter()
                 write_stats: dict[str, float] = {}
                 count = _write_finalized_frames(
-                    item, output_width, output_height,
+                    batch_payload, output_width, output_height,
                     config.target_profile, encoder.stdin,
                     write_stats=write_stats,
                 )
@@ -1006,6 +1076,8 @@ def _process_frames_async(
                 diag_write_pipe_ms[0] += write_stats.get("write_pipe_ms", 0.0)
                 diag_write_frames[0] += count
                 frames_written[0] += count
+                if saw_sentinel:
+                    break
         except Exception as exc:
             write_errors.append(exc)
             abort.set()
@@ -1046,6 +1118,30 @@ def _process_frames_async(
                     ok, enhanced_list = _safe_get(enhanced_queue)
                     if not ok or enhanced_list is None:
                         break
+
+                    # Fast-path for the common sharpen-only case: keep batch payload
+                    # as contiguous 4D ndarray so writer can bypass per-frame prepare.
+                    if (
+                        codeformer_restorer is None
+                        and stab_pool is None
+                        and stab_future is None
+                        and sharpen_strength > 0
+                        and isinstance(enhanced_list, np.ndarray)
+                        and enhanced_list.ndim == 4
+                        and enhanced_list.dtype == np.uint8
+                        and enhanced_list.flags.c_contiguous
+                    ):
+                        sharpened_batch = np.empty_like(enhanced_list)
+                        t_pp = time.perf_counter()
+                        for index in range(enhanced_list.shape[0]):
+                            if control is not None:
+                                control.check()
+                            t_sharp = time.perf_counter()
+                            sharpened_batch[index] = apply_sharpening(enhanced_list[index], sharpen_strength)
+                            diag_sharpen_ms[0] += (time.perf_counter() - t_sharp) * 1000
+                        diag_postprocess_ms[0] += (time.perf_counter() - t_pp) * 1000
+                        _safe_put(finalized_queue, sharpened_batch)
+                        continue
 
                     finalized_list: list[np.ndarray] = []
                     for enhanced in enhanced_list:
