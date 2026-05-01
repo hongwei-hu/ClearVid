@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +44,10 @@ _INFERENCE_DEPS = [
 
 # Current lib stamp version — bump when dependency set changes.
 LIB_VERSION = "1.0.0"
+
+StepCallback = Callable[[int, int, str], None]
+OutputCallback = Callable[[str], None]
+ErrorCallback = Callable[[int, str, int], None]
 
 
 @dataclass
@@ -120,9 +125,9 @@ def build_install_steps(plan: InstallPlan) -> list[tuple[str, list[str]]]:
 def run_install(
     plan: InstallPlan,
     *,
-    on_step: callable | None = None,
-    on_output: callable | None = None,
-    on_error: callable | None = None,
+    on_step: StepCallback | None = None,
+    on_output: OutputCallback | None = None,
+    on_error: ErrorCallback | None = None,
 ) -> bool:
     """Execute the install plan step by step.
 
@@ -147,32 +152,55 @@ def run_install(
         if on_step:
             on_step(idx, total, desc)
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.rstrip()
-                if on_output and line:
-                    on_output(line)
-            proc.wait()
-        except Exception as exc:  # noqa: BLE001
+        return_code = _run_install_step(cmd, on_output)
+        if return_code != 0:
             if on_error:
-                on_error(idx, desc, -1)
-            if on_output:
-                on_output(f"[错误] {exc}")
-            return False
-
-        if proc.returncode != 0:
-            if on_error:
-                on_error(idx, desc, proc.returncode)
+                on_error(idx, desc, return_code)
             return False
 
     # Stamp version
     write_lib_version(LIB_VERSION)
     return True
+
+
+def _run_install_step(cmd: list[str], on_output: OutputCallback | None) -> int:
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if on_output and line:
+                on_output(line)
+        proc.wait()
+        return proc.returncode
+    except Exception as exc:  # noqa: BLE001
+        _terminate_process(proc)
+        _safe_output(on_output, f"[错误] {exc}")
+        return -1
+
+
+def _terminate_process(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _safe_output(on_output: OutputCallback | None, line: str) -> None:
+    if on_output is None:
+        return
+    try:
+        on_output(line)
+    except Exception:
+        pass

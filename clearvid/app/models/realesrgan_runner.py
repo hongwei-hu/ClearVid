@@ -4,6 +4,7 @@ import importlib
 import logging
 import queue
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -690,12 +691,9 @@ def _stream_process_video(
     control: ExportControl | None = None,
     preview_mux_trigger: Callable[[int], None] | None = None,
 ) -> None:
-    import subprocess
-
     decode_command = _build_decode_command(config, metadata)
     encode_command = _build_encode_command(config, metadata, output_width, output_height, temp_video_path)
-    decoder = subprocess.Popen(decode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    encoder = subprocess.Popen(encode_command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    decoder, encoder = _start_stream_processes(decode_command, encode_command)
 
     try:
         _process_stream_frames(
@@ -716,6 +714,27 @@ def _stream_process_video(
         _finalize_stream_processes(decoder, encoder)
     finally:
         _cleanup_stream_processes(decoder, encoder)
+
+
+def _start_stream_processes(
+    decode_command: list[str],
+    encode_command: list[str],
+) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
+    decoder: subprocess.Popen[bytes] | None = None
+    try:
+        decoder = subprocess.Popen(decode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        encoder = subprocess.Popen(encode_command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        if decoder is not None and decoder.poll() is None:
+            decoder.kill()
+            decoder.wait()
+        executable = decode_command[0] if isinstance(exc, FileNotFoundError) else "FFmpeg"
+        raise RuntimeError(f"无法启动 {executable}: {exc}") from exc
+
+    if decoder.stdout is None or decoder.stderr is None or encoder.stdin is None or encoder.stderr is None:
+        _cleanup_stream_processes(decoder, encoder)
+        raise RuntimeError("FFmpeg 管道初始化失败")
+    return decoder, encoder
 
 
 def _mux_preview(

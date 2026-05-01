@@ -70,14 +70,14 @@ def test_face_restore_model_values() -> None:
 # ---------------------------------------------------------------------------
 
 def _make_metadata(**kwargs) -> VideoMetadata:
-    defaults = dict(
-        input_path=Path("input.mp4"),
-        duration_seconds=10.0,
-        width=1280,
-        height=720,
-        fps=30.0,
-        video_codec="h264",
-    )
+    defaults = {
+        "input_path": Path("input.mp4"),
+        "duration_seconds": 10.0,
+        "width": 1280,
+        "height": 720,
+        "fps": 30.0,
+        "video_codec": "h264",
+    }
     defaults.update(kwargs)
     return VideoMetadata(**defaults)
 
@@ -111,10 +111,10 @@ def test_stream_info_minimal() -> None:
 # ---------------------------------------------------------------------------
 
 def _make_config(**kwargs) -> EnhancementConfig:
-    defaults = dict(
-        input_path=Path("in.mp4"),
-        output_path=Path("out.mp4"),
-    )
+    defaults = {
+        "input_path": Path("in.mp4"),
+        "output_path": Path("out.mp4"),
+    }
     defaults.update(kwargs)
     return EnhancementConfig(**defaults)
 
@@ -124,15 +124,15 @@ def test_enhancement_config_defaults() -> None:
     assert cfg.target_profile == TargetProfile.FHD
     assert cfg.quality_mode == QualityMode.QUALITY
     assert cfg.backend == BackendType.AUTO
-    assert cfg.face_restore_enabled is True
+    assert cfg.face_restore_enabled is False
     assert cfg.preserve_audio is True
 
 
 def test_enhancement_config_face_restore_strength_valid() -> None:
     cfg = _make_config(face_restore_strength=0.0)
-    assert cfg.face_restore_strength == 0.0
+    assert cfg.face_restore_strength == pytest.approx(0.0)
     cfg2 = _make_config(face_restore_strength=1.0)
-    assert cfg2.face_restore_strength == 1.0
+    assert cfg2.face_restore_strength == pytest.approx(1.0)
 
 
 def test_enhancement_config_face_restore_strength_invalid() -> None:

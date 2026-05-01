@@ -110,7 +110,7 @@ class EnhancementConfig(BaseModel):
     quality_mode: QualityMode = QualityMode.QUALITY
     backend: BackendType = BackendType.AUTO
     upscale_model: UpscaleModel = UpscaleModel.AUTO
-    face_restore_enabled: bool = True
+    face_restore_enabled: bool = False
     face_restore_strength: float = Field(default=0.55, ge=0.0, le=1.0)
     face_restore_model: FaceRestoreModel = FaceRestoreModel.CODEFORMER
     face_poisson_blend: bool = False

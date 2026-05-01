@@ -12,18 +12,21 @@ from clearvid.app.bootstrap.paths import (
     ffprobe_path as _ffprobe_path,
 )
 from clearvid.app.models.realesrgan_runner import inspect_realesrgan_runtime
-from clearvid.app.schemas.models import EnvironmentInfo, StreamInfo, VideoMetadata
+from clearvid.app.schemas.models import BackendType, EnvironmentInfo, StreamInfo, VideoMetadata
 
 
 def _which(binary_name: str) -> str | None:
     return shutil.which(binary_name)
 
 
-def _run_text(command: list[str]) -> str:
-    completed = subprocess.run(
-        command, capture_output=True, text=True, check=False,
-        encoding="utf-8", errors="replace",
-    )
+def _run_text(command: list[str], *, timeout: float = 30.0) -> str:
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, check=False,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip() or completed.stderr.strip()
@@ -145,7 +148,7 @@ def collect_environment_info() -> EnvironmentInfo:
         torch_version=torch_version,
         torch_cuda_available=torch_cuda_available,
         torch_gpu_compatible=torch_gpu_compatible,
-        preferred_backend=EnvironmentInfo.model_fields["preferred_backend"].annotation.REALESRGAN if realesrgan_available else EnvironmentInfo.model_fields["preferred_backend"].annotation.BASELINE,
+        preferred_backend=BackendType.REALESRGAN if realesrgan_available else BackendType.BASELINE,
         realesrgan_available=realesrgan_available,
         realesrgan_message=realesrgan_message,
     )
