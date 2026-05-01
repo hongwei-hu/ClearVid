@@ -401,10 +401,10 @@ def _resize_for_target(
     output_height: int,
     target_profile: TargetProfile,
 ) -> np.ndarray:
-    if target_profile in {TargetProfile.FHD, TargetProfile.UHD4K}:
-        return _fit_and_pad_frame(frame, output_width, output_height)
     if frame.shape[1] == output_width and frame.shape[0] == output_height:
         return frame
+    if target_profile in {TargetProfile.FHD, TargetProfile.UHD4K}:
+        return _fit_and_pad_frame(frame, output_width, output_height)
     return cv2.resize(frame, (output_width, output_height), interpolation=cv2.INTER_LANCZOS4)
 
 

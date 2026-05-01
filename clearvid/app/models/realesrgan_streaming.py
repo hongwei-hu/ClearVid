@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 _FRAME_QUEUE_DEPTH = 64
 _ENHANCED_QUEUE_DEPTH = 16
+_PACKED_LIST_WRITE_MIN_BATCH = 4
 _TrtTileInfo = tuple[int, int, int, int, int, int, int, int]
 _TrtPendingTile = tuple[object, _TrtTileInfo]
 _FramePayload = list[np.ndarray] | np.ndarray
@@ -655,6 +656,11 @@ def _write_encoder_frame_batch(
     target_profile: TargetProfile,
 ) -> int:
     if isinstance(frames, np.ndarray) and frames.ndim == 4:
+        prepared_batch = _prepare_encoder_frame_batch(frames, output_width, output_height, target_profile)
+        encoder_stdin.write(memoryview(prepared_batch).cast("B"))
+        return int(prepared_batch.shape[0])
+
+    if len(frames) >= _PACKED_LIST_WRITE_MIN_BATCH:
         prepared_batch = _prepare_encoder_frame_batch(frames, output_width, output_height, target_profile)
         encoder_stdin.write(memoryview(prepared_batch).cast("B"))
         return int(prepared_batch.shape[0])
