@@ -22,6 +22,7 @@ import logging
 import subprocess
 import sys
 import time as _time_module
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -33,6 +34,16 @@ TRT_PREFERRED_BATCHES = (16, 8, 4, 2, 1)
 TRT_PREFERRED_TILE_SIZES = (1024, 768, 512, 256, 128)
 TRT_ONNX_EXPORT_MAX_BATCH = 1
 TRT_ONNX_EXPORT_MAX_TILE = 512
+
+
+@dataclass(frozen=True)
+class TrtEngineCandidate:
+    tile_size: int
+    batch_size: int
+    engine_path: str
+    score: float = 0.0
+    tiles_per_frame: int = 0
+    estimated_pixels_per_frame: int = 0
 
 
 class InferenceAccelerator(str, Enum):
@@ -104,6 +115,120 @@ def find_compatible_engine(
             if engine_path.exists() and engine_path.stat().st_size > 0:
                 return candidate_tile, candidate_batch, str(engine_path)
     return None
+
+
+def find_compatible_engines(
+    model: object,
+    *,
+    fp16: bool = True,
+    cache_dir: Path | None = None,
+    weight_path: Path | None = None,
+) -> list[TrtEngineCandidate]:
+    """Return all cached engines matching the same model weights + fp16 flag."""
+    if cache_dir is None:
+        from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
+        cache_dir = TRT_CACHE_DIR
+
+    candidates: list[TrtEngineCandidate] = []
+    seen: set[tuple[int, int]] = set()
+    for candidate_batch in TRT_PREFERRED_BATCHES:
+        for candidate_tile in TRT_PREFERRED_TILE_SIZES:
+            profile = (candidate_tile, candidate_batch)
+            if profile in seen:
+                continue
+            seen.add(profile)
+            digest = _engine_cache_key(model, fp16, candidate_tile, candidate_batch, weight_path)
+            engine_path = cache_dir / f"realesrgan_{digest}.engine"
+            if engine_path.exists() and engine_path.stat().st_size > 0:
+                candidates.append(TrtEngineCandidate(
+                    tile_size=candidate_tile,
+                    batch_size=candidate_batch,
+                    engine_path=str(engine_path),
+                ))
+    return candidates
+
+
+def select_compatible_engine_for_video(
+    model: object,
+    *,
+    width: int,
+    height: int,
+    tile_pad: int = 16,
+    fp16: bool = True,
+    cache_dir: Path | None = None,
+    weight_path: Path | None = None,
+) -> TrtEngineCandidate | None:
+    """Pick the best cached TRT profile for the current video geometry.
+
+    The selector deliberately uses only cached engines.  It avoids tying the
+    cache key to video resolution, while still choosing among a small reusable
+    engine pool by estimating tile count, padded tile pixels, and batch profile
+    efficiency for the current frame size.
+    """
+    candidates = find_compatible_engines(
+        model,
+        fp16=fp16,
+        cache_dir=cache_dir,
+        weight_path=weight_path,
+    )
+    scored: list[TrtEngineCandidate] = []
+    for candidate in candidates:
+        score_info = _score_trt_engine_for_video(
+            width=width,
+            height=height,
+            tile_size=candidate.tile_size,
+            batch_size=candidate.batch_size,
+            tile_pad=tile_pad,
+        )
+        if score_info is None:
+            continue
+        score, tiles_per_frame, estimated_pixels = score_info
+        scored.append(TrtEngineCandidate(
+            tile_size=candidate.tile_size,
+            batch_size=candidate.batch_size,
+            engine_path=candidate.engine_path,
+            score=score,
+            tiles_per_frame=tiles_per_frame,
+            estimated_pixels_per_frame=estimated_pixels,
+        ))
+    if not scored:
+        return None
+    return min(scored, key=lambda item: (item.score, -item.batch_size, item.tile_size))
+
+
+def _score_trt_engine_for_video(
+    *,
+    width: int,
+    height: int,
+    tile_size: int,
+    batch_size: int,
+    tile_pad: int = 16,
+) -> tuple[float, int, int] | None:
+    """Estimate relative cost of a cached TRT profile for one input frame."""
+    width = max(1, int(width))
+    height = max(1, int(height))
+    tile_size = max(1, int(tile_size))
+    batch_size = _normalize_trt_batch(batch_size)
+    tile_pad = max(0, int(tile_pad))
+
+    min_hw = max(32, tile_size // 4)
+    target_tile_h = min(height, tile_size + tile_pad * 2)
+    target_tile_w = min(width, tile_size + tile_pad * 2)
+    if target_tile_h < min_hw or target_tile_w < min_hw:
+        return None
+
+    tiles_x = max(1, (width + tile_size - 1) // tile_size)
+    tiles_y = max(1, (height + tile_size - 1) // tile_size)
+    tiles_per_frame = tiles_x * tiles_y
+    estimated_pixels = tiles_per_frame * target_tile_h * target_tile_w
+
+    launch_overhead_pixels = tiles_per_frame * 80_000
+    batch_discount = min(batch_size, TRT_MAX_BATCH) ** 0.25
+    score = (estimated_pixels + launch_overhead_pixels) / batch_discount
+
+    if max(width, height) <= 512 and tile_size > 512:
+        score *= 1.15
+    return score, tiles_per_frame, estimated_pixels
 
 
 def accelerate_model(

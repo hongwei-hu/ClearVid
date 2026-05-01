@@ -35,6 +35,7 @@ from clearvid.app.models.tensorrt_engine import (
     accelerate_model,
     check_engine_ready,
     describe_accelerator,
+    select_compatible_engine_for_video,
 )
 from clearvid.app.models.realesrgan_support import (
     DEFAULT_MODEL_FILENAME,
@@ -151,14 +152,10 @@ def run_realesrgan_video(
         _emit_progress(progress_callback, 11, f"正在应用推理加速: {accel_label}")
         t_accel = time.perf_counter()
         trt_tile = _auto_trt_tile_size(config.tile_size, metadata.width, metadata.height)
-
-        # When TensorRT is explicitly selected (not AUTO), require a pre-built
-        # engine.  TRT engines are built for a specific (tile, batch) profile.
-        # Since TRT forces tiling which disables batching, batch_size=1 is the
-        # only value that makes sense — override auto-detected batch here.
         trt_batch = _resolve_trt_batch(config.batch_size, accel, config.inference_accelerator)
+        build_if_missing = False
 
-        if accel == InferenceAccelerator.TENSORRT and config.inference_accelerator.value != "auto":
+        if accel == InferenceAccelerator.TENSORRT:
             ready, _msg = check_engine_ready(
                 upsampler.model,
                 fp16=config.fp16_enabled,
@@ -167,39 +164,59 @@ def run_realesrgan_video(
                 cache_dir=TRT_CACHE_DIR,
                 weight_path=model_path,
             )
-            if not ready:
-                # Try to find a compatible engine with a different tile/batch size
-                from clearvid.app.models.tensorrt_engine import find_compatible_engine
-                compat = find_compatible_engine(
+            selected = None
+            should_auto_select = (
+                config.inference_accelerator.value == "auto"
+                or config.tile_size <= 0
+                or config.batch_size <= 0
+                or not ready
+            )
+            if should_auto_select:
+                selected = select_compatible_engine_for_video(
                     upsampler.model,
+                    width=metadata.width,
+                    height=metadata.height,
+                    tile_pad=config.tile_pad,
                     fp16=config.fp16_enabled,
                     cache_dir=TRT_CACHE_DIR,
                     weight_path=model_path,
                 )
-                if compat is not None:
-                    found_tile, found_batch, _ = compat
+
+            if selected is not None:
+                if selected.tile_size != trt_tile or selected.batch_size != trt_batch:
                     logger.info(
-                        "TRT 引擎 tile=%d batch=%d 未找到，自动切换到已部署的 tile=%d batch=%d 引擎",
-                        trt_tile, trt_batch, found_tile, found_batch,
+                        "自适应选择 TensorRT 引擎: requested tile=%d batch=%d -> selected tile=%d batch=%d "
+                        "(tiles/frame=%d score=%.0f)",
+                        trt_tile, trt_batch,
+                        selected.tile_size, selected.batch_size,
+                        selected.tiles_per_frame, selected.score,
                     )
-                    trt_tile = found_tile
-                    trt_batch = found_batch
-                    config = config.model_copy(update={"tile_size": found_tile, "batch_size": found_batch})
-                else:
-                    raise RuntimeError(
-                        f"TensorRT 引擎尚未部署 (tile={trt_tile}, batch={trt_batch})。"
-                        "请先使用 GUI 中的'部署 TensorRT 引擎'按钮 "
-                        "或运行 `clearvid warmup` 命令完成首次构建。\n"
-                        "或切换到'自动检测'模式以自动选择可用加速方案。"
+                    _emit_progress(
+                        progress_callback,
+                        11,
+                        f"自适应选择 TensorRT 引擎: tile={selected.tile_size} batch={selected.batch_size} "
+                        f"({selected.tiles_per_frame} tiles/帧)",
                     )
-            build_if_missing = True
-            # TRT forces tiling → batching is disabled in the pipeline.  Pin
-            # config.batch_size to match the deployed engine profile so logs
-            # and diagnostics are accurate.
-            if trt_batch != config.batch_size:
-                config = config.model_copy(update={"batch_size": trt_batch})
-        else:
-            build_if_missing = False
+                trt_tile = selected.tile_size
+                trt_batch = selected.batch_size
+                config = config.model_copy(update={"tile_size": trt_tile, "batch_size": trt_batch})
+            elif ready:
+                config = config.model_copy(update={"tile_size": trt_tile, "batch_size": trt_batch})
+            elif config.inference_accelerator.value != "auto":
+                raise RuntimeError(
+                    f"TensorRT 引擎尚未部署 (tile={trt_tile}, batch={trt_batch})。"
+                    "请先使用 GUI 中的'部署 TensorRT 引擎'按钮 "
+                    "或运行 `clearvid warmup` 命令完成首次构建。\n"
+                    "或切换到'自动检测'模式以自动选择可用加速方案。"
+                )
+            else:
+                logger.info("自动模式未找到可用 TensorRT 缓存引擎，降级到 torch.compile/标准推理")
+                _emit_progress(
+                    progress_callback,
+                    11,
+                    "未找到可复用 TensorRT 引擎，自动降级到 torch.compile/标准推理",
+                )
+                accel = InferenceAccelerator.COMPILE
 
         upsampler.model = accelerate_model(
             upsampler.model,
@@ -215,13 +232,12 @@ def run_realesrgan_video(
             low_load=True,
         )
         accel_actual = "TensorRT" if hasattr(upsampler.model, '_engine') else "PyTorch (回退)"
-        # When TRT is active, force tiling so input shapes stay within the
-        # TRT engine profile.  Whole-frame mode (tile=0) would send shapes
-        # like 854×480 that exceed the profile's max_hw.
-        if hasattr(upsampler.model, '_engine') and getattr(upsampler, 'tile', 0) == 0:
+        # When TRT is active, force the upsampler tile to the selected profile.
+        # Whole-frame mode or stale GUI values can send shapes outside profile bounds.
+        if hasattr(upsampler.model, '_engine'):
             upsampler.tile = trt_tile
             upsampler.tile_size = trt_tile
-            logger.info("TRT 激活: 强制 tiling=%d (整帧模式不兼容 TRT profile)", trt_tile)
+            logger.info("TRT 激活: 使用 tiling=%d batch=%d", trt_tile, trt_batch)
 
         # Performance advisory: TRT batch=1 with large free VRAM is GPU-underutilised.
         # Tile inference is sequential — each TRT call covers one tile, leaving GPU

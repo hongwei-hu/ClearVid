@@ -4,8 +4,10 @@ from clearvid.app.models.tensorrt_engine import (
     _engine_cache_key,
     _onnx_export_shape,
     _read_engine_profile_shapes,
+    _score_trt_engine_for_video,
     _trt_build_modes,
     find_compatible_engine,
+    select_compatible_engine_for_video,
     trt_profile_fallbacks,
 )
 from clearvid.app.gui.workers import TrtWarmupWorker
@@ -60,6 +62,61 @@ def test_find_compatible_engine_prefers_larger_batch_and_tile(tmp_path) -> None:
         cache_dir=tmp_path,
         weight_path=weight_path,
     ) == (1024, 16, str(faster))
+
+
+def test_select_compatible_engine_for_video_prefers_geometry_fit(tmp_path) -> None:
+    model = _NoParamModel()
+    weight_path = tmp_path / "model.pth"
+    weight_path.write_bytes(b"weights")
+
+    for tile_size, batch_size in [(512, 16), (768, 8), (1024, 8)]:
+        engine = tmp_path / f"realesrgan_{_engine_cache_key(model, True, tile_size, batch_size, weight_path)}.engine"
+        engine.write_bytes(b"engine")
+
+    selected = select_compatible_engine_for_video(
+        model,
+        width=1280,
+        height=720,
+        fp16=True,
+        cache_dir=tmp_path,
+        weight_path=weight_path,
+    )
+
+    assert selected is not None
+    assert (selected.tile_size, selected.batch_size) == (768, 8)
+    assert selected.tiles_per_frame == 2
+
+
+def test_select_compatible_engine_for_video_skips_profile_min_shape_mismatch(tmp_path) -> None:
+    model = _NoParamModel()
+    weight_path = tmp_path / "model.pth"
+    weight_path.write_bytes(b"weights")
+
+    tiny_invalid = tmp_path / f"realesrgan_{_engine_cache_key(model, True, 1024, 16, weight_path)}.engine"
+    tiny_valid = tmp_path / f"realesrgan_{_engine_cache_key(model, True, 512, 16, weight_path)}.engine"
+    tiny_invalid.write_bytes(b"engine")
+    tiny_valid.write_bytes(b"engine")
+
+    selected = select_compatible_engine_for_video(
+        model,
+        width=320,
+        height=180,
+        fp16=True,
+        cache_dir=tmp_path,
+        weight_path=weight_path,
+    )
+
+    assert selected is not None
+    assert (selected.tile_size, selected.batch_size) == (512, 16)
+
+
+def test_score_trt_engine_for_video_rejects_shapes_below_profile_min() -> None:
+    assert _score_trt_engine_for_video(
+        width=320,
+        height=180,
+        tile_size=1024,
+        batch_size=16,
+    ) is None
 
 
 def test_onnx_export_shape_caps_aggressive_profile() -> None:
