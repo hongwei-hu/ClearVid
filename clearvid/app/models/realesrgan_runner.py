@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import logging
 import math
+import os
 import queue
 import shutil
 import subprocess
@@ -88,6 +89,152 @@ class FrameSkipper:
         """Return a copy of the cached enhanced frame."""
         assert self._prev_enhanced is not None
         return self._prev_enhanced.copy()
+
+
+# ---------------------------------------------------------------------------
+# GPU metrics sampler — polls nvidia-smi in a background thread
+# ---------------------------------------------------------------------------
+
+class _GpuSampler:
+    """Lightweight GPU metrics collector via ``nvidia-smi``.
+
+    Spawns a daemon thread that polls ``nvidia-smi`` every *interval* seconds.
+    All public methods are thread-safe.  Silently no-ops if ``nvidia-smi`` is
+    not available so the rest of the pipeline is unaffected.
+    """
+
+    _QUERY = (
+        "index,name,uuid,pci.bus_id,"
+        "utilization.gpu,utilization.memory,"
+        "memory.used,memory.total,"
+        "temperature.gpu,"
+        "clocks.current.sm,clocks.max.sm,"
+        "power.draw"
+    )
+    _MAX_SAMPLES = 120  # keep at most ~10 min of samples at 5s interval
+
+    def __init__(self, interval: float = 5.0) -> None:
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._samples: list[dict] = []      # list of parsed sample dicts
+        self._target_uuid = self._detect_torch_device_uuid()
+        self._stop = threading.Event()
+        self._available = False
+        self._thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="gpu-sampler",
+        )
+        self._thread.start()
+
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ------------------------------------------------------------------
+    def snapshot(self) -> dict | None:
+        """Return the most-recent sample, or ``None`` if unavailable."""
+        with self._lock:
+            return dict(self._samples[-1]) if self._samples else None
+
+    def summary(self) -> dict:
+        """Return min/mean/max aggregates over all collected samples."""
+        with self._lock:
+            samples = list(self._samples)
+        if not samples:
+            return {}
+
+        def _agg(key: str) -> tuple[float, float, float]:
+            vals = [s[key] for s in samples if key in s]
+            if not vals:
+                return 0.0, 0.0, 0.0
+            return min(vals), sum(vals) / len(vals), max(vals)
+
+        _, gpu_avg, gpu_max = _agg("gpu_util")
+        _, mem_avg, mem_max = _agg("mem_used_mb")
+        _, tmp_avg, tmp_max = _agg("temperature")
+        _, pwr_avg, pwr_max = _agg("power_w")
+        _, sm_avg, sm_max = _agg("sm_clock")
+
+        first = samples[0]
+        return {
+            "gpu_avg": gpu_avg, "gpu_max": gpu_max,
+            "mem_avg_mb": mem_avg, "mem_peak_mb": mem_max,
+            "mem_total_mb": first.get("mem_total_mb", 0),
+            "temp_avg": tmp_avg, "temp_max": tmp_max,
+            "power_avg_w": pwr_avg, "power_max_w": pwr_max,
+            "sm_clock_avg": sm_avg, "sm_clock_max": sm_max,
+            "sample_count": len(samples),
+            "gpu_index": first.get("index", "?"),
+            "gpu_name": first.get("name", "?"),
+            "gpu_uuid": first.get("uuid", "?"),
+            "pci_bus_id": first.get("pci_bus_id", "?"),
+        }
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _detect_torch_device_uuid() -> str | None:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return None
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            uuid = getattr(props, "uuid", None)
+            return str(uuid) if uuid else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _poll_loop(self) -> None:
+        if not self._do_sample():
+            return  # nvidia-smi not present or failed — silently exit
+        self._available = True
+
+        while not self._stop.wait(self._interval):
+            self._do_sample()
+
+    def _do_sample(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=" + self._QUERY, "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5.0,
+            )
+            if result.returncode != 0:
+                return False
+            lines = result.stdout.strip().splitlines()
+            if not lines:
+                return False
+            line = self._select_gpu_line(lines)
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 12:
+                return False
+            sample = {
+                "index": parts[0],
+                "name": parts[1],
+                "uuid": parts[2],
+                "pci_bus_id": parts[3],
+                "gpu_util": float(parts[4]),
+                "mem_util": float(parts[5]),
+                "mem_used_mb": float(parts[6]),
+                "mem_total_mb": float(parts[7]),
+                "temperature": float(parts[8]),
+                "sm_clock": float(parts[9]),
+                "sm_clock_max": float(parts[10]),
+                "power_w": float(parts[11]),
+            }
+            with self._lock:
+                if len(self._samples) >= self._MAX_SAMPLES:
+                    self._samples.pop(0)
+                self._samples.append(sample)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _select_gpu_line(self, lines: list[str]) -> str:
+        if self._target_uuid:
+            for line in lines:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 3 and parts[2].replace("GPU-", "") == self._target_uuid.replace("GPU-", ""):
+                    return line
+        return lines[0]
+
 
 # ---------------------------------------------------------------------------
 # Model registry — each entry describes architecture, weights, and download URL
@@ -402,6 +549,33 @@ def run_realesrgan_video(
         f"初始化完成 ({t_init:.1f}s) | 模型={model_label} 加速={accel_label} "
         f"batch={config.batch_size} {batching} fp16={'是' if config.fp16_enabled else '否'} "
         f"人脸={face_label} {'async' if config.async_pipeline else 'sync'}",
+    )
+
+    # Emit structured task config block for diagnostics
+    fps_src = metadata.fps or 0.0
+    dur_s = metadata.duration_seconds or 0.0
+    total_frames_est = int(dur_s * fps_src) if dur_s > 0 and fps_src > 0 else 0
+    dur_str = f"{int(dur_s // 60)}m{int(dur_s % 60)}s" if dur_s > 0 else "未知"
+    stabilizer_label = "关闭" if not (getattr(config, 'temporal_stabilization', False)) else "开启"
+    sharpen_label = f"{config.sharpen_strength:.1f}" if config.sharpen_enabled else "关闭"
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _gpu_name = _torch.cuda.get_device_properties(0).name
+            _vram_total_gb = _torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            gpu_line = f"{_gpu_name} ({_vram_total_gb:.0f}GB VRAM)"
+        else:
+            gpu_line = "未检测到 CUDA GPU"
+    except Exception:  # noqa: BLE001
+        gpu_line = "未知"
+    _emit_progress(
+        progress_callback, 15,
+        f"[任务配置] "
+        f"输入: {metadata.width}×{metadata.height} {fps_src:.3f}fps ~{total_frames_est or '?'}帧({dur_str}) | "
+        f"输出: {output_width}×{output_height} 缩放×{output_width // max(metadata.width, 1)} | "
+        f"模型: {model_label} | 加速: {accel_label} batch={config.batch_size} {batching} fp16={'是' if config.fp16_enabled else '否'} | "
+        f"后处理: 人脸={face_label} 稳定={stabilizer_label} 锐化={sharpen_label} | "
+        f"GPU: {gpu_line}",
     )
 
     temp_root = Path(tempfile.mkdtemp(prefix="clearvid-realesrgan-"))
@@ -1102,14 +1276,21 @@ def _flush_trt_tile_batch(
     pending: list[_TrtPendingTile],
     upsampler: object,
     output: object,
+    tile_stats: dict[str, float] | None = None,
 ) -> None:
     if not pending:
         return
     import torch
 
     tiles = torch.cat([item[0] for item in pending], dim=0)
+    t0 = time.perf_counter()
     with torch.inference_mode():
         outputs = upsampler.model(tiles)
+    if tile_stats is not None:
+        tile_stats["tile_batches"] = tile_stats.get("tile_batches", 0.0) + 1.0
+        tile_stats["tiles"] = tile_stats.get("tiles", 0.0) + float(len(pending))
+        tile_stats["tile_infer_ms"] = tile_stats.get("tile_infer_ms", 0.0) + (time.perf_counter() - t0) * 1000
+        tile_stats["tile_batch_max"] = max(tile_stats.get("tile_batch_max", 0.0), float(len(pending)))
     for idx, (_, info) in enumerate(pending):
         (
             output_start_x, output_end_x, output_start_y, output_end_y,
@@ -1128,6 +1309,7 @@ def _enhance_frame_trt_tiled(
     frame: np.ndarray,
     upsampler: object,
     outscale: float,
+    tile_stats: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Enhance one frame by batching RealESRGAN tiles through TensorRT.
 
@@ -1169,7 +1351,7 @@ def _enhance_frame_trt_tiled(
             input_tile = upsampler.img[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
             tile_hw = (int(input_tile.shape[2]), int(input_tile.shape[3]))
             if pending_hw is not None and (tile_hw != pending_hw or len(pending) >= max_batch):
-                _flush_trt_tile_batch(pending, upsampler, output)
+                _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
                 pending = []
                 pending_hw = None
             pending_hw = tile_hw
@@ -1191,7 +1373,7 @@ def _enhance_frame_trt_tiled(
                     output_start_y_tile, output_end_y_tile,
                 ),
             ))
-    _flush_trt_tile_batch(pending, upsampler, output)
+    _flush_trt_tile_batch(pending, upsampler, output, tile_stats=tile_stats)
 
     upsampler.output = output
     output_img = upsampler.post_process().data.squeeze().float().cpu().clamp_(0, 1).numpy()
@@ -1215,6 +1397,7 @@ def _fetch_enhanced_frames(
     upsampler: object,
     outscale: float,
     skipper: FrameSkipper | None = None,
+    trt_tile_stats: dict[str, float] | None = None,
 ) -> list[np.ndarray] | None:
     """Fetch and enhance the next frame(s). Returns None at end of stream."""
     if use_batching:
@@ -1234,7 +1417,7 @@ def _fetch_enhanced_frames(
         return [skipper.get_cached()]
 
     if _is_trt_upsampler(upsampler) and getattr(upsampler, "tile_size", 0) > 0:
-        enhanced = _enhance_frame_trt_tiled(image, upsampler, outscale)
+        enhanced = _enhance_frame_trt_tiled(image, upsampler, outscale, tile_stats=trt_tile_stats)
     else:
         enhanced, _ = upsampler.enhance(image, outscale=outscale)
     if skipper is not None:
@@ -1507,6 +1690,7 @@ def _process_frames_async(
     _diag_face_frames = [0]                 # frames where faces were detected
     _diag_face_total = [0]                  # total faces restored
     _diag_postprocess_ms = [0.0]
+    _diag_trt_tile_stats: dict[str, float] = {}
 
     # -- Stage 2: super-resolution thread -----------------------------------
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
@@ -1521,6 +1705,7 @@ def _process_frames_async(
                     raw_queue, use_batching, config.batch_size,
                     metadata.height, metadata.width, upsampler, outscale,
                     skipper=skipper,
+                    trt_tile_stats=_diag_trt_tile_stats,
                 )
                 t_done = time.perf_counter()
                 if enhanced_list is None:
@@ -1657,6 +1842,9 @@ def _process_frames_async(
         postprocess_thread.start()
     write_thread.start()
 
+    # -- GPU metrics sampler (daemon thread, polling nvidia-smi every 5s) -----
+    _gpu_sampler = _GpuSampler(interval=5.0)
+
     # -- Main thread: progress reporting + periodic preview mux ---------------
     monitor_thread = postprocess_thread if postprocess_thread is not None else enhance_thread
     last_reported_progress = -1
@@ -1664,6 +1852,9 @@ def _process_frames_async(
     _preview_interval_frames = int(fps * 60)  # ~60 seconds of video
     _last_preview_at = 0
     _t_async_start = time.perf_counter()
+    _cpu_start = time.process_time()
+    _last_cpu_time = _cpu_start
+    _last_cpu_wall = _t_async_start
     _last_diag_time = _t_async_start
     _DIAG_INTERVAL = 10.0  # log diagnostics every 10 seconds
     while monitor_thread.is_alive():
@@ -1680,6 +1871,11 @@ def _process_frames_async(
         # Periodic diagnostics
         if now - _last_diag_time >= _DIAG_INTERVAL and progress_callback:
             _last_diag_time = now
+            cpu_now = time.process_time()
+            cpu_wall_delta = max(now - _last_cpu_wall, 1e-6)
+            cpu_pct = (cpu_now - _last_cpu_time) / cpu_wall_delta * 100.0 / max(os.cpu_count() or 1, 1)
+            _last_cpu_time = cpu_now
+            _last_cpu_wall = now
             rq = raw_queue.qsize()
             eq = enhanced_queue.qsize() if enhanced_queue is not finalized_queue else -1
             fq = finalized_queue.qsize()
@@ -1687,22 +1883,48 @@ def _process_frames_async(
                 sum(_diag_batch_sizes[-20:]) / len(_diag_batch_sizes[-20:])
                 if _diag_batch_sizes else 0
             )
-            enh_fps = _diag_enhance_frames[0] / (now - _t_async_start) if now > _t_async_start else 0
-            wr_fps = _diag_write_frames[0] / (now - _t_async_start) if now > _t_async_start else 0
+            elapsed_s = now - _t_async_start
+            enh_fps = _diag_enhance_frames[0] / elapsed_s if elapsed_s > 0 else 0
+            wr_fps = _diag_write_frames[0] / elapsed_s if elapsed_s > 0 else 0
             pp_avg = (
                 _diag_postprocess_ms[0] / _diag_write_frames[0]
                 if _diag_write_frames[0] > 0 else 0
             )
-            queue_info = f"队列: 解码={rq}/{_FRAME_QUEUE_DEPTH}"
+            avg_infer_ms = (
+                _diag_enhance_infer_ms[0] / _diag_enhance_batches[0]
+                if _diag_enhance_batches[0] > 0 else 0
+            )
+            trt_tile_batches = _diag_trt_tile_stats.get("tile_batches", 0.0)
+            trt_tiles = _diag_trt_tile_stats.get("tiles", 0.0)
+            trt_avg_tile_batch = trt_tiles / trt_tile_batches if trt_tile_batches > 0 else 0.0
+            # Queue saturation (% of max depth currently filled)
+            rq_pct = rq * 100 // max(_FRAME_QUEUE_DEPTH, 1)
+            fq_pct = fq * 100 // max(_ENHANCED_QUEUE_DEPTH, 1)
+            queue_info = f"队列: 解码={rq}/{_FRAME_QUEUE_DEPTH}({rq_pct}%)"
             if eq >= 0:
-                queue_info += f" 增强={eq}/{_ENHANCED_QUEUE_DEPTH}"
-            queue_info += f" 写入={fq}/{_ENHANCED_QUEUE_DEPTH}"
+                eq_pct = eq * 100 // max(_ENHANCED_QUEUE_DEPTH, 1)
+                queue_info += f" 增强={eq}/{_ENHANCED_QUEUE_DEPTH}({eq_pct}%)"
+            queue_info += f" 写入={fq}/{_ENHANCED_QUEUE_DEPTH}({fq_pct}%)"
             pp_info = f" 后处理={pp_avg:.0f}ms/帧" if pp_avg > 0 else ""
+            infer_info = f" 推理={avg_infer_ms:.0f}ms/批" if avg_infer_ms > 0 else ""
+            trt_info = f" TRT-tile-batch={trt_avg_tile_batch:.1f}" if trt_tile_batches > 0 else ""
+            # GPU metrics from sampler (latest sample)
+            gpu_snap = _gpu_sampler.snapshot()
+            if gpu_snap:
+                gpu_info = (
+                    f" | GPU {gpu_snap['gpu_util']:.0f}%"
+                    f" 显存 {gpu_snap['mem_used_mb']/1024:.1f}/{gpu_snap['mem_total_mb']/1024:.0f}GB"
+                    f" {gpu_snap['temperature']:.0f}°C"
+                    f" {gpu_snap['power_w']:.0f}W"
+                    f" SM{gpu_snap['sm_clock']:.0f}MHz"
+                )
+            else:
+                gpu_info = ""
             _emit_progress(
                 progress_callback,
                 last_reported_progress,
-                f"[诊断] {queue_info} | 增强 {enh_fps:.1f}fps 写入 {wr_fps:.1f}fps | "
-                f"平均batch={avg_batch:.1f}{pp_info}",
+                f"[诊断] {queue_info} | 增强 {enh_fps:.1f}fps 写入 {wr_fps:.1f}fps"
+                f" | 平均帧batch={avg_batch:.1f}{trt_info}{infer_info}{pp_info} CPU={cpu_pct:.0f}%{gpu_info}",
             )
 
     _report_stream_progress(
@@ -1710,24 +1932,82 @@ def _process_frames_async(
         progress_callback, start_time=_t_async_start,
     )
 
-    # Final diagnostics summary
+    # Stop GPU sampler and collect final summary
+    _gpu_sampler.stop()
+    _gpu_summary = _gpu_sampler.summary()
+
+    # ---- Comprehensive performance report ----------------------------------
     total_elapsed = time.perf_counter() - _t_async_start
     if progress_callback and total_elapsed > 0:
         enh_batches = _diag_enhance_batches[0]
         enh_frames = _diag_enhance_frames[0]
+        wr_frames = _diag_write_frames[0]
         avg_batch = enh_frames / enh_batches if enh_batches else 0
         avg_infer_ms = _diag_enhance_infer_ms[0] / enh_batches if enh_batches else 0
-        avg_write_ms = _diag_write_ms[0] / _diag_write_frames[0] if _diag_write_frames[0] else 0
-        avg_pp_ms = _diag_postprocess_ms[0] / _diag_write_frames[0] if _diag_write_frames[0] else 0
-        pp_part = f" 后处理: avg={avg_pp_ms:.0f}ms/帧 |" if avg_pp_ms > 0 else ""
-        _emit_progress(
-            progress_callback,
-            last_reported_progress,
-            f"[诊断汇总] 增强: {enh_frames}帧/{enh_batches}批 "
-            f"avg_batch={avg_batch:.1f} avg_infer={avg_infer_ms:.0f}ms/批 |{pp_part} "
-            f"写入: avg={avg_write_ms:.1f}ms/帧 | "
-            f"总吞吐: {enh_frames / total_elapsed:.2f} fps",
-        )
+        avg_write_ms = _diag_write_ms[0] / wr_frames if wr_frames else 0
+        avg_pp_ms = _diag_postprocess_ms[0] / wr_frames if wr_frames else 0
+        total_fps = enh_frames / total_elapsed
+        cpu_total_pct = (time.process_time() - _cpu_start) / total_elapsed * 100.0 / max(os.cpu_count() or 1, 1)
+        skip_frames = skipper.skip_count if skipper is not None else 0
+        skip_pct = skip_frames * 100.0 / max(enh_frames + skip_frames, 1)
+        trt_tile_batches = _diag_trt_tile_stats.get("tile_batches", 0.0)
+        trt_tiles = _diag_trt_tile_stats.get("tiles", 0.0)
+        trt_tile_ms = _diag_trt_tile_stats.get("tile_infer_ms", 0.0)
+        trt_tile_max_batch = _diag_trt_tile_stats.get("tile_batch_max", 0.0)
+        trt_avg_tile_batch = trt_tiles / trt_tile_batches if trt_tile_batches > 0 else 0.0
+        trt_tile_ms_per_batch = trt_tile_ms / trt_tile_batches if trt_tile_batches > 0 else 0.0
+
+        # Stage throughput breakdown (ms/frame)
+        infer_per_frame = avg_infer_ms / max(avg_batch, 1)
+
+        # GPU summary lines
+        if _gpu_summary:
+            uuid_short = str(_gpu_summary["gpu_uuid"]).replace("GPU-", "")[:8]
+            gpu_line = (
+                f"  GPU采样:   index={_gpu_summary['gpu_index']}  {_gpu_summary['gpu_name']}  "
+                f"uuid={uuid_short}  bus={_gpu_summary['pci_bus_id']}\n"
+                f"  GPU利用率: 平均 {_gpu_summary['gpu_avg']:.0f}%  峰值 {_gpu_summary['gpu_max']:.0f}%\n"
+                f"  显存占用:  平均 {_gpu_summary['mem_avg_mb']/1024:.1f}GB  "
+                f"峰值 {_gpu_summary['mem_peak_mb']/1024:.1f}GB  "
+                f"总计 {_gpu_summary['mem_total_mb']/1024:.0f}GB\n"
+                f"  GPU温度:   平均 {_gpu_summary['temp_avg']:.0f}°C  峰值 {_gpu_summary['temp_max']:.0f}°C\n"
+                f"  功耗:      平均 {_gpu_summary['power_avg_w']:.0f}W  峰值 {_gpu_summary['power_max_w']:.0f}W\n"
+                f"  SM时钟:    平均 {_gpu_summary['sm_clock_avg']:.0f}MHz  "
+                f"(最大 {_gpu_summary['sm_clock_max']:.0f}MHz)  "
+                f"采样次数={_gpu_summary['sample_count']}"
+            )
+        else:
+            gpu_line = "  GPU: nvidia-smi 未就绪，无GPU指标"
+
+        pp_line = (
+            f"  后处理:    平均 {avg_pp_ms:.1f}ms/帧  (人脸={_diag_face_frames[0]}帧 "
+            f"共{_diag_face_total[0]}张)"
+        ) if avg_pp_ms > 0 else "  后处理: 未启用"
+        trt_line = (
+            f"  TRT tiles: {trt_tiles:.0f}个 / {trt_tile_batches:.0f}批  "
+            f"平均 {trt_avg_tile_batch:.2f} tiles/批  峰值 {trt_tile_max_batch:.0f}  "
+            f"TRT调用 {trt_tile_ms_per_batch:.1f}ms/批"
+        ) if trt_tile_batches > 0 else "  TRT tiles: 未使用 TensorRT tile 批处理"
+
+        report_lines = [
+            "═" * 46,
+            "              [性能报告]",
+            "═" * 46,
+            f"  输出帧数:  {enh_frames}帧  耗时 {total_elapsed:.1f}s",
+            f"  总体吞吐:  {total_fps:.2f} fps",
+            f"  推理批次:  {enh_batches}批  平均 {avg_batch:.2f}帧/批",
+            f"  推理延迟:  {avg_infer_ms:.1f}ms/批  ({infer_per_frame:.1f}ms/帧)",
+            trt_line,
+            f"  写入延迟:  {avg_write_ms:.2f}ms/帧",
+            pp_line,
+            f"  CPU占用:   进程平均 {cpu_total_pct:.0f}%  (按 {os.cpu_count() or 1} 核归一化)",
+            f"  跳帧统计:  跳过 {skip_frames}帧 ({skip_pct:.1f}%)",
+            "  " + "-" * 42,
+            gpu_line,
+            "═" * 46,
+        ]
+        for line in report_lines:
+            _emit_progress(progress_callback, last_reported_progress, line)
 
     # -- Join background threads (with timeout to prevent hang) ---------------
     for t in (enhance_thread, postprocess_thread, write_thread):

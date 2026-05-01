@@ -103,9 +103,30 @@ class _FakeUpsampler:
 def test_enhance_frame_trt_tiled_batches_tiles_with_expected_shape() -> None:
     frame = np.full((8, 8, 3), 128, dtype=np.uint8)
     upsampler = _FakeUpsampler()
+    tile_stats: dict[str, float] = {}
 
-    enhanced = realesrgan_runner._enhance_frame_trt_tiled(frame, upsampler, outscale=2.0)
+    enhanced = realesrgan_runner._enhance_frame_trt_tiled(
+        frame, upsampler, outscale=2.0, tile_stats=tile_stats,
+    )
 
     assert enhanced.shape == (16, 16, 3)
     assert enhanced.dtype == np.uint8
     assert upsampler.model.batch_sizes == [2, 2]
+    assert tile_stats["tiles"] == 4
+    assert tile_stats["tile_batches"] == 2
+    assert tile_stats["tile_batch_max"] == 2
+    assert tile_stats["tile_infer_ms"] >= 0
+
+
+def test_gpu_sampler_selects_torch_device_uuid(monkeypatch) -> None:
+    monkeypatch.setattr(realesrgan_runner._GpuSampler, "_detect_torch_device_uuid", staticmethod(lambda: "bbbb"))
+
+    sampler = realesrgan_runner._GpuSampler.__new__(realesrgan_runner._GpuSampler)
+    sampler._target_uuid = "bbbb"
+
+    selected = sampler._select_gpu_line([
+        "0, GPU A, GPU-aaaa, 00000000:01:00.0, 10, 1, 1000, 2000, 40, 1000, 2000, 50",
+        "1, GPU B, GPU-bbbb, 00000000:02:00.0, 80, 5, 3000, 4000, 50, 1800, 2200, 180",
+    ])
+
+    assert selected.startswith("1, GPU B")
