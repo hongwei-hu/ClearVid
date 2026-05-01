@@ -56,7 +56,9 @@ class SplitCompareWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         w, h = self.width(), self.height()
 
-        if not self.has_images():
+        before = self._before
+        after = self._after
+        if before is None or after is None:
             painter.fillRect(0, 0, w, h, QColor("#111122"))
             painter.setPen(QColor("#555"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "拖入视频后\n勾选「自动生成预览」或按 Space")
@@ -64,18 +66,18 @@ class SplitCompareWidget(QWidget):
             return
 
         split_x = int(w * self._split)
-        image_rect = _fit_rect(self._before.size(), self.size())
-        after_source_rect = _center_crop_rect(self._after.size(), self._before.size())
+        image_rect = _fit_rect(before.size(), self.size())
+        after_source_rect = _center_crop_rect(after.size(), before.size())
 
         # -- Draw Before on the left side --
         painter.setClipRect(QRect(0, 0, split_x, h))
         painter.fillRect(0, 0, w, h, QColor("#111122"))
-        painter.drawPixmap(image_rect, self._before)
+        painter.drawPixmap(image_rect, before, before.rect())
 
         # -- Draw After on the right side --
         painter.setClipRect(QRect(split_x, 0, w - split_x, h))
         painter.fillRect(0, 0, w, h, QColor("#111122"))
-        painter.drawPixmap(image_rect, self._after, after_source_rect)
+        painter.drawPixmap(image_rect, after, after_source_rect)
 
         painter.setClipping(False)
 
