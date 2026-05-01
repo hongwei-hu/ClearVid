@@ -848,6 +848,20 @@ class MainWindow(QMainWindow):
 
     def _cancel_current(self) -> None:
         """Cancel the currently running worker or queue."""
+        is_running = (
+            (self._queue_worker and self._queue_worker.isRunning())
+            or (self._worker and self._worker.isRunning())
+        )
+        if is_running:
+            reply = QMessageBox.question(
+                self,
+                "确认取消",
+                "正在导出中，确定要取消当前任务吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         if self._queue_worker and self._queue_worker.isRunning():
             self._queue_worker.cancel()
             self._log_message("队列取消中…")
