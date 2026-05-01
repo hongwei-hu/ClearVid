@@ -127,6 +127,8 @@ class EnhancementConfig(BaseModel):
     batch_size: int = 4
     fp16_enabled: bool = True
     inference_accelerator: InferenceAccelerator = InferenceAccelerator.AUTO
+    trt_build_timeout: int | None = None
+    skip_frame_threshold: float = Field(default=0.0, ge=0.0, le=20.0)
     async_pipeline: bool = True
     preserve_audio: bool = True
     preserve_subtitles: bool = True

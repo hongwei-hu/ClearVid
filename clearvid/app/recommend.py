@@ -64,11 +64,21 @@ def recommend(metadata: VideoMetadata, environment: EnvironmentInfo) -> Recommen
         notes.append("显存有限，推荐快速模式以避免 OOM")
 
     # --- Upscale model ---
-    if quality_mode == "quality" and vram >= 8_000:
+    # When hardware acceleration is available, general_v3 under TensorRT is
+    # faster than pure-PyTorch x4plus with comparable quality.  Reserve x4plus
+    # for quality mode when no acceleration is available.
+    gpu_capable = (
+        environment.torch_gpu_compatible
+        and environment.nvidia_smi_available
+        and vram >= 6_000
+    )
+    if quality_mode == "quality" and vram >= 8_000 and not gpu_capable:
         upscale_model = "x4plus"
-        notes.append("高显存 + 高质量模式，使用 RRDB x4plus 模型以获得最佳细节")
+        notes.append("无硬件加速 + 高质量模式，使用 RRDB x4plus 模型以获得最佳细节")
     else:
         upscale_model = "general_v3"
+        if quality_mode == "quality" and gpu_capable:
+            notes.append("检测到 GPU 加速可用，使用 general_v3 (TRT 加速后性能更优)")
 
     # --- Tile size based on VRAM ---
     if vram >= 16_000:

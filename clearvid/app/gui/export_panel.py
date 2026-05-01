@@ -469,7 +469,41 @@ class ExportPanel(QWidget):
         lay.addLayout(
             _labeled_row("推理加速", self.accelerator_combo, TOOLTIPS["accelerator"])
         )
-        lay.addWidget(_hint("TensorRT 最快但需首次编译"))
+
+        # --- TensorRT deploy row ---
+        trt_deploy_row = QHBoxLayout()
+        self.trt_status_label = QLabel("")
+        self.trt_status_label.setStyleSheet(
+            "font-size: 11px; color: #888; padding-left: 4px;"
+        )
+        self.trt_deploy_btn = QPushButton("部署 TensorRT 引擎")
+        self.trt_deploy_btn.setFixedWidth(160)
+        self.trt_deploy_btn.setVisible(False)
+        self.trt_deploy_progress = QProgressBar()
+        self.trt_deploy_progress.setRange(0, 100)
+        self.trt_deploy_progress.setValue(0)
+        self.trt_deploy_progress.setVisible(False)
+        self.trt_deploy_progress.setFixedWidth(160)
+        self.trt_deploy_progress.setFixedHeight(18)
+        self.trt_deploy_progress.setTextVisible(True)
+        self.trt_deploy_progress.setFormat("")
+        # Toggling visibility doesn't change the row height — we use a
+        # QStackedWidget-style approach: show either button or bar.
+        trt_deploy_row.addWidget(self.trt_deploy_btn)
+        trt_deploy_row.addWidget(self.trt_deploy_progress)
+        trt_deploy_row.addWidget(self.trt_status_label)
+        trt_deploy_row.addStretch()
+        lay.addLayout(trt_deploy_row)
+
+        self._trt_deploying = False
+        self._trt_warmup_worker = None
+
+        self.trt_deploy_btn.clicked.connect(self._start_trt_deploy)
+
+        # Connect accelerator combo to show/hide and re-check deploy state
+        self.accelerator_combo.currentIndexChanged.connect(
+            self._on_accelerator_changed,
+        )
 
         self.async_pipeline = QCheckBox("异步流水线")
         self.async_pipeline.setChecked(True)
@@ -704,6 +738,137 @@ class ExportPanel(QWidget):
             sharpen_enabled=self.sharpen_enabled.isChecked(),
             sharpen_strength=self.sharpen_strength.value(),
         )
+
+    # --- TensorRT deploy -------------------------------------------------------
+
+    def _on_accelerator_changed(self) -> None:
+        """Show/hide the TRT deploy button based on selected accelerator."""
+        accel = coerce_enum(
+            InferenceAccelerator,
+            self.accelerator_combo.currentData(),
+            InferenceAccelerator.AUTO,
+        )
+        is_trt = accel == InferenceAccelerator.TENSORRT
+        self.trt_deploy_btn.setVisible(is_trt and not self._trt_deploying)
+        self._refresh_trt_status()
+
+    def _start_trt_deploy(self) -> None:
+        """Launch background TensorRT engine deployment."""
+        from clearvid.app.gui.workers import TrtWarmupWorker
+
+        # Gather current config parameters
+        model_key = coerce_enum(
+            UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO,
+        )
+        model_key_str = "general_v3" if model_key == UpscaleModel.AUTO else model_key.value
+        tile = self.tile_size_spin.value() or 512
+        batch = self.batch_size_spin.value() or 1
+
+        self._trt_deploying = True
+        self.trt_deploy_btn.setVisible(False)
+        self.trt_deploy_progress.setVisible(True)
+        self.trt_deploy_progress.setValue(0)
+        self.trt_status_label.setText("准备部署...")
+        self.trt_status_label.setStyleSheet("font-size: 11px; color: #ccc; padding-left: 4px;")
+
+        self._trt_warmup_worker = TrtWarmupWorker(
+            model_key=model_key_str,
+            tile_size=tile,
+            batch_size=batch,
+        )
+        self._trt_warmup_worker.progress.connect(self._on_trt_deploy_progress)
+        self._trt_warmup_worker.failed.connect(self._on_trt_deploy_failed)
+        self._trt_warmup_worker.ready.connect(lambda _: None)  # noop
+        self._trt_warmup_worker.done.connect(self._on_trt_deploy_done)
+        self._trt_warmup_worker.start()
+
+    def _on_trt_deploy_progress(self, pct: int, msg: str) -> None:
+        self.trt_deploy_progress.setValue(pct)
+        self.trt_status_label.setText(msg)
+        if pct >= 100:
+            self.trt_status_label.setStyleSheet(
+                "font-size: 11px; color: #4caf50; padding-left: 4px;"
+            )
+
+    def _on_trt_deploy_failed(self, err: str) -> None:
+        short = err.split("\n")[0]  # first line is the core message
+        self.trt_status_label.setText(f"部署失败: {short[:120]}")
+        self.trt_status_label.setStyleSheet(
+            "font-size: 11px; color: #f44336; padding-left: 4px;"
+        )
+
+    def _on_trt_deploy_done(self) -> None:
+        self._trt_deploying = False
+        self.trt_deploy_progress.setVisible(False)
+        self._refresh_trt_status()
+
+    def _refresh_trt_status(self) -> None:
+        """Re-check whether TRT engine is cached and update UI."""
+        accel = coerce_enum(
+            InferenceAccelerator,
+            self.accelerator_combo.currentData(),
+            InferenceAccelerator.AUTO,
+        )
+        if accel != InferenceAccelerator.TENSORRT:
+            self.trt_deploy_btn.setVisible(False)
+            if not self._trt_deploying:
+                self.trt_status_label.setText("")
+            return
+        if self._trt_deploying:
+            return
+        self.trt_deploy_btn.setVisible(True)
+        # Lightweight check: try import + check cache
+        try:
+            from clearvid.app.models.tensorrt_engine import check_engine_ready as _check
+            from clearvid.app.models.realesrgan_runner import (
+                _MODEL_REGISTRY,
+                _build_upsampler,
+                ensure_realesrgan_weights,
+                resolve_upscale_model,
+            )
+            from clearvid.app.bootstrap.paths import REALESRGAN_WEIGHTS_DIR, TRT_CACHE_DIR
+            from clearvid.app.schemas.models import EnhancementConfig as _EC, QualityMode as _QM, UpscaleModel as _UM
+
+            model_enum = coerce_enum(_UM, self.upscale_model_combo.currentData(), _UM.AUTO)
+            model_key = resolve_upscale_model(model_enum, _QM.QUALITY)
+            weights_dir = REALESRGAN_WEIGHTS_DIR
+            if not (weights_dir / _MODEL_REGISTRY[model_key]["filename"]).exists():
+                self.trt_status_label.setText("(请先下载模型权重)")
+                self.trt_status_label.setStyleSheet(
+                    "font-size: 11px; color: #888; padding-left: 4px;"
+                )
+                self.trt_deploy_btn.setEnabled(False)
+                return
+
+            tile = self.tile_size_spin.value() or 512
+            batch = self.batch_size_spin.value() or 1
+            model_path = ensure_realesrgan_weights(weights_dir, model_key)
+            dummy_config = _EC(
+                input_path=Path("check"), output_path=Path("check"),
+                tile_size=tile, batch_size=batch,
+            )
+            upsampler = _build_upsampler(dummy_config, model_path, model_key, tile, tile)
+            ready, msg = _check(
+                upsampler.model, fp16=True, tile_size=tile, batch_size=batch,
+                cache_dir=TRT_CACHE_DIR, weight_path=model_path,
+            )
+            if ready:
+                self.trt_status_label.setText("✓ 已就绪")
+                self.trt_status_label.setStyleSheet(
+                    "font-size: 11px; color: #4caf50; padding-left: 4px;"
+                )
+                self.trt_deploy_btn.setVisible(False)
+            else:
+                self.trt_status_label.setText(msg)
+                self.trt_status_label.setStyleSheet(
+                    "font-size: 11px; color: #ff9800; padding-left: 4px;"
+                )
+                self.trt_deploy_btn.setEnabled(True)
+        except Exception:
+            self.trt_status_label.setText("(无法检测状态)")
+            self.trt_status_label.setStyleSheet(
+                "font-size: 11px; color: #888; padding-left: 4px;"
+            )
 
     def apply_recommendation(self, rec: Any) -> None:
         """Apply a Recommendation object to widget state."""

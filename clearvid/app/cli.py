@@ -210,6 +210,115 @@ def batch(
 
 
 @app.command()
+def warmup(
+    model: UpscaleModel = typer.Option(UpscaleModel.GENERAL_V3, help="Model to pre-build engine for"),
+    tile_size: int = typer.Option(512, help="Tile size for the optimization profile"),
+    batch_size: int = typer.Option(1, help="Batch size"),
+    fp16: bool = typer.Option(True, help="Use FP16 precision"),
+    timeout: int | None = typer.Option(None, help="Build timeout override in seconds"),
+    fast: bool = typer.Option(False, "--fast", help="Use standard (faster-build, higher-load) mode instead of low-load"),
+) -> None:
+    """Pre-build and cache the TensorRT engine for a model.
+
+    Uses low-load mode by default (reduced GPU workspace, idle CPU priority)
+    to keep the system responsive.  Pass --fast for standard mode if you
+    prefer a shorter build time at the cost of system responsiveness.
+
+    Run once after installing/updating ClearVid or changing GPU drivers.
+    """
+    import time as _time
+    from pathlib import Path
+
+    from clearvid.app.bootstrap.paths import REALESRGAN_WEIGHTS_DIR, TRT_CACHE_DIR
+    from clearvid.app.models.realesrgan_runner import (
+        _MODEL_REGISTRY,
+        _build_upsampler,
+        ensure_realesrgan_weights,
+    )
+    from clearvid.app.models.tensorrt_engine import (
+        InferenceAccelerator,
+        accelerate_model,
+        check_engine_ready,
+    )
+    from clearvid.app.schemas.models import EnhancementConfig
+
+    low_load = not fast
+    model_key = model.value
+    if model_key not in _MODEL_REGISTRY:
+        console.print(f"[red]未知模型: {model_key}[/red]")
+        raise typer.Exit(1)
+
+    entry = _MODEL_REGISTRY[model_key]
+    mode_label = "低负载" if low_load else "标准"
+    console.print(f"[bold]预热模型: {entry['filename']} ({mode_label}模式)[/bold]")
+
+    # Ensure weights
+    weights_dir = REALESRGAN_WEIGHTS_DIR
+    console.print("检查权重文件...")
+    model_path = ensure_realesrgan_weights(weights_dir, model_key)
+    console.print(f"  权重: {model_path}")
+
+    # Build a minimal upsampler to get the model object
+    dummy_config = EnhancementConfig(
+        input_path=Path("warmup"),
+        output_path=Path("warmup"),
+        tile_size=tile_size,
+        batch_size=batch_size,
+        fp16_enabled=fp16,
+    )
+    upsampler = _build_upsampler(dummy_config, model_path, model_key, tile_size, tile_size)
+    console.print(f"  架构: {entry['arch']}")
+
+    # Check if already deployed
+    ready, msg = check_engine_ready(
+        upsampler.model,
+        fp16=fp16, tile_size=tile_size, batch_size=batch_size,
+        cache_dir=TRT_CACHE_DIR, weight_path=model_path,
+    )
+    if ready:
+        console.print(f"\n[green]✓ {msg}[/green]")
+        console.print(f"  缓存目录: {TRT_CACHE_DIR}")
+        return
+
+    # Build TRT engine
+    console.print(f"\n[bold]构建 TensorRT 引擎 ({mode_label}模式)...[/bold]")
+    console.print(f"  tile={tile_size}, batch={batch_size}, fp16={fp16}")
+    if low_load:
+        console.print(
+            "[dim]  低负载模式: 构建时间较长，但系统可保持流畅操作[/dim]"
+        )
+
+    def _cb(pct: int, msg: str) -> None:
+        console.print(f"  [{pct}%] {msg}")
+
+    t0 = _time.perf_counter()
+    try:
+        accelerate_model(
+            upsampler.model,
+            InferenceAccelerator.TENSORRT,
+            fp16=fp16,
+            tile_size=tile_size,
+            batch_size=batch_size,
+            cache_dir=TRT_CACHE_DIR,
+            progress_callback=_cb,
+            weight_path=model_path,
+            trt_build_timeout=timeout,
+            build_if_missing=True,
+            low_load=low_load,
+        )
+        elapsed = _time.perf_counter() - t0
+        console.print(f"\n[green]✓ 引擎构建成功 (耗时 {elapsed:.1f}s)[/green]")
+        console.print(f"  缓存目录: {TRT_CACHE_DIR}")
+    except Exception as exc:
+        console.print(f"\n[red]✗ 引擎构建失败: {exc}[/red]")
+        console.print(
+            "[dim]提示: 下次导出时将自动降级到 torch.compile 或标准 PyTorch。"
+            " 删除 trt_cache/ 目录中的 .failed 文件可强制重试。[/dim]"
+        )
+        raise typer.Exit(1)
+
+
+@app.command()
 def gui() -> None:
     from clearvid.app.gui import main
 

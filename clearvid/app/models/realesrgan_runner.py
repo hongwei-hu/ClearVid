@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import queue
 import shutil
 import tempfile
@@ -10,6 +11,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 import cv2
 import numpy as np
 
@@ -18,6 +21,7 @@ from clearvid.app.models.gfpgan_runner import GFPGANRestorer
 from clearvid.app.models.tensorrt_engine import (
     InferenceAccelerator,
     accelerate_model,
+    check_engine_ready,
     describe_accelerator,
     detect_best_accelerator,
 )
@@ -43,6 +47,45 @@ from clearvid.app.export_control import ExportCancelled, ExportControl
 from clearvid.app.utils.subprocess_utils import run_command
 
 DEFAULT_MODEL_SCALE = 4
+
+
+class FrameSkipper:
+    """Skip super-resolution inference for near-static frames.
+
+    When consecutive raw frames differ by less than *threshold* (mean absolute
+    pixel difference), the previous enhanced result is reused instead of
+    running the full model forward pass.  This is most effective for
+    talking-head videos, tutorials, and screen recordings.
+
+    The threshold is expressed as a mean pixel difference (0-255 range).
+    Recommended values: 2.0 (conservative) to 5.0 (aggressive).
+    Set to 0 to disable.
+    """
+
+    def __init__(self, threshold: float = 0.0):
+        self._threshold = max(0.0, threshold)
+        self._prev_raw: np.ndarray | None = None
+        self._prev_enhanced: np.ndarray | None = None
+        self.skip_count = 0
+
+    @property
+    def active(self) -> bool:
+        return self._threshold > 0
+
+    def should_skip(self, raw: np.ndarray) -> bool:
+        if not self.active or self._prev_raw is None:
+            return False
+        diff = np.abs(raw.astype(np.float32) - self._prev_raw.astype(np.float32))
+        return float(diff.mean()) < self._threshold
+
+    def record(self, raw: np.ndarray, enhanced: np.ndarray) -> None:
+        self._prev_raw = raw.copy()
+        self._prev_enhanced = enhanced.copy()
+
+    def get_cached(self) -> np.ndarray:
+        """Return a copy of the cached enhanced frame."""
+        assert self._prev_enhanced is not None
+        return self._prev_enhanced.copy()
 
 # ---------------------------------------------------------------------------
 # Model registry — each entry describes architecture, weights, and download URL
@@ -184,6 +227,32 @@ def _auto_batch_size(
     return 1
 
 
+def _resolve_trt_batch(
+    config_batch: int,
+    accel: InferenceAccelerator,
+    config_accel: InferenceAcceleratorEnum,
+) -> int:
+    """Return the effective batch_size for TRT engine lookup.
+
+    TRT forces tiling → batching is disabled in the pipeline.  Using a
+    batch_size that differs from the deployed engine's profile causes a
+    cache miss and a misleading "not deployed" error.
+
+    For explicit TensorRT mode, always pin to 1:
+    - The GUI deploy button always builds with batch=1 (spin at "自动" → 0 or 1 = 1).
+    - Auto-detected batch (e.g. 8 on high-VRAM machines) must not be treated
+      as a "user-explicit" override — it causes a hash mismatch with the
+      deployed engine.
+    """
+    # AUTO or COMPILE: keep auto-detected batch
+    if accel != InferenceAccelerator.TENSORRT:
+        return config_batch
+    if config_accel.value == "auto":
+        return config_batch
+    # Explicitly selected TensorRT: always use batch=1 to match the GUI deploy profile
+    return 1
+
+
 def run_realesrgan_video(
     config: EnhancementConfig,
     metadata: VideoMetadata,
@@ -196,9 +265,13 @@ def run_realesrgan_video(
     config = _apply_quality_mode_overrides(config)
     t_start = time.perf_counter()
 
+    # Resolve accelerator FIRST so model selection can consider it
+    accel = _resolve_accelerator(config.inference_accelerator)
+    accel_label = describe_accelerator(accel)
+
     _emit_progress(progress_callback, 6, "正在准备 Real-ESRGAN 权重")
     weights_dir = REALESRGAN_WEIGHTS_DIR
-    model_key = resolve_upscale_model(config.upscale_model, config.quality_mode)
+    model_key = resolve_upscale_model(config.upscale_model, config.quality_mode, accel)
     model_arch = _MODEL_REGISTRY[model_key]["arch"]
     config = config.model_copy(update={
         "batch_size": _auto_batch_size(config, metadata.width, metadata.height, model_arch),
@@ -208,23 +281,54 @@ def run_realesrgan_video(
     _emit_progress(progress_callback, 10, f"正在初始化 Real-ESRGAN ({model_label})")
     upsampler = _build_upsampler(config, model_path, model_key, metadata.width, metadata.height)
     tile_size = getattr(upsampler, "tile_size", getattr(upsampler, "tile", "?"))
-
-    # Apply inference accelerator
-    accel = _resolve_accelerator(config.inference_accelerator)
-    accel_label = describe_accelerator(accel)
     if accel != InferenceAccelerator.NONE:
         _emit_progress(progress_callback, 11, f"正在应用推理加速: {accel_label}")
         t_accel = time.perf_counter()
-        # TRT opt profile tile: use config value, or 512 as sensible default
         trt_tile = config.tile_size if config.tile_size > 0 else 512
+
+        # When TensorRT is explicitly selected (not AUTO), require a pre-built
+        # engine.  TRT engines are built for a specific (tile, batch) profile.
+        # Since TRT forces tiling which disables batching, batch_size=1 is the
+        # only value that makes sense — override auto-detected batch here.
+        trt_batch = _resolve_trt_batch(config.batch_size, accel, config.inference_accelerator)
+
+        if accel == InferenceAccelerator.TENSORRT and config.inference_accelerator.value != "auto":
+            ready, _msg = check_engine_ready(
+                upsampler.model,
+                fp16=config.fp16_enabled,
+                tile_size=trt_tile,
+                batch_size=trt_batch,
+                cache_dir=TRT_CACHE_DIR,
+                weight_path=model_path,
+            )
+            if not ready:
+                raise RuntimeError(
+                    f"TensorRT 引擎尚未部署 (tile={trt_tile}, batch={trt_batch})。"
+                    "请先使用 GUI 中的'部署 TensorRT 引擎'按钮 "
+                    "或运行 `clearvid warmup` 命令完成首次构建。\n"
+                    "或切换到'自动检测'模式以自动选择可用加速方案。"
+                )
+            build_if_missing = True
+            # TRT forces tiling → batching is disabled in the pipeline.  Pin
+            # config.batch_size to match the deployed engine profile so logs
+            # and diagnostics are accurate.
+            if trt_batch != config.batch_size:
+                config = config.model_copy(update={"batch_size": trt_batch})
+        else:
+            build_if_missing = False
+
         upsampler.model = accelerate_model(
             upsampler.model,
             accel,
             fp16=config.fp16_enabled,
             tile_size=trt_tile,
-            batch_size=config.batch_size,
+            batch_size=trt_batch,
             cache_dir=TRT_CACHE_DIR,
             progress_callback=progress_callback,
+            weight_path=model_path,
+            trt_build_timeout=getattr(config, 'trt_build_timeout', None),
+            build_if_missing=build_if_missing,
+            low_load=True,
         )
         accel_actual = "TensorRT" if hasattr(upsampler.model, '_engine') else "PyTorch (回退)"
         # When TRT is active, force tiling so input shapes stay within the
@@ -433,11 +537,25 @@ def _load_runtime_components() -> tuple[type, type, type, object]:
     )
 
 
-def resolve_upscale_model(upscale_model: UpscaleModel, quality_mode: QualityMode) -> str:
-    """Resolve AUTO to a concrete model key based on quality mode."""
+def resolve_upscale_model(
+    upscale_model: UpscaleModel,
+    quality_mode: QualityMode,
+    accel: InferenceAccelerator | None = None,
+) -> str:
+    """Resolve AUTO to a concrete model key based on quality mode.
+
+    When TensorRT is available, ``general_v3`` is preferred even in QUALITY mode
+    because TRT-accelerated general_v3 is faster than pure-PyTorch x4plus while
+    delivering comparable subjective quality.  x4plus is reserved for QUALITY
+    mode when no hardware acceleration is available (pure PyTorch).
+    """
     if upscale_model != UpscaleModel.AUTO:
         return upscale_model.value
     if quality_mode == QualityMode.QUALITY:
+        if accel is not None and accel != InferenceAccelerator.NONE:
+            # Hardware acceleration available: general_v3 is fast enough
+            return "general_v3"
+        # No acceleration: use x4plus for best quality (slower but worth it)
         return "x4plus"
     return "general_v3"
 
@@ -801,19 +919,18 @@ def _resolve_tile_size(config_tile_size: int, width: int, height: int, fp16: boo
 def _start_decode_thread(
     decoder_stdout: object,
     frame_size: int,
-    abort: threading.Event | None = None,
+    abort: threading.Event,
 ) -> tuple[queue.Queue, list[BaseException], threading.Thread]:
     raw_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_FRAME_QUEUE_DEPTH)
     errors: list[BaseException] = []
 
     def _loop() -> None:
         try:
-            while not (abort and abort.is_set()):
+            while not abort.is_set():
                 raw = _read_exact_bytes(decoder_stdout, frame_size)
                 if raw is None:
                     break
-                # Use timeout to avoid blocking forever if downstream crashed
-                while not (abort and abort.is_set()):
+                while not abort.is_set():
                     try:
                         raw_queue.put(raw, timeout=1.0)
                         break
@@ -821,10 +938,16 @@ def _start_decode_thread(
                         continue
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
-            if abort:
-                abort.set()
+            abort.set()
         finally:
-            raw_queue.put(None)
+            # Timeout-aware sentinel: keep trying until downstream picks it up
+            # or the pipeline is aborted entirely.
+            while not abort.is_set():
+                try:
+                    raw_queue.put(None, timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
 
     thread = threading.Thread(target=_loop, daemon=True)
     thread.start()
@@ -906,6 +1029,7 @@ def _fetch_enhanced_frames(
     width: int,
     upsampler: object,
     outscale: float,
+    skipper: FrameSkipper | None = None,
 ) -> list[np.ndarray] | None:
     """Fetch and enhance the next frame(s). Returns None at end of stream."""
     if use_batching:
@@ -919,7 +1043,14 @@ def _fetch_enhanced_frames(
     if raw_frame is None:
         return None
     image = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width, 3))
+
+    if skipper is not None and skipper.should_skip(image):
+        skipper.skip_count += 1
+        return [skipper.get_cached()]
+
     enhanced, _ = upsampler.enhance(image, outscale=outscale)
+    if skipper is not None:
+        skipper.record(image, enhanced)
     return [enhanced]
 
 
@@ -992,10 +1123,12 @@ def _process_stream_frames(
 
     assert decoder.stdout is not None
     assert encoder.stdin is not None
+    skipper = FrameSkipper(getattr(config, 'skip_frame_threshold', 0.0))
     _emit_progress(
         progress_callback, 18,
         f"正在流式处理视频帧 (batch={config.batch_size}, "
-        f"{'async' if config.async_pipeline else 'sync'})",
+        f"{'async' if config.async_pipeline else 'sync'}"
+        f"{', 智能跳帧=%d' % int(skipper._threshold) if skipper.active else ''})",
     )
 
     abort = threading.Event()
@@ -1008,6 +1141,7 @@ def _process_stream_frames(
             raw_queue, encoder, total_frames, progress_callback,
             abort=abort, control=control,
             preview_mux_trigger=preview_mux_trigger,
+            skipper=skipper,
         )
     else:
         _process_frames_sync(
@@ -1015,7 +1149,13 @@ def _process_stream_frames(
             upsampler, codeformer_restorer, stabilizer,
             raw_queue, encoder, total_frames, progress_callback,
             preview_mux_trigger=preview_mux_trigger,
+            skipper=skipper,
         )
+
+    if skipper.skip_count > 0:
+        logger.info("智能跳帧: 跳过 %d 帧 (%.1f%%)",
+                     skipper.skip_count,
+                     skipper.skip_count / max(total_frames or 1, 1) * 100)
 
     reader.join()
     if decode_errors:
@@ -1036,6 +1176,7 @@ def _process_frames_sync(
     total_frames: int | None,
     progress_callback: Callable[[int, str], None] | None,
     preview_mux_trigger: Callable[[int], None] | None = None,
+    skipper: FrameSkipper | None = None,
 ) -> None:
     """Original synchronous processing: inference and encode on main thread."""
     use_batching = getattr(upsampler, "tile_size", 0) == 0 and config.batch_size > 1
@@ -1049,6 +1190,7 @@ def _process_frames_sync(
     while True:
         enhanced_list = _fetch_enhanced_frames(
             raw_queue, use_batching, config.batch_size, metadata.height, metadata.width, upsampler, outscale,
+            skipper=skipper,
         )
         if enhanced_list is None:
             break
@@ -1087,6 +1229,7 @@ def _process_frames_async(
     abort: threading.Event | None = None,
     control: ExportControl | None = None,
     preview_mux_trigger: Callable[[int], None] | None = None,
+    skipper: FrameSkipper | None = None,
 ) -> None:
     """Async pipeline with abort-safe queue operations.
 
@@ -1162,6 +1305,7 @@ def _process_frames_async(
                 enhanced_list = _fetch_enhanced_frames(
                     raw_queue, use_batching, config.batch_size,
                     metadata.height, metadata.width, upsampler, outscale,
+                    skipper=skipper,
                 )
                 t_done = time.perf_counter()
                 if enhanced_list is None:
@@ -1181,10 +1325,12 @@ def _process_frames_async(
             enhance_errors.append(exc)
             abort.set()
         finally:
-            try:
-                enhanced_queue.put(None, timeout=2.0)
-            except queue.Full:
-                pass
+            while not abort.is_set():
+                try:
+                    enhanced_queue.put(None, timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
 
     enhance_thread = threading.Thread(
         target=_enhance_loop, daemon=True, name="sr-enhance",
@@ -1277,10 +1423,12 @@ def _process_frames_async(
                 stage3_errors.append(exc)
                 abort.set()
             finally:
-                try:
-                    finalized_queue.put(None, timeout=2.0)
-                except queue.Full:
-                    pass
+                while not abort.is_set():
+                    try:
+                        finalized_queue.put(None, timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
                 if _stab_pool is not None:
                     _stab_pool.shutdown(wait=False)
 
