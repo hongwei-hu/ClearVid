@@ -190,6 +190,11 @@ def test_trt_build_modes_use_single_strategy_in_low_load_mode() -> None:
     ]
 
 
+def test_trt_warmup_detects_recent_failed_status() -> None:
+    assert TrtWarmupWorker._is_recent_failed_status("上次部署失败 (2.5 小时前)") is True
+    assert TrtWarmupWorker._is_recent_failed_status("TensorRT 引擎尚未部署") is False
+
+
 def test_trt_failure_summary_identifies_builder_profile_failure() -> None:
     assert TrtWarmupWorker._summarize_trt_failure(
         RuntimeError("TRT 引擎构建失败 (exit=1): ENGINE_BUILD_RETURNED_NONE")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import traceback
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from clearvid.app.models.tensorrt_engine import (
 )
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.schemas.models import EnhancementConfig, QualityMode, UpscaleModel
+
+logger = logging.getLogger(__name__)
 
 
 class Worker(QThread):
@@ -113,9 +116,11 @@ class TrtWarmupWorker(QThread):
 
     def run(self) -> None:
         try:
+            self._log_warmup_started()
             weights_dir = REALESRGAN_WEIGHTS_DIR
             model_key = self._model_key
             if model_key not in _MODEL_REGISTRY:
+                logger.error("TRT warmup aborted: unknown model %s", model_key)
                 self.failed.emit(f"未知模型: {model_key}")
                 return
 
@@ -126,83 +131,217 @@ class TrtWarmupWorker(QThread):
             model_path = ensure_realesrgan_weights(weights_dir, model_key)
 
             errors: list[str] = []
-            profiles = (
-                trt_profile_fallbacks(self._tile_size, self._batch_size)
-                if self._allow_fallbacks
-                else [(self._tile_size, self._batch_size)]
-            )
+            profiles = self._candidate_profiles()
             for profile_index, (tile_size, batch_size) in enumerate(profiles, start=1):
-                try:
-                    self.progress.emit(
-                        10,
-                        f"加载模型架构: {entry['arch']} (tile={tile_size}, batch={batch_size})",
-                    )
-                    dummy_config = EnhancementConfig(
-                        input_path=Path("warmup"),
-                        output_path=Path("warmup"),
-                        tile_size=tile_size,
-                        batch_size=batch_size,
-                        fp16_enabled=self._fp16,
-                    )
-                    upsampler = _build_upsampler(
-                        dummy_config, model_path, model_key,
-                        tile_size, tile_size,
-                    )
-
-                    ready, msg = check_engine_ready(
-                        upsampler.model,
-                        fp16=self._fp16,
-                        tile_size=tile_size,
-                        batch_size=batch_size,
-                        cache_dir=TRT_CACHE_DIR,
-                        weight_path=model_path,
-                    )
-                    if ready:
-                        self.progress.emit(100, f"TensorRT 引擎已就绪 (tile={tile_size}, batch={batch_size})")
-                        return
-
-                    self.progress.emit(15, msg)
-
-                    def _cb(pct: int, msg: str) -> None:
-                        mapped = 15 + int(pct * 0.8)
-                        self.progress.emit(mapped, msg)
-
-                    accelerate_model(
-                        upsampler.model,
-                        InferenceAccelerator.TENSORRT,
-                        fp16=self._fp16,
-                        tile_size=tile_size,
-                        batch_size=batch_size,
-                        cache_dir=TRT_CACHE_DIR,
-                        progress_callback=_cb,
-                        weight_path=model_path,
-                        trt_build_timeout=self._timeout,
-                        build_if_missing=True,
-                        low_load=self._low_load,
-                    )
-                    self.progress.emit(100, f"TensorRT 引擎部署完成 (tile={tile_size}, batch={batch_size})")
+                should_stop = self._try_profile(
+                    model_key, entry, model_path, profile_index, len(profiles),
+                    tile_size, batch_size, errors,
+                )
+                if should_stop:
                     return
-                except Exception as exc:  # noqa: BLE001
-                    reason = self._summarize_trt_failure(exc)
-                    errors.append(f"tile={tile_size}, batch={batch_size}: {reason}")
-                    if "upsampler" in locals():
-                        del upsampler
-                    if profile_index < len(profiles):
-                        self.progress.emit(
-                            15,
-                            f"当前配置失败 ({reason})，自动降档重试: {profiles[profile_index]}",
-                        )
-                        self._clear_cuda_cache()
-                        continue
-                    self.failed.emit(
-                        "TensorRT 引擎部署失败，已尝试以下配置:\n"
-                        + "\n".join(errors)
-                        + f"\n\n--- 完整异常信息 ---\n{traceback.format_exc()}"
-                    )
         except Exception as exc:  # noqa: BLE001
+            logger.exception("TRT warmup crashed")
             self.failed.emit(f"{exc}\n\n--- 完整异常信息 ---\n{traceback.format_exc()}")
         finally:
+            logger.info("TRT warmup finished: model=%s", self._model_key)
             self.done.emit()
+
+    def _log_warmup_started(self) -> None:
+        logger.info(
+            "TRT warmup started: model=%s tile=%d batch=%d fp16=%s low_load=%s fallback=%s",
+            self._model_key,
+            self._tile_size,
+            self._batch_size,
+            self._fp16,
+            self._low_load,
+            self._allow_fallbacks,
+        )
+
+    def _candidate_profiles(self) -> list[tuple[int, int]]:
+        if self._allow_fallbacks:
+            return trt_profile_fallbacks(self._tile_size, self._batch_size)
+        return [(self._tile_size, self._batch_size)]
+
+    def _try_profile(
+        self,
+        model_key: str,
+        entry: dict,
+        model_path: Path,
+        profile_index: int,
+        profile_count: int,
+        tile_size: int,
+        batch_size: int,
+        errors: list[str],
+    ) -> bool:
+        try:
+            self._log_profile_attempt(model_key, profile_index, profile_count, tile_size, batch_size)
+            upsampler = self._build_warmup_upsampler(entry, model_path, model_key, tile_size, batch_size)
+            ready, msg = self._check_profile_status(upsampler.model, model_path, tile_size, batch_size)
+            if ready:
+                logger.info(
+                    "TRT engine already ready: model=%s tile=%d batch=%d",
+                    model_key, tile_size, batch_size,
+                )
+                self.progress.emit(100, f"TensorRT 引擎已就绪 (tile={tile_size}, batch={batch_size})")
+                return True
+
+            self.progress.emit(15, msg)
+            if self._should_skip_fallback_profile(profile_index, msg):
+                return self._skip_failed_fallback(
+                    model_key, tile_size, batch_size, msg, errors,
+                    profile_index, profile_count,
+                )
+
+            self._deploy_profile(upsampler.model, model_path, tile_size, batch_size)
+            logger.info(
+                "TRT engine deployed: model=%s tile=%d batch=%d",
+                model_key, tile_size, batch_size,
+            )
+            self.progress.emit(100, f"TensorRT 引擎部署完成 (tile={tile_size}, batch={batch_size})")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            return self._handle_profile_exception(
+                exc, model_key, tile_size, batch_size,
+                profile_index, profile_count, errors,
+            )
+
+    def _log_profile_attempt(
+        self,
+        model_key: str,
+        profile_index: int,
+        profile_count: int,
+        tile_size: int,
+        batch_size: int,
+    ) -> None:
+        logger.info(
+            "TRT warmup profile attempt %d/%d: model=%s tile=%d batch=%d",
+            profile_index,
+            profile_count,
+            model_key,
+            tile_size,
+            batch_size,
+        )
+
+    def _build_warmup_upsampler(
+        self,
+        entry: dict,
+        model_path: Path,
+        model_key: str,
+        tile_size: int,
+        batch_size: int,
+    ):
+        self.progress.emit(
+            10,
+            f"加载模型架构: {entry['arch']} (tile={tile_size}, batch={batch_size})",
+        )
+        dummy_config = EnhancementConfig(
+            input_path=Path("warmup"),
+            output_path=Path("warmup"),
+            tile_size=tile_size,
+            batch_size=batch_size,
+            fp16_enabled=self._fp16,
+        )
+        return _build_upsampler(
+            dummy_config, model_path, model_key,
+            tile_size, tile_size,
+        )
+
+    def _check_profile_status(
+        self,
+        model,
+        model_path: Path,
+        tile_size: int,
+        batch_size: int,
+    ) -> tuple[bool, str]:
+        return check_engine_ready(
+            model,
+            fp16=self._fp16,
+            tile_size=tile_size,
+            batch_size=batch_size,
+            cache_dir=TRT_CACHE_DIR,
+            weight_path=model_path,
+        )
+
+    def _deploy_profile(
+        self,
+        model,
+        model_path: Path,
+        tile_size: int,
+        batch_size: int,
+    ) -> None:
+        def _cb(pct: int, msg: str) -> None:
+            mapped = 15 + int(pct * 0.8)
+            self.progress.emit(mapped, msg)
+
+        accelerate_model(
+            model,
+            InferenceAccelerator.TENSORRT,
+            fp16=self._fp16,
+            tile_size=tile_size,
+            batch_size=batch_size,
+            cache_dir=TRT_CACHE_DIR,
+            progress_callback=_cb,
+            weight_path=model_path,
+            trt_build_timeout=self._timeout,
+            build_if_missing=True,
+            low_load=self._low_load,
+        )
+
+    def _should_skip_fallback_profile(self, profile_index: int, message: str) -> bool:
+        return (
+            self._allow_fallbacks
+            and profile_index > 1
+            and self._is_recent_failed_status(message)
+        )
+
+    def _skip_failed_fallback(
+        self,
+        model_key: str,
+        tile_size: int,
+        batch_size: int,
+        message: str,
+        errors: list[str],
+        profile_index: int,
+        profile_count: int,
+    ) -> bool:
+        reason = f"跳过近期失败记录 ({message})"
+        logger.info(
+            "Skipping recently failed TRT fallback profile: model=%s tile=%d batch=%d status=%s",
+            model_key, tile_size, batch_size, message,
+        )
+        errors.append(f"tile={tile_size}, batch={batch_size}: {reason}")
+        if profile_index < profile_count:
+            self.progress.emit(15, f"{reason}，继续尝试下一个组合")
+            return False
+        self.failed.emit("TensorRT 引擎部署失败，已尝试以下配置:\n" + "\n".join(errors))
+        return True
+
+    def _handle_profile_exception(
+        self,
+        exc: Exception,
+        model_key: str,
+        tile_size: int,
+        batch_size: int,
+        profile_index: int,
+        profile_count: int,
+        errors: list[str],
+    ) -> bool:
+        reason = self._summarize_trt_failure(exc)
+        logger.exception(
+            "TRT warmup profile failed: model=%s tile=%d batch=%d reason=%s",
+            model_key, tile_size, batch_size, reason,
+        )
+        errors.append(f"tile={tile_size}, batch={batch_size}: {reason}")
+        if profile_index < profile_count:
+            self.progress.emit(15, f"当前配置失败 ({reason})，继续尝试下一个组合")
+            self._clear_cuda_cache()
+            return False
+        self.failed.emit(
+            "TensorRT 引擎部署失败，已尝试以下配置:\n"
+            + "\n".join(errors)
+            + f"\n\n--- 完整异常信息 ---\n{traceback.format_exc()}"
+        )
+        return True
 
     @staticmethod
     def _clear_cuda_cache() -> None:
@@ -212,6 +351,10 @@ class TrtWarmupWorker(QThread):
                 torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _is_recent_failed_status(message: str) -> bool:
+        return message.startswith("上次部署失败")
 
     @staticmethod
     def _summarize_trt_failure(exc: Exception) -> str:

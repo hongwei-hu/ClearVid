@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from clearvid.app.gui._helpers import coerce_enum
+from clearvid.app.gui.crash_logging import open_log_dir, setup_gui_crash_logging
 from clearvid.app.gui.estimation import format_duration
 from clearvid.app.gui.export_panel import ExportPanel
 from clearvid.app.gui.file_panel import FilePanel
@@ -116,6 +117,7 @@ class MainWindow(QMainWindow):
         settings_menu.addAction("全局设置...", self._show_settings_dialog)
         settings_menu.addSeparator()
         settings_menu.addAction("环境诊断", self._show_env_dialog)
+        settings_menu.addAction("打开日志目录", open_log_dir)
         self._log_action = settings_menu.addAction("显示日志面板", self._toggle_log)
         self._log_action.setCheckable(True)
         self._log_action.setChecked(False)
@@ -990,18 +992,7 @@ class MainWindow(QMainWindow):
 
 def launch() -> None:
     """Create QApplication, apply theme, and show the main window."""
-    # Global exception hook — log crashes instead of silent exit.
-    _logger = logging.getLogger("clearvid.gui")
-
-    def _exception_hook(exc_type, exc_value, exc_tb):
-        _logger.critical(
-            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb),
-        )
-        # Also print to stderr so the console shows it.
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-    sys.excepthook = _exception_hook
-
+    setup_gui_crash_logging()
     app = QApplication(sys.argv)
 
     # Set a default font with explicit point size to prevent
