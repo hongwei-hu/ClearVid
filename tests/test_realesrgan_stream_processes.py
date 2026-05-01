@@ -280,6 +280,22 @@ def test_enhance_frames_trt_tiled_batches_tiles_across_frames() -> None:
     assert tile_stats["tile_batch_max"] == 4
 
 
+def test_enhance_frame_trt_tiled_single_tile_avoids_cat(monkeypatch) -> None:
+    frame = np.full((4, 4, 3), 128, dtype=np.uint8)
+    upsampler = _FakeUpsampler()
+    upsampler.tile_size = 4
+    upsampler.model.max_batch = 4
+
+    def fail_cat(*_args, **_kwargs):
+        raise AssertionError("torch.cat should not be used for a single TRT tile batch")
+
+    monkeypatch.setattr(torch, "cat", fail_cat)
+
+    enhanced = realesrgan_runner._enhance_frame_trt_tiled(frame, upsampler, outscale=2.0)
+
+    assert enhanced.shape == (8, 8, 3)
+
+
 def test_fetch_enhanced_frames_trt_batches_when_skipper_inactive() -> None:
     raw_queue: queue.Queue[bytes | None] = queue.Queue()
     for value in (64, 128, 192):

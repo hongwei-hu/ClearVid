@@ -222,7 +222,7 @@ def _flush_trt_tile_batch(
         return
     import torch
 
-    tiles = torch.cat([item[0] for item in pending], dim=0)
+    tiles = _make_trt_tile_batch(pending)
     t0 = time.perf_counter()
     with torch.inference_mode():
         outputs = upsampler.model(tiles)
@@ -250,6 +250,15 @@ def _flush_trt_tile_batch(
         output_offset += tile_batch
     if tile_stats is not None:
         tile_stats["trt_stitch_ms"] = tile_stats.get("trt_stitch_ms", 0.0) + (time.perf_counter() - t_stitch) * 1000
+
+
+def _make_trt_tile_batch(pending: list[_TrtPendingTile]) -> object:
+    import torch
+
+    if len(pending) == 1:
+        tile = pending[0][0]
+        return tile if tile.is_contiguous() else tile.contiguous()
+    return torch.cat([item[0] for item in pending], dim=0)
 
 
 def _trt_output_to_frames(
