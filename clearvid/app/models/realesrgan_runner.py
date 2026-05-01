@@ -1336,6 +1336,8 @@ def _enhance_frame_trt_tiled(
     tile_size = int(getattr(upsampler, "tile_size", 0) or 0)
     tile_pad = int(getattr(upsampler, "tile_pad", 0) or 0)
     max_batch = max(1, int(getattr(upsampler.model, "max_batch", 1)))
+    if tile_stats is not None:
+        tile_stats["engine_max_batch"] = float(max_batch)
     tiles_x = math.ceil(width / tile_size)
     tiles_y = math.ceil(height / tile_size)
     target_tile_h = min(height, tile_size + tile_pad * 2)
@@ -1967,6 +1969,7 @@ def _process_frames_async(
         trt_tiles = _diag_trt_tile_stats.get("tiles", 0.0)
         trt_tile_ms = _diag_trt_tile_stats.get("tile_infer_ms", 0.0)
         trt_tile_max_batch = _diag_trt_tile_stats.get("tile_batch_max", 0.0)
+        trt_engine_max_batch = _diag_trt_tile_stats.get("engine_max_batch", 0.0)
         trt_avg_tile_batch = trt_tiles / trt_tile_batches if trt_tile_batches > 0 else 0.0
         trt_tile_ms_per_batch = trt_tile_ms / trt_tile_batches if trt_tile_batches > 0 else 0.0
 
@@ -1999,7 +2002,7 @@ def _process_frames_async(
         trt_line = (
             f"  TRT tiles: {trt_tiles:.0f}个 / {trt_tile_batches:.0f}批  "
             f"平均 {trt_avg_tile_batch:.2f} tiles/批  峰值 {trt_tile_max_batch:.0f}  "
-            f"TRT调用 {trt_tile_ms_per_batch:.1f}ms/批"
+            f"engine_max_batch={trt_engine_max_batch:.0f}  TRT调用 {trt_tile_ms_per_batch:.1f}ms/批"
         ) if trt_tile_batches > 0 else "  TRT tiles: 未使用 TensorRT tile 批处理"
 
         report_lines = [

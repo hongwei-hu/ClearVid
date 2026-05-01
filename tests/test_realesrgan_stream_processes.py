@@ -115,6 +115,7 @@ def test_enhance_frame_trt_tiled_batches_tiles_with_expected_shape() -> None:
     assert tile_stats["tiles"] == 4
     assert tile_stats["tile_batches"] == 2
     assert tile_stats["tile_batch_max"] == 2
+    assert tile_stats["engine_max_batch"] == 2
     assert tile_stats["tile_infer_ms"] >= 0
 
 
@@ -132,6 +133,7 @@ def test_enhance_frame_trt_tiled_pads_edge_tiles_to_batch() -> None:
     assert tile_stats["tiles"] == 2
     assert tile_stats["tile_batches"] == 1
     assert tile_stats["tile_batch_max"] == 2
+    assert tile_stats["engine_max_batch"] == 2
 
 
 def test_gpu_sampler_selects_torch_device_uuid(monkeypatch) -> None:

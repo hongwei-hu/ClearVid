@@ -24,7 +24,7 @@ import sys
 import time as _time_module
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -687,8 +687,9 @@ class _TensorRTModelWrapper:
         self.opt_shape: tuple[int, ...] | None = None
         self.max_shape: tuple[int, ...] | None = None
         try:
-            self.opt_shape = tuple(self._engine.get_profile_shape("input", 0)[1])
-            self.max_shape = tuple(self._engine.get_profile_shape("input", 0)[2])
+            profile_shape = _read_engine_profile_shapes(self._engine, "input", 0)
+            self.opt_shape = tuple(profile_shape[1])
+            self.max_shape = tuple(profile_shape[2])
             self.max_batch = int(self.max_shape[0])
         except Exception:
             pass
@@ -696,7 +697,9 @@ class _TensorRTModelWrapper:
         # Warm up: one dummy inference to trigger lazy CUDA init
         import torch
         try:
-            opt_shape = self.opt_shape or self._engine.get_profile_shape("input", 0)[1]
+            opt_shape = self.opt_shape
+            if opt_shape is None:
+                opt_shape = tuple(_read_engine_profile_shapes(self._engine, "input", 0)[1])
             dummy = torch.randn(*opt_shape, device="cuda", dtype=torch.float16 if fp16 else torch.float32)
             self.__call__(dummy)
             del dummy
@@ -729,6 +732,18 @@ class _TensorRTModelWrapper:
 
     def to(self, *args, **kwargs):
         return self
+
+
+def _shape_tuple(shape: Any) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in shape)
+
+
+def _read_engine_profile_shapes(engine: Any, tensor_name: str, profile_index: int) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    if hasattr(engine, "get_tensor_profile_shape"):
+        min_shape, opt_shape, max_shape = engine.get_tensor_profile_shape(tensor_name, profile_index)
+    else:
+        min_shape, opt_shape, max_shape = engine.get_profile_shape(tensor_name, profile_index)
+    return _shape_tuple(min_shape), _shape_tuple(opt_shape), _shape_tuple(max_shape)
 
 
 # ---------------------------------------------------------------------------
