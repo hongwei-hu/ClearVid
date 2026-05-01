@@ -867,7 +867,7 @@ class ExportPanel(QWidget):
         self.trt_deploy_btn.setVisible(True)
         # Lightweight check: try import + check cache
         try:
-            from clearvid.app.models.tensorrt_engine import check_engine_ready as _check
+            from clearvid.app.models.tensorrt_engine import check_engine_ready as _check, InferenceAccelerator as _IA
             from clearvid.app.models.realesrgan_runner import (
                 _MODEL_REGISTRY,
                 _build_upsampler,
@@ -878,7 +878,9 @@ class ExportPanel(QWidget):
             from clearvid.app.schemas.models import EnhancementConfig as _EC, QualityMode as _QM, UpscaleModel as _UM
 
             model_enum = coerce_enum(_UM, self.upscale_model_combo.currentData(), _UM.AUTO)
-            model_key = resolve_upscale_model(model_enum, _QM.QUALITY)
+            # Pass accel=TENSORRT so that AUTO resolves to general_v3 (same as
+            # the deploy button), instead of x4plus which has a different hash.
+            model_key = resolve_upscale_model(model_enum, _QM.QUALITY, accel=_IA.TENSORRT)
             weights_dir = REALESRGAN_WEIGHTS_DIR
             if not (weights_dir / _MODEL_REGISTRY[model_key]["filename"]).exists():
                 self.trt_status_label.setText("(请先下载模型权重)")

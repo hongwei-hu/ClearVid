@@ -112,7 +112,6 @@ class TrtWarmupWorker(QThread):
             model_key = self._model_key
             if model_key not in _MODEL_REGISTRY:
                 self.failed.emit(f"未知模型: {model_key}")
-                self.done.emit()
                 return
 
             entry = _MODEL_REGISTRY[model_key]
@@ -146,8 +145,7 @@ class TrtWarmupWorker(QThread):
             )
             if ready:
                 self.progress.emit(100, "TensorRT 引擎已就绪")
-                self.done.emit()
-                return
+                return  # done emitted by finally
 
             self.progress.emit(15, msg)
 
