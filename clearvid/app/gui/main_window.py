@@ -270,6 +270,7 @@ class MainWindow(QMainWindow):
             self._export_panel.update_estimation(
                 self._video_duration, self._video_frames, self._video_size_bytes,
             )
+            self._export_panel.set_current_video_info(metadata.width, metadata.height)
             # Auto-preview at slider position when enabled
             if self._preview_panel.is_auto_preview():
                 # Use singleShot so the file-selection flow finishes first.

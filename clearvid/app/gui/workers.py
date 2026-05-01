@@ -100,6 +100,7 @@ class TrtWarmupWorker(QThread):
         fp16: bool = True,
         timeout: int | None = None,
         low_load: bool = False,
+        allow_fallbacks: bool = True,
     ) -> None:
         super().__init__()
         self._model_key = model_key
@@ -108,6 +109,7 @@ class TrtWarmupWorker(QThread):
         self._fp16 = fp16
         self._timeout = timeout
         self._low_load = low_load
+        self._allow_fallbacks = allow_fallbacks
 
     def run(self) -> None:
         try:
@@ -124,7 +126,11 @@ class TrtWarmupWorker(QThread):
             model_path = ensure_realesrgan_weights(weights_dir, model_key)
 
             errors: list[str] = []
-            profiles = trt_profile_fallbacks(self._tile_size, self._batch_size)
+            profiles = (
+                trt_profile_fallbacks(self._tile_size, self._batch_size)
+                if self._allow_fallbacks
+                else [(self._tile_size, self._batch_size)]
+            )
             for profile_index, (tile_size, batch_size) in enumerate(profiles, start=1):
                 try:
                     self.progress.emit(

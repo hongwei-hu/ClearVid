@@ -46,6 +46,19 @@ class TrtEngineCandidate:
     estimated_pixels_per_frame: int = 0
 
 
+@dataclass(frozen=True)
+class TrtProfileCacheEntry:
+    tile_size: int
+    batch_size: int
+    digest: str
+    state: str
+    engine_path: str
+    failed_path: str
+    size_mb: float = 0.0
+    modified_at: float = 0.0
+    failure_reason: str = ""
+
+
 class InferenceAccelerator(str, Enum):
     NONE = "none"
     COMPILE = "compile"
@@ -87,6 +100,56 @@ def check_engine_ready(
         age_h = (_time_module.time() - prev["timestamp"]) / 3600
         return False, f"上次部署失败 ({age_h:.1f} 小时前)"
     return False, "TensorRT 引擎尚未部署"
+
+
+def list_trt_profile_cache(
+    model: object,
+    *,
+    fp16: bool = True,
+    cache_dir: Path | None = None,
+    weight_path: Path | None = None,
+    tile_sizes: tuple[int, ...] = TRT_PREFERRED_TILE_SIZES,
+    batch_sizes: tuple[int, ...] = TRT_PREFERRED_BATCHES,
+) -> list[TrtProfileCacheEntry]:
+    """List ready/failed/missing cache entries for common TRT profiles."""
+    if cache_dir is None:
+        from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
+        cache_dir = TRT_CACHE_DIR
+
+    entries: list[TrtProfileCacheEntry] = []
+    for tile_size in tile_sizes:
+        for batch_size in batch_sizes:
+            batch_size = _normalize_trt_batch(batch_size)
+            digest = _engine_cache_key(model, fp16, tile_size, batch_size, weight_path)
+            engine_path = cache_dir / f"realesrgan_{digest}.engine"
+            failed_path = cache_dir / f"realesrgan_{digest}.failed"
+            state = "missing"
+            size_mb = 0.0
+            modified_at = 0.0
+            failure_reason = ""
+            if engine_path.exists() and engine_path.stat().st_size > 0:
+                stat = engine_path.stat()
+                state = "ready"
+                size_mb = stat.st_size / (1024 * 1024)
+                modified_at = stat.st_mtime
+            elif failed_path.exists():
+                state = "failed"
+                modified_at = failed_path.stat().st_mtime
+                marker = _read_failed_marker(failed_path)
+                if marker is not None:
+                    failure_reason = str(marker.get("reason", ""))
+            entries.append(TrtProfileCacheEntry(
+                tile_size=tile_size,
+                batch_size=batch_size,
+                digest=digest,
+                state=state,
+                engine_path=str(engine_path),
+                failed_path=str(failed_path),
+                size_mb=size_mb,
+                modified_at=modified_at,
+                failure_reason=failure_reason,
+            ))
+    return entries
 
 
 def find_compatible_engine(

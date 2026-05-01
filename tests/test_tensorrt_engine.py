@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from clearvid.app.models.tensorrt_engine import (
     _engine_cache_key,
     _onnx_export_shape,
@@ -7,6 +9,7 @@ from clearvid.app.models.tensorrt_engine import (
     _score_trt_engine_for_video,
     _trt_build_modes,
     find_compatible_engine,
+    list_trt_profile_cache,
     select_compatible_engine_for_video,
     trt_profile_fallbacks,
 )
@@ -62,6 +65,36 @@ def test_find_compatible_engine_prefers_larger_batch_and_tile(tmp_path) -> None:
         cache_dir=tmp_path,
         weight_path=weight_path,
     ) == (1024, 16, str(faster))
+
+
+def test_list_trt_profile_cache_reports_ready_failed_and_missing(tmp_path) -> None:
+    model = _NoParamModel()
+    weight_path = tmp_path / "model.pth"
+    weight_path.write_bytes(b"weights")
+
+    ready_digest = _engine_cache_key(model, True, 512, 8, weight_path)
+    failed_digest = _engine_cache_key(model, True, 512, 4, weight_path)
+    (tmp_path / f"realesrgan_{ready_digest}.engine").write_bytes(b"engine")
+    (tmp_path / f"realesrgan_{failed_digest}.failed").write_text(
+        f'{{"timestamp": {time.time()}, "reason": "builder failed"}}',
+        encoding="utf-8",
+    )
+
+    entries = list_trt_profile_cache(
+        model,
+        fp16=True,
+        cache_dir=tmp_path,
+        weight_path=weight_path,
+        tile_sizes=(512,),
+        batch_sizes=(8, 4, 1),
+    )
+    states = {(entry.tile_size, entry.batch_size): entry.state for entry in entries}
+
+    assert states[(512, 8)] == "ready"
+    assert states[(512, 4)] == "failed"
+    assert states[(512, 1)] == "missing"
+    failed = next(entry for entry in entries if entry.batch_size == 4)
+    assert failed.failure_reason == "builder failed"
 
 
 def test_select_compatible_engine_for_video_prefers_geometry_fit(tmp_path) -> None:

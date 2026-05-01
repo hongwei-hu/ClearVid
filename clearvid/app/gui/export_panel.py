@@ -138,6 +138,8 @@ TOOLTIPS: dict[str, str] = {
     "preserve_metadata": "保留拍摄日期、GPS 等元信息",
 }
 
+_TRT_STATUS_MUTED_STYLE = "font-size: 11px; color: #888; padding-left: 4px;"
+
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -178,6 +180,9 @@ class ExportPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._sections: dict[str, CollapsibleSection] = {}
+        self._current_video_width = 0
+        self._current_video_height = 0
+        self._trt_manager_dialog = None
 
         # Outer layout: scrollable body + fixed bottom
         outer = QVBoxLayout(self)
@@ -473,9 +478,7 @@ class ExportPanel(QWidget):
         # --- TensorRT deploy row ---
         trt_deploy_row = QHBoxLayout()
         self.trt_status_label = QLabel("")
-        self.trt_status_label.setStyleSheet(
-            "font-size: 11px; color: #888; padding-left: 4px;"
-        )
+        self.trt_status_label.setStyleSheet(_TRT_STATUS_MUTED_STYLE)
         self.trt_deploy_btn = QPushButton("部署 TensorRT 引擎")
         self.trt_deploy_btn.setFixedWidth(160)
         self.trt_deploy_btn.setVisible(False)
@@ -495,11 +498,24 @@ class ExportPanel(QWidget):
         trt_deploy_row.addStretch()
         lay.addLayout(trt_deploy_row)
 
+        trt_manage_row = QHBoxLayout()
+        self.trt_manage_btn = QPushButton("管理 TensorRT 引擎")
+        self.trt_manage_btn.setToolTip(
+            "查看已经编译好的加速引擎，或手动选择分块大小/并行量来构建新引擎。"
+        )
+        self.trt_prediction_label = QLabel("自动选择会使用最适合当前视频的已缓存引擎")
+        self.trt_prediction_label.setWordWrap(True)
+        self.trt_prediction_label.setStyleSheet("font-size: 11px; color: #9e9e9e; padding-left: 4px;")
+        trt_manage_row.addWidget(self.trt_manage_btn)
+        trt_manage_row.addWidget(self.trt_prediction_label, 1)
+        lay.addLayout(trt_manage_row)
+
         self._trt_deploying = False
         self._trt_warmup_worker = None
         self._is_exporting = False  # set by MainWindow via set_exporting_state()
 
         self.trt_deploy_btn.clicked.connect(self._start_trt_deploy)
+        self.trt_manage_btn.clicked.connect(self._show_trt_manager)
 
         # Connect accelerator combo to show/hide and re-check deploy state
         self.accelerator_combo.currentIndexChanged.connect(
@@ -530,6 +546,10 @@ class ExportPanel(QWidget):
             _labeled_row("分块尺寸", self.tile_size_spin, TOOLTIPS["tile_size"])
         )
         lay.addWidget(_hint("0=自动，OOM 时可设 256/512"))
+
+        self.upscale_model_combo.currentIndexChanged.connect(self._update_trt_prediction_label)
+        self.batch_size_spin.valueChanged.connect(self._update_trt_prediction_label)
+        self.tile_size_spin.valueChanged.connect(self._update_trt_prediction_label)
 
         self._layout.addWidget(sec)
         self._sections["performance"] = sec
@@ -856,8 +876,72 @@ class ExportPanel(QWidget):
         self.log_message.emit("[TRT] 部署流程结束")
         self._refresh_trt_status()
 
+    def _show_trt_manager(self) -> None:
+        from clearvid.app.gui.trt_manager_dialog import TrtManagerDialog
+
+        model_key = coerce_enum(
+            UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO,
+        )
+        model_key_str = "general_v3" if model_key == UpscaleModel.AUTO else model_key.value
+        dlg = TrtManagerDialog(
+            self,
+            current_width=self._current_video_width,
+            current_height=self._current_video_height,
+            current_model_key=model_key_str,
+        )
+        dlg.log_message.connect(self.log_message.emit)
+        dlg.finished.connect(lambda _result: self._refresh_trt_status())
+        self._trt_manager_dialog = dlg
+        dlg.show()
+
+    def set_current_video_info(self, width: int, height: int) -> None:
+        self._current_video_width = max(0, int(width))
+        self._current_video_height = max(0, int(height))
+        self._update_trt_prediction_label()
+
+    def _update_trt_prediction_label(self) -> None:
+        if self._current_video_width <= 0 or self._current_video_height <= 0:
+            self.trt_prediction_label.setText("选择视频后会显示自动选择的 TensorRT 引擎")
+            return
+        try:
+            from clearvid.app.bootstrap.paths import REALESRGAN_WEIGHTS_DIR, TRT_CACHE_DIR
+            from clearvid.app.models.realesrgan_runner import _MODEL_REGISTRY
+            from clearvid.app.models.tensorrt_engine import select_compatible_engine_for_video
+
+            model_key = coerce_enum(
+                UpscaleModel, self.upscale_model_combo.currentData(), UpscaleModel.AUTO,
+            )
+            model_key_str = "general_v3" if model_key == UpscaleModel.AUTO else model_key.value
+            model_entry = _MODEL_REGISTRY.get(model_key_str)
+            if model_entry is None:
+                self.trt_prediction_label.setText("当前模型暂不支持 TensorRT 预测")
+                return
+            weight_path = REALESRGAN_WEIGHTS_DIR / str(model_entry["filename"])
+            if not weight_path.exists():
+                self.trt_prediction_label.setText("模型权重未下载，暂无法预测 TensorRT 引擎")
+                return
+            selected = select_compatible_engine_for_video(
+                object(),
+                width=self._current_video_width,
+                height=self._current_video_height,
+                tile_pad=16,
+                fp16=True,
+                cache_dir=TRT_CACHE_DIR,
+                weight_path=weight_path,
+            )
+            if selected is None:
+                self.trt_prediction_label.setText("当前视频暂无可用 TRT 引擎，导出时会自动回退")
+                return
+            self.trt_prediction_label.setText(
+                f"当前视频预计使用 TRT: 分块 {selected.tile_size} / 并行量 {selected.batch_size}"
+            )
+        except Exception:
+            self.trt_prediction_label.setText("点击管理可查看 TensorRT 引擎池")
+
     def _refresh_trt_status(self) -> None:
         """Re-check whether TRT engine is cached and update UI."""
+        if hasattr(self, "trt_prediction_label"):
+            self._update_trt_prediction_label()
         accel = coerce_enum(
             InferenceAccelerator,
             self.accelerator_combo.currentData(),
@@ -894,9 +978,7 @@ class ExportPanel(QWidget):
             weights_dir = REALESRGAN_WEIGHTS_DIR
             if not (weights_dir / _MODEL_REGISTRY[model_key]["filename"]).exists():
                 self.trt_status_label.setText("(请先下载模型权重)")
-                self.trt_status_label.setStyleSheet(
-                    "font-size: 11px; color: #888; padding-left: 4px;"
-                )
+                self.trt_status_label.setStyleSheet(_TRT_STATUS_MUTED_STYLE)
                 self.trt_deploy_btn.setEnabled(False)
                 return
 
@@ -943,9 +1025,7 @@ class ExportPanel(QWidget):
                 self.trt_deploy_btn.setEnabled(True)
         except Exception:
             self.trt_status_label.setText("(无法检测状态)")
-            self.trt_status_label.setStyleSheet(
-                "font-size: 11px; color: #888; padding-left: 4px;"
-            )
+            self.trt_status_label.setStyleSheet(_TRT_STATUS_MUTED_STYLE)
 
     def _recommended_trt_batch(self) -> int:
         raw_batch = self.batch_size_spin.value()
