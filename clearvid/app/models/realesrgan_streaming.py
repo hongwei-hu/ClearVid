@@ -634,6 +634,52 @@ def _iter_frame_payload(frames: _FramePayload):
     yield from frames
 
 
+def _prepare_encoder_ndarray_batch(
+    frames: np.ndarray,
+    output_width: int,
+    output_height: int,
+    target_profile: TargetProfile,
+) -> np.ndarray | None:
+    if not (
+        frames.ndim == 4
+        and frames.shape[3] == 3
+        and frames.dtype == np.uint8
+        and frames.flags.c_contiguous
+    ):
+        return None
+
+    count = int(frames.shape[0])
+    input_height = int(frames.shape[1])
+    input_width = int(frames.shape[2])
+    prepared_batch = np.empty((count, output_height, output_width, 3), dtype=np.uint8)
+
+    if target_profile in {TargetProfile.FHD, TargetProfile.UHD4K}:
+        scale = min(output_width / input_width, output_height / input_height)
+        resized_width = max(1, int(round(input_width * scale)))
+        resized_height = max(1, int(round(input_height * scale)))
+        offset_x = (output_width - resized_width) // 2
+        offset_y = (output_height - resized_height) // 2
+        prepared_batch.fill(0)
+        for index in range(count):
+            roi = prepared_batch[index, offset_y:offset_y + resized_height, offset_x:offset_x + resized_width]
+            cv2.resize(
+                frames[index],
+                (resized_width, resized_height),
+                dst=roi,
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+        return prepared_batch
+
+    for index in range(count):
+        cv2.resize(
+            frames[index],
+            (output_width, output_height),
+            dst=prepared_batch[index],
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+    return prepared_batch
+
+
 def _prepare_encoder_frame_batch(
     frames: _FramePayload,
     output_width: int,
@@ -649,15 +695,19 @@ def _prepare_encoder_frame_batch(
     ):
         return frames
 
-    if isinstance(frames, list) and frames:
-        if all(
-            frame.ndim == 3
-            and frame.shape == (output_height, output_width, 3)
-            and frame.dtype == np.uint8
-            and frame.flags.c_contiguous
-            for frame in frames
-        ):
-            return np.ascontiguousarray(np.stack(frames, axis=0), dtype=np.uint8)
+    if isinstance(frames, list) and frames and all(
+        frame.ndim == 3
+        and frame.shape == (output_height, output_width, 3)
+        and frame.dtype == np.uint8
+        and frame.flags.c_contiguous
+        for frame in frames
+    ):
+        return np.ascontiguousarray(np.stack(frames, axis=0), dtype=np.uint8)
+
+    if isinstance(frames, np.ndarray):
+        prepared_ndarray = _prepare_encoder_ndarray_batch(frames, output_width, output_height, target_profile)
+        if prepared_ndarray is not None:
+            return prepared_ndarray
 
     count = _frame_payload_count(frames)
     prepared_batch = np.empty((count, output_height, output_width, 3), dtype=np.uint8)
