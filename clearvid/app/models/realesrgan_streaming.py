@@ -612,9 +612,16 @@ def _write_encoder_frame(
     frame: np.ndarray,
     output_width: int,
     output_height: int,
+    write_stats: dict[str, float] | None = None,
 ) -> None:
+    t_prepare = time.perf_counter()
     prepared = _prepare_encoder_frame(frame, output_width, output_height)
+    if write_stats is not None:
+        write_stats["write_prepare_ms"] = write_stats.get("write_prepare_ms", 0.0) + (time.perf_counter() - t_prepare) * 1000
+    t_pipe = time.perf_counter()
     encoder_stdin.write(memoryview(prepared).cast("B"))
+    if write_stats is not None:
+        write_stats["write_pipe_ms"] = write_stats.get("write_pipe_ms", 0.0) + (time.perf_counter() - t_pipe) * 1000
 
 
 def _iter_frame_payload(frames: _FramePayload):
@@ -654,21 +661,41 @@ def _write_encoder_frame_batch(
     output_width: int,
     output_height: int,
     target_profile: TargetProfile,
+    write_stats: dict[str, float] | None = None,
 ) -> int:
     if isinstance(frames, np.ndarray) and frames.ndim == 4:
+        t_prepare = time.perf_counter()
         prepared_batch = _prepare_encoder_frame_batch(frames, output_width, output_height, target_profile)
+        if write_stats is not None:
+            write_stats["write_prepare_ms"] = write_stats.get("write_prepare_ms", 0.0) + (time.perf_counter() - t_prepare) * 1000
+        t_pipe = time.perf_counter()
         encoder_stdin.write(memoryview(prepared_batch).cast("B"))
+        if write_stats is not None:
+            write_stats["write_pipe_ms"] = write_stats.get("write_pipe_ms", 0.0) + (time.perf_counter() - t_pipe) * 1000
         return int(prepared_batch.shape[0])
 
     if len(frames) >= _PACKED_LIST_WRITE_MIN_BATCH:
+        t_prepare = time.perf_counter()
         prepared_batch = _prepare_encoder_frame_batch(frames, output_width, output_height, target_profile)
+        if write_stats is not None:
+            write_stats["write_prepare_ms"] = write_stats.get("write_prepare_ms", 0.0) + (time.perf_counter() - t_prepare) * 1000
+        t_pipe = time.perf_counter()
         encoder_stdin.write(memoryview(prepared_batch).cast("B"))
+        if write_stats is not None:
+            write_stats["write_pipe_ms"] = write_stats.get("write_pipe_ms", 0.0) + (time.perf_counter() - t_pipe) * 1000
         return int(prepared_batch.shape[0])
 
     count = 0
     for frame in frames:
+        t_prepare = time.perf_counter()
         resized = _resize_for_target(frame, output_width, output_height, target_profile)
-        _write_encoder_frame(encoder_stdin, resized, output_width, output_height)
+        prepared = _prepare_encoder_frame(resized, output_width, output_height)
+        if write_stats is not None:
+            write_stats["write_prepare_ms"] = write_stats.get("write_prepare_ms", 0.0) + (time.perf_counter() - t_prepare) * 1000
+        t_pipe = time.perf_counter()
+        encoder_stdin.write(memoryview(prepared).cast("B"))
+        if write_stats is not None:
+            write_stats["write_pipe_ms"] = write_stats.get("write_pipe_ms", 0.0) + (time.perf_counter() - t_pipe) * 1000
         count += 1
     return count
 
@@ -682,6 +709,7 @@ def _write_enhanced_frames(
     target_profile: TargetProfile,
     encoder_stdin: object,
     sharpen_strength: float = 0.0,
+    write_stats: dict[str, float] | None = None,
 ) -> int:
     finalized_list: list[np.ndarray] = []
     for enhanced in enhanced_list:
@@ -694,6 +722,7 @@ def _write_enhanced_frames(
         finalized_list.append(enhanced)
     return _write_encoder_frame_batch(
         encoder_stdin, finalized_list, output_width, output_height, target_profile,
+        write_stats=write_stats,
     )
 
 
@@ -703,9 +732,11 @@ def _write_finalized_frames(
     output_height: int,
     target_profile: TargetProfile,
     encoder_stdin: object,
+    write_stats: dict[str, float] | None = None,
 ) -> int:
     return _write_encoder_frame_batch(
         encoder_stdin, finalized_list, output_width, output_height, target_profile,
+        write_stats=write_stats,
     )
 
 
@@ -900,6 +931,8 @@ def _process_frames_async(
     diag_enhance_infer_ms = [0.0]
     diag_write_frames = [0]
     diag_write_ms = [0.0]
+    diag_write_prepare_ms = [0.0]
+    diag_write_pipe_ms = [0.0]
     diag_batch_sizes: list[int] = []
     diag_postprocess_ms = [0.0]
     diag_face_ms = [0.0]
@@ -962,11 +995,15 @@ def _process_frames_async(
                 if not ok or item is None:
                     break
                 t_w = time.perf_counter()
+                write_stats: dict[str, float] = {}
                 count = _write_finalized_frames(
                     item, output_width, output_height,
                     config.target_profile, encoder.stdin,
+                    write_stats=write_stats,
                 )
                 diag_write_ms[0] += (time.perf_counter() - t_w) * 1000
+                diag_write_prepare_ms[0] += write_stats.get("write_prepare_ms", 0.0)
+                diag_write_pipe_ms[0] += write_stats.get("write_pipe_ms", 0.0)
                 diag_write_frames[0] += count
                 frames_written[0] += count
         except Exception as exc:
@@ -1132,6 +1169,8 @@ def _process_frames_async(
         avg_batch = enh_frames / enh_batches if enh_batches else 0
         avg_infer_ms = diag_enhance_infer_ms[0] / enh_batches if enh_batches else 0
         avg_write_ms = diag_write_ms[0] / wr_frames if wr_frames else 0
+        avg_write_prepare_ms = diag_write_prepare_ms[0] / wr_frames if wr_frames else 0
+        avg_write_pipe_ms = diag_write_pipe_ms[0] / wr_frames if wr_frames else 0
         avg_pp_ms = diag_postprocess_ms[0] / frame_denominator
         avg_face_ms = diag_face_ms[0] / frame_denominator
         avg_stabilize_ms = diag_stabilize_ms[0] / frame_denominator
@@ -1220,7 +1259,7 @@ def _process_frames_async(
             trt_line,
             trt_post_line,
             trt_other_line,
-            f"  写入延迟:  {avg_write_ms:.2f}ms/帧",
+            f"  写入延迟:  {avg_write_ms:.2f}ms/帧  prepare={avg_write_prepare_ms:.2f}ms  pipe={avg_write_pipe_ms:.2f}ms",
             pp_line,
             f"  CPU占用:   进程平均 {cpu_total_pct:.0f}%  (按 {cpu_tracker.cpu_count} 核归一化)",
             f"  跳帧统计:  跳过 {skip_frames}帧 ({skip_pct:.1f}%)",
