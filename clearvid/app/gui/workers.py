@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -172,8 +173,8 @@ class TrtWarmupWorker(QThread):
                 )
                 self.progress.emit(100, "TensorRT 引擎部署完成")
             except Exception as exc:
-                self.failed.emit(str(exc))
+                self.failed.emit(f"{exc}\n\n--- 完整异常信息 ---\n{traceback.format_exc()}")  # noqa: BLE001
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            self.failed.emit(f"{exc}\n\n--- 完整异常信息 ---\n{traceback.format_exc()}")
         finally:
             self.done.emit()

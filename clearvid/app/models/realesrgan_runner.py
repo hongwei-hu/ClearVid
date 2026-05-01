@@ -304,23 +304,23 @@ def run_realesrgan_video(
                 weight_path=model_path,
             )
             if not ready:
-                # Try to find a compatible engine with a different tile size
+                # Try to find a compatible engine with a different tile/batch size
                 from clearvid.app.models.tensorrt_engine import find_compatible_engine
                 compat = find_compatible_engine(
                     upsampler.model,
                     fp16=config.fp16_enabled,
-                    batch_size=trt_batch,
                     cache_dir=TRT_CACHE_DIR,
                     weight_path=model_path,
                 )
                 if compat is not None:
-                    found_tile, _ = compat
+                    found_tile, found_batch, _ = compat
                     logger.info(
-                        "TRT 引擎 tile=%d 未找到，自动切换到已部署的 tile=%d 引擎",
-                        trt_tile, found_tile,
+                        "TRT 引擎 tile=%d batch=%d 未找到，自动切换到已部署的 tile=%d batch=%d 引擎",
+                        trt_tile, trt_batch, found_tile, found_batch,
                     )
                     trt_tile = found_tile
-                    config = config.model_copy(update={"tile_size": found_tile})
+                    trt_batch = found_batch
+                    config = config.model_copy(update={"tile_size": found_tile, "batch_size": found_batch})
                 else:
                     raise RuntimeError(
                         f"TensorRT 引擎尚未部署 (tile={trt_tile}, batch={trt_batch})。"
@@ -358,6 +358,26 @@ def run_realesrgan_video(
             upsampler.tile = trt_tile
             upsampler.tile_size = trt_tile
             logger.info("TRT 激活: 强制 tiling=%d (整帧模式不兼容 TRT profile)", trt_tile)
+
+        # Performance advisory: TRT batch=1 with large free VRAM is GPU-underutilised.
+        # Tile inference is sequential — each TRT call covers one tile, leaving GPU
+        # idle between kernel launches.  batch=4+ in the engine profile would allow
+        # multi-tile fusing for ~3-4× better throughput.
+        if hasattr(upsampler.model, '_engine') and trt_batch == 1:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    free_bytes, _ = torch.cuda.mem_get_info(0)
+                    if free_bytes > 8 * 1024 ** 3:
+                        logger.warning(
+                            "TRT batch=1 性能提示: GPU 剩余显存 %.0fGB，当前引擎每次仅处理 1 个 tile，"
+                            "GPU 利用率偏低。建议点击『部署 TRT 引擎』按钮重新部署 (batch=4) 以获得 3-4× 速度提升；"
+                            "或在『加速方式』下拉菜单切换为『自动检测』改用 PyTorch 批量模式，无需重新部署。",
+                            free_bytes / 1024 ** 3,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+
         _emit_progress(
             progress_callback, 11,
             f"推理加速就绪: {accel_actual} ({time.perf_counter() - t_accel:.1f}s)",

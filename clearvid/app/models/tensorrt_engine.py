@@ -75,26 +75,27 @@ def find_compatible_engine(
     model: object,
     *,
     fp16: bool = True,
-    batch_size: int = 1,
     cache_dir: Path | None = None,
     weight_path: Path | None = None,
-) -> tuple[int, str] | None:
-    """Scan *cache_dir* for any deployed engine matching the same weight + fp16 + batch.
+) -> tuple[int, int, str] | None:
+    """Scan *cache_dir* for any deployed engine matching the same weight + fp16.
 
-    Returns ``(tile_size, engine_path_str)`` for the first match found, or
-    ``None`` if no compatible engine exists.  Used as a fallback when the
-    requested tile_size has no cached engine — allows the runner to
-    transparently reuse a different-tile engine rather than raising an error.
+    Searches across common tile sizes (512, 256, 1024, 128, 768) AND batch
+    sizes (4, 2, 1, 8), preferring higher batch engines first since they give
+    better GPU utilisation.  Returns ``(tile_size, batch_size, engine_path_str)``
+    for the first match found, or ``None`` if no compatible engine exists.
     """
     if cache_dir is None:
         from clearvid.app.bootstrap.paths import TRT_CACHE_DIR
         cache_dir = TRT_CACHE_DIR
 
-    for candidate_tile in (512, 256, 1024, 128, 768):
-        digest = _engine_cache_key(model, fp16, candidate_tile, batch_size, weight_path)
-        engine_path = cache_dir / f"realesrgan_{digest}.engine"
-        if engine_path.exists() and engine_path.stat().st_size > 0:
-            return candidate_tile, str(engine_path)
+    # Prefer larger batch (better GPU utilisation), then common tile sizes
+    for candidate_batch in (4, 2, 1, 8):
+        for candidate_tile in (512, 256, 1024, 128, 768):
+            digest = _engine_cache_key(model, fp16, candidate_tile, candidate_batch, weight_path)
+            engine_path = cache_dir / f"realesrgan_{digest}.engine"
+            if engine_path.exists() and engine_path.stat().st_size > 0:
+                return candidate_tile, candidate_batch, str(engine_path)
     return None
 
 
@@ -422,14 +423,18 @@ def _get_or_build_engine(
             f"TensorRT 引擎尚未部署，请先点击'部署 TensorRT 引擎'按钮完成首次构建{hint}"
         )
 
-    # --- Previous failure check ----------------------------------------------
+    # --- Previous failure check (auto-build path only) ----------------------
+    # When the user explicitly clicks deploy (build_if_missing=True), clear
+    # any stale failure marker and retry.  Only block on the failed marker
+    # for background auto-builds (build_if_missing=False, handled above).
     prev_failure = _read_failed_marker(failed_path)
     if prev_failure is not None:
         age_h = (_time_module.time() - prev_failure["timestamp"]) / 3600
-        raise RuntimeError(
-            f"TRT 引擎构建在 {age_h:.1f} 小时前失败过 ({prev_failure['reason']})，"
-            f"删除 {failed_path.name} 可强制重新构建。"
+        logger.info(
+            "发现历史失败标记 (%.1f 小时前)，本次显式部署将清除并重试: %s",
+            age_h, failed_path.name,
         )
+        _clear_failed_marker(failed_path)
 
     # --- Step 1: export ONNX (in-process) ------------------------------------
     onnx_path = cache_dir / f"realesrgan_{digest}.onnx"
@@ -486,8 +491,8 @@ def _get_or_build_engine(
             progress_callback=progress_callback,
             low_load=low_load,
         )
-    except Exception:
-        _write_failed_marker(failed_path, f"timeout={timeout}s low_load={low_load}")
+    except Exception as exc:
+        _write_failed_marker(failed_path, str(exc))
         raise
 
     if not engine_path.exists() or engine_path.stat().st_size == 0:

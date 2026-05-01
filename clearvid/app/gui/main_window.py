@@ -170,6 +170,7 @@ class MainWindow(QMainWindow):
         self._export_panel.export_all_requested.connect(self._run_queue)
         self._export_panel.smart_params_requested.connect(self._apply_recommendation)
         self._export_panel.output_dir_changed.connect(self._settings.set_last_output_dir)
+        self._export_panel.log_message.connect(self._log_and_show)
         self._splitter.addWidget(self._export_panel)
 
         # Default column sizes
@@ -606,6 +607,14 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _log_message(self, text: str) -> None:
+        self._log.appendPlainText(text)
+
+    def _log_and_show(self, text: str) -> None:
+        """Log a message and auto-show the log panel if it is hidden."""
+        if not self._log.isVisible():
+            self._log.setVisible(True)
+            self._log_action.setChecked(True)
+            self._log_toggle_btn.setChecked(True)
         self._log.appendPlainText(text)
 
     def _toggle_log(self) -> None:

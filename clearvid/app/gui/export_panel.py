@@ -173,6 +173,7 @@ class ExportPanel(QWidget):
     output_dir_changed = Signal(str)
     pause_requested = Signal()
     cancel_requested = Signal()
+    log_message = Signal(str)  # forwards messages to the main window log panel
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -351,7 +352,7 @@ class ExportPanel(QWidget):
         lay = sec.content_layout
 
         self.face_restore_enabled = QCheckBox("启用人脸修复")
-        self.face_restore_enabled.setChecked(True)
+        self.face_restore_enabled.setChecked(False)
         self.face_restore_enabled.setToolTip(TOOLTIPS["face_restore"])
         lay.addWidget(self.face_restore_enabled)
         lay.addWidget(_hint("自动检测并修复模糊人脸"))
@@ -797,7 +798,12 @@ class ExportPanel(QWidget):
         )
         model_key_str = "general_v3" if model_key == UpscaleModel.AUTO else model_key.value
         tile = self.tile_size_spin.value() or 512
-        batch = self.batch_size_spin.value() or 1
+        # TRT engine profiles are always built with batch=1.
+        # The pipeline's _resolve_trt_batch() also enforces batch=1 for
+        # explicitly-selected TensorRT because tiling disables multi-frame
+        # batching.  Using batch=1 here keeps the deploy hash consistent with
+        # the status check and avoids building a heavier engine that times out.
+        batch = 1
 
         self._trt_deploying = True
         self.trt_deploy_btn.setVisible(False)
@@ -805,6 +811,10 @@ class ExportPanel(QWidget):
         self.trt_deploy_progress.setValue(0)
         self.trt_status_label.setText("准备部署...")
         self.trt_status_label.setStyleSheet("font-size: 11px; color: #ccc; padding-left: 4px;")
+
+        self.log_message.emit(
+            f"[TRT] 开始部署: model={model_key_str}, tile={tile}, batch={batch}, fp16=True"
+        )
 
         self._trt_warmup_worker = TrtWarmupWorker(
             model_key=model_key_str,
@@ -820,6 +830,7 @@ class ExportPanel(QWidget):
     def _on_trt_deploy_progress(self, pct: int, msg: str) -> None:
         self.trt_deploy_progress.setValue(pct)
         self.trt_status_label.setText(msg)
+        self.log_message.emit(f"[TRT {pct:3d}%] {msg}")
         if pct >= 100:
             self.trt_status_label.setStyleSheet(
                 "font-size: 11px; color: #4caf50; padding-left: 4px;"
@@ -831,10 +842,12 @@ class ExportPanel(QWidget):
         self.trt_status_label.setStyleSheet(
             "font-size: 11px; color: #f44336; padding-left: 4px;"
         )
+        self.log_message.emit(f"[TRT 失败]\n{err}")
 
     def _on_trt_deploy_done(self) -> None:
         self._trt_deploying = False
         self.trt_deploy_progress.setVisible(False)
+        self.log_message.emit("[TRT] 部署流程结束")
         self._refresh_trt_status()
 
     def _refresh_trt_status(self) -> None:
@@ -876,7 +889,7 @@ class ExportPanel(QWidget):
                 return
 
             tile = self.tile_size_spin.value() or 512
-            batch = self.batch_size_spin.value() or 1
+            batch = 1  # TRT engine profiles are always built with batch=1
             model_path = ensure_realesrgan_weights(weights_dir, model_key)
             dummy_config = _EC(
                 input_path=Path("check"), output_path=Path("check"),
