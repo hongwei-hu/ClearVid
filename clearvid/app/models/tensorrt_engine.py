@@ -895,8 +895,6 @@ def _build_trt_engine_subprocess(
     In *low_load* mode (default), the subprocess runs at idle priority and
     uses minimal GPU resources to avoid freezing the desktop.
     """
-    import time as _time
-
     args_json = json.dumps({
         "onnx_path": str(onnx_path),
         "engine_path": str(engine_path),
@@ -907,60 +905,93 @@ def _build_trt_engine_subprocess(
         "build_modes": _trt_build_modes(low_load),
     })
 
-    creation_flags = 0
-    if sys.platform == "win32":
-        # IDLE priority: only runs when the system has nothing else to do
-        creation_flags = (
-            subprocess.IDLE_PRIORITY_CLASS
-            | subprocess.CREATE_NO_WINDOW
-        )
-
     proc = subprocess.Popen(
         [sys.executable, "-c", _TRT_BUILD_SCRIPT, args_json],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        creationflags=creation_flags,
+        creationflags=_trt_subprocess_creation_flags(),
     )
 
-    t_start = _time.monotonic()
-    poll_interval = 15  # seconds — longer interval in low-load mode
     try:
-        while True:
-            try:
-                stdout, stderr = proc.communicate(timeout=poll_interval)
-                break
-            except subprocess.TimeoutExpired:
-                elapsed = _time.monotonic() - t_start
-                if elapsed > timeout:
-                    raise
-                if progress_callback is not None:
-                    progress_callback(
-                        int(min(elapsed / max(timeout, 1), 1.0) * 100),
-                        f"TensorRT 引擎部署中... ({elapsed:.0f}s / 最长{timeout}s)",
-                    )
-                continue
+        stdout, stderr = _wait_for_trt_build(proc, timeout, progress_callback)
 
         if proc.returncode != 0:
-            err_msg = stderr.decode(errors="replace").strip()
-            if engine_path.exists():
-                try:
-                    engine_path.unlink()
-                except OSError:
-                    pass
+            err_msg = _format_trt_subprocess_failure(stdout, stderr)
+            _remove_partial_engine(engine_path)
             raise RuntimeError(f"TRT 引擎构建失败 (exit={proc.returncode}): {err_msg}")
         logger.info("TRT 子进程输出: %s", stdout.decode(errors="replace").strip())
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        if engine_path.exists():
-            try:
-                engine_path.unlink()
-            except OSError:
-                pass
-        raise TimeoutError(
-            f"TRT 引擎构建超时 ({timeout}s)。"
-            "建议减小 batch_size 或使用标准 PyTorch 推理。"
-        )
+        _terminate_trt_build(proc, engine_path, timeout)
+
+
+def _trt_subprocess_creation_flags() -> int:
+    if sys.platform != "win32":
+        return 0
+    return subprocess.IDLE_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
+
+
+def _wait_for_trt_build(
+    proc: subprocess.Popen,
+    timeout: int,
+    progress_callback: Callable[[int, str], None] | None,
+) -> tuple[bytes, bytes]:
+    import time as _time
+
+    t_start = _time.monotonic()
+    poll_interval = 15
+    while True:
+        try:
+            return proc.communicate(timeout=poll_interval)
+        except subprocess.TimeoutExpired:
+            elapsed = _time.monotonic() - t_start
+            if elapsed > timeout:
+                raise
+            _emit_trt_build_progress(progress_callback, elapsed, timeout)
+
+
+def _emit_trt_build_progress(
+    progress_callback: Callable[[int, str], None] | None,
+    elapsed: float,
+    timeout: int,
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(
+        int(min(elapsed / max(timeout, 1), 1.0) * 100),
+        f"TensorRT 引擎部署中... ({elapsed:.0f}s / 最长{timeout}s)",
+    )
+
+
+def _remove_partial_engine(engine_path: Path) -> None:
+    if not engine_path.exists():
+        return
+    try:
+        engine_path.unlink()
+    except OSError:
+        pass
+
+
+def _terminate_trt_build(proc: subprocess.Popen, engine_path: Path, timeout: int) -> None:
+    proc.kill()
+    proc.wait()
+    _remove_partial_engine(engine_path)
+    raise TimeoutError(
+        f"TRT 引擎构建超时 ({timeout}s)。"
+        "建议减小 batch_size 或使用标准 PyTorch 推理。"
+    )
+
+
+def _format_trt_subprocess_failure(stdout: bytes, stderr: bytes, limit: int = 4000) -> str:
+    stderr_text = stderr.decode(errors="replace").strip()
+    stdout_text = stdout.decode(errors="replace").strip()
+    parts: list[str] = []
+    if stderr_text:
+        parts.append(stderr_text)
+    if stdout_text:
+        if len(stdout_text) > limit:
+            stdout_text = "..." + stdout_text[-limit:]
+        parts.append(f"--- TensorRT stdout ---\n{stdout_text}")
+    return "\n\n".join(parts) or "TensorRT subprocess exited without diagnostics"
 
 
 class _TensorRTModelWrapper:

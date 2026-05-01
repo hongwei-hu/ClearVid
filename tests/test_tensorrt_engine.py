@@ -4,6 +4,7 @@ import time
 
 from clearvid.app.models.tensorrt_engine import (
     _engine_cache_key,
+    _format_trt_subprocess_failure,
     _onnx_export_shape,
     _read_engine_profile_shapes,
     _score_trt_engine_for_video,
@@ -193,6 +194,17 @@ def test_trt_build_modes_use_single_strategy_in_low_load_mode() -> None:
 def test_trt_warmup_detects_recent_failed_status() -> None:
     assert TrtWarmupWorker._is_recent_failed_status("上次部署失败 (2.5 小时前)") is True
     assert TrtWarmupWorker._is_recent_failed_status("TensorRT 引擎尚未部署") is False
+
+
+def test_trt_subprocess_failure_includes_stdout_context() -> None:
+    message = _format_trt_subprocess_failure(
+        b"Building TRT engine\n[TRT] useful builder detail",
+        b"ENGINE_BUILD_RETURNED_NONE_ALL_MODES",
+    )
+
+    assert "ENGINE_BUILD_RETURNED_NONE_ALL_MODES" in message
+    assert "TensorRT stdout" in message
+    assert "useful builder detail" in message
 
 
 def test_trt_failure_summary_identifies_builder_profile_failure() -> None:

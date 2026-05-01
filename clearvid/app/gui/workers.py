@@ -327,15 +327,19 @@ class TrtWarmupWorker(QThread):
         errors: list[str],
     ) -> bool:
         reason = self._summarize_trt_failure(exc)
-        logger.exception(
-            "TRT warmup profile failed: model=%s tile=%d batch=%d reason=%s",
-            model_key, tile_size, batch_size, reason,
-        )
         errors.append(f"tile={tile_size}, batch={batch_size}: {reason}")
         if profile_index < profile_count:
+            logger.warning(
+                "TRT warmup fallback profile failed: model=%s tile=%d batch=%d reason=%s",
+                model_key, tile_size, batch_size, reason,
+            )
             self.progress.emit(15, f"当前配置失败 ({reason})，继续尝试下一个组合")
             self._clear_cuda_cache()
             return False
+        logger.exception(
+            "TRT warmup final profile failed: model=%s tile=%d batch=%d reason=%s",
+            model_key, tile_size, batch_size, reason,
+        )
         self.failed.emit(
             "TensorRT 引擎部署失败，已尝试以下配置:\n"
             + "\n".join(errors)
