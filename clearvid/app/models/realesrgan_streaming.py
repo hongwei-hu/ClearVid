@@ -374,6 +374,27 @@ def _trt_output_to_frame(
     return np.ascontiguousarray(frames[0])
 
 
+def _fast_trt_batch_preprocess(frames: list[np.ndarray], upsampler: object) -> object:
+    import torch
+
+    batch_np = np.stack(frames, axis=0)
+    batch_uint8 = torch.from_numpy(batch_np).to(upsampler.device, non_blocking=True)
+    batch_tensor = batch_uint8.permute(0, 3, 1, 2)[:, [2, 1, 0], :, :]
+    batch_tensor = batch_tensor.to(dtype=torch.float32).mul_(1.0 / 255.0)
+    if upsampler.half:
+        batch_tensor = batch_tensor.half()
+    batch_tensor = batch_tensor.contiguous()
+    if hasattr(upsampler, "mod_scale"):
+        upsampler.mod_scale = None
+    if hasattr(upsampler, "mod_pad_h"):
+        upsampler.mod_pad_h = 0
+    if hasattr(upsampler, "mod_pad_w"):
+        upsampler.mod_pad_w = 0
+    if hasattr(upsampler, "img"):
+        upsampler.img = batch_tensor
+    return batch_tensor
+
+
 def _enhance_frames_trt_tiled(
     frames: list[np.ndarray],
     upsampler: object,
@@ -404,24 +425,7 @@ def _enhance_frames_trt_tiled(
         return (h_input % mod_scale == 0) and (w_input % mod_scale == 0)
 
     def _fast_batch_preprocess() -> object:
-        import torch
-
-        batch_np = np.stack(frames, axis=0)
-        batch_np = np.ascontiguousarray(batch_np[:, :, :, ::-1].transpose(0, 3, 1, 2), dtype=np.float32)
-        batch_np *= (1.0 / 255.0)
-        batch_tensor = torch.from_numpy(batch_np)
-        if upsampler.half:
-            batch_tensor = batch_tensor.half()
-        batch_tensor = batch_tensor.to(upsampler.device, non_blocking=True)
-        if hasattr(upsampler, "mod_scale"):
-            upsampler.mod_scale = None
-        if hasattr(upsampler, "mod_pad_h"):
-            upsampler.mod_pad_h = 0
-        if hasattr(upsampler, "mod_pad_w"):
-            upsampler.mod_pad_w = 0
-        if hasattr(upsampler, "img"):
-            upsampler.img = batch_tensor
-        return batch_tensor
+        return _fast_trt_batch_preprocess(frames, upsampler)
 
     def _legacy_batch_preprocess() -> object:
         first = frames[0]

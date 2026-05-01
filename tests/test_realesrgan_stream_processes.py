@@ -201,9 +201,11 @@ class _FakeTrtModel:
 
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []
+        self.inputs: list[torch.Tensor] = []
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
         self.batch_sizes.append(int(tensor.shape[0]))
+        self.inputs.append(tensor.detach().clone())
         return torch.nn.functional.interpolate(tensor, scale_factor=2, mode="nearest")
 
 
@@ -293,6 +295,33 @@ def test_enhance_frame_trt_tiled_single_tile_avoids_cat(monkeypatch) -> None:
 
     enhanced = realesrgan_runner._enhance_frame_trt_tiled(frame, upsampler, outscale=2.0)
 
+    assert enhanced.shape == (8, 8, 3)
+
+
+def test_fast_trt_preprocess_uses_torch_path_and_preserves_rgb_values() -> None:
+    class _FastUpsampler(_FakeUpsampler):
+        device = torch.device("cpu")
+        half = False
+
+        def pre_process(self, _img: np.ndarray) -> None:
+            raise AssertionError("fast TRT preprocessing should bypass legacy pre_process")
+
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    frame[:, :, 0] = 10
+    frame[:, :, 1] = 20
+    frame[:, :, 2] = 30
+    upsampler = _FastUpsampler()
+    upsampler.tile_size = 4
+    upsampler.model.max_batch = 1
+
+    enhanced = realesrgan_runner._enhance_frame_trt_tiled(frame, upsampler, outscale=2.0)
+
+    model_input = upsampler.model.inputs[0]
+    assert model_input.shape == (1, 3, 4, 4)
+    assert torch.allclose(
+        model_input[0, :, 0, 0],
+        torch.tensor([30 / 255, 20 / 255, 10 / 255], dtype=torch.float32),
+    )
     assert enhanced.shape == (8, 8, 3)
 
 

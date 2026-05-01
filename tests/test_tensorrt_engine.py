@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from clearvid.app.models.tensorrt_engine import (
     _engine_cache_key,
+    _apply_tensorrt,
     _format_trt_subprocess_failure,
     _onnx_export_shape,
     _read_engine_profile_shapes,
@@ -259,3 +262,23 @@ def test_trt_failure_summary_identifies_cuda_oom() -> None:
     assert TrtWarmupWorker._summarize_trt_failure(
         RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
     ) == "CUDA 显存不足"
+
+
+def test_explicit_tensorrt_build_reraises_builder_failure(monkeypatch, tmp_path) -> None:
+    class _Model:
+        pass
+
+    def fail_build(*_args, **_kwargs):
+        raise TimeoutError("构建超时")
+
+    monkeypatch.setattr("clearvid.app.models.tensorrt_engine._get_or_build_engine", fail_build)
+
+    with pytest.raises(TimeoutError, match="构建超时"):
+        _apply_tensorrt(
+            _Model(),
+            fp16=True,
+            tile_size=512,
+            batch_size=4,
+            cache_dir=tmp_path,
+            build_if_missing=True,
+        )

@@ -451,27 +451,34 @@ def _apply_tensorrt(
         # build_if_missing=False: engine not ready, re-raise to caller
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.error("TensorRT 引擎构建失败，回退到标准推理: %s", exc, exc_info=True)
+        return _handle_tensorrt_failure(
+            model, exc,
+            progress_callback=progress_callback,
+            allow_fallback=not build_if_missing,
+        )
+
+
+def _handle_tensorrt_failure(
+    model: object,
+    exc: Exception,
+    *,
+    progress_callback: Callable[[int, str], None] | None,
+    allow_fallback: bool,
+) -> object:
+    if not allow_fallback:
+        raise exc
+    logger.error("TensorRT 引擎构建失败，回退到标准推理: %s", exc, exc_info=True)
+    if progress_callback is not None:
+        progress_callback(11, "TensorRT 构建失败，尝试 torch.compile 降级加速...")
+    compiled = _apply_torch_compile(model)
+    if compiled is not model:
+        logger.info("TensorRT 失败，已降级到 torch.compile 加速")
         if progress_callback is not None:
-            progress_callback(
-                11,
-                "TensorRT 构建失败，尝试 torch.compile 降级加速...",
-            )
-        compiled = _apply_torch_compile(model)
-        if compiled is not model:
-            logger.info("TensorRT 失败，已降级到 torch.compile 加速")
-            if progress_callback is not None:
-                progress_callback(
-                    11,
-                    f"推理加速就绪: torch.compile (TensorRT 构建失败: {exc})",
-                )
-            return compiled
-        if progress_callback is not None:
-            progress_callback(
-                11,
-                "推理加速不可用，使用标准 PyTorch (TensorRT/torch.compile 均失败)",
-            )
-        return model
+            progress_callback(11, f"推理加速就绪: torch.compile (TensorRT 构建失败: {exc})")
+        return compiled
+    if progress_callback is not None:
+        progress_callback(11, "推理加速不可用，使用标准 PyTorch (TensorRT/torch.compile 均失败)")
+    return model
 
 
 # ---------------------------------------------------------------------------

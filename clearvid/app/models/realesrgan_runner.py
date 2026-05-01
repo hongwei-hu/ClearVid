@@ -81,6 +81,7 @@ from clearvid.app.models.realesrgan_streaming import (
     _finalize_stream_processes,
     _flush_trt_tile_batch,
     _frame_payload_count,
+    _fast_trt_batch_preprocess,
     _is_trt_upsampler,
     _iter_frame_payload,
     _pack_trt_output_tensor,
