@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import sys
 import time
+import types
 
 import pytest
 
+from clearvid.app.gui.workers import TrtWarmupWorker
 from clearvid.app.models.tensorrt_engine import (
-    _engine_cache_key,
     _apply_tensorrt,
+    _engine_cache_key,
     _format_trt_subprocess_failure,
     _onnx_export_shape,
     _read_engine_profile_shapes,
@@ -19,7 +22,6 @@ from clearvid.app.models.tensorrt_engine import (
     select_compatible_engine_for_video,
     trt_profile_fallbacks,
 )
-from clearvid.app.gui.workers import TrtWarmupWorker
 
 
 class _TensorProfileEngine:
@@ -196,6 +198,21 @@ def test_trt_build_modes_use_single_strategy_in_low_load_mode() -> None:
     ]
 
 
+def test_trt_build_modes_append_rescue_modes_for_heavy_high_tile_profiles() -> None:
+    modes = _trt_build_modes(
+        low_load=False,
+        heavy_model=True,
+        tile_size=768,
+        batch_size=4,
+    )
+
+    labels = [str(mode["label"]) for mode in modes]
+    assert labels[-2:] == ["rescue-narrow-profile", "rescue-high-workspace"]
+    assert int(modes[-1]["workspace_mb"]) == 8192
+    assert int(modes[-1]["max_aux_streams"]) == 0
+    assert int(modes[-1]["profile_min_hw"]) == 384
+
+
 def test_rrdb_trt_timeout_is_not_shortened_below_build_floor_on_fast_gpus() -> None:
     assert _resolve_trt_timeout(
         param_count=16_700_000,
@@ -228,6 +245,22 @@ def test_trt_warmup_detects_recent_failed_status() -> None:
 def test_trt_warmup_retries_timeout_failed_status() -> None:
     assert TrtWarmupWorker._is_retryable_failed_status("上次部署失败 (0.2 小时前): 构建超时") is True
     assert TrtWarmupWorker._is_retryable_failed_status("上次部署失败 (0.2 小时前): TensorRT builder 未生成 engine") is False
+
+
+def test_trt_warmup_skips_primary_profile_for_recent_non_retryable_failure() -> None:
+    worker = TrtWarmupWorker(allow_fallbacks=True)
+    assert worker._should_skip_fallback_profile(
+        1,
+        "上次部署失败 (0.1 小时前): TensorRT builder 未生成 engine",
+    ) is True
+
+
+def test_trt_warmup_does_not_skip_primary_profile_for_timeout_failure() -> None:
+    worker = TrtWarmupWorker(allow_fallbacks=True)
+    assert worker._should_skip_fallback_profile(
+        1,
+        "上次部署失败 (0.1 小时前): 构建超时",
+    ) is False
 
 
 def test_failed_marker_reason_summary_identifies_timeout_and_builder_failures() -> None:
@@ -271,6 +304,8 @@ def test_explicit_tensorrt_build_reraises_builder_failure(monkeypatch, tmp_path)
     def fail_build(*_args, **_kwargs):
         raise TimeoutError("构建超时")
 
+    monkeypatch.setitem(sys.modules, "tensorrt", types.ModuleType("tensorrt"))
+    monkeypatch.setitem(sys.modules, "onnx", types.ModuleType("onnx"))
     monkeypatch.setattr("clearvid.app.models.tensorrt_engine._get_or_build_engine", fail_build)
 
     with pytest.raises(TimeoutError, match="构建超时"):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -11,10 +13,43 @@ from clearvid.app.preprocess.filters import build_preprocess_filters
 from clearvid.app.schemas.models import EnhancementConfig, VideoMetadata
 from clearvid.app.utils.subprocess_utils import run_command
 
-
 PopenFactory = Callable[..., subprocess.Popen[bytes]]
 RunFactory = Callable[..., subprocess.CompletedProcess[bytes]]
 CommandRunner = Callable[[list[str]], object]
+_STDERR_TAIL_LIMIT = 64 * 1024
+
+
+class _StderrDrain:
+    """Continuously drains a process stderr pipe and keeps the diagnostic tail."""
+
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+        self._chunks: deque[bytes] = deque()
+        self._size = 0
+        self._thread = threading.Thread(target=self._drain, daemon=True, name="ffmpeg-stderr")
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.readline()
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                self._append(bytes(chunk))
+        except Exception:
+            return
+
+    def _append(self, chunk: bytes) -> None:
+        self._chunks.append(chunk)
+        self._size += len(chunk)
+        while self._size > _STDERR_TAIL_LIMIT and self._chunks:
+            self._size -= len(self._chunks.popleft())
+
+    def text(self) -> str:
+        self._thread.join(timeout=1.0)
+        return b"".join(self._chunks).decode("utf-8", errors="replace")
 
 
 def build_decode_command(config: EnhancementConfig, metadata: VideoMetadata) -> list[str]:
@@ -105,6 +140,8 @@ def start_stream_processes(
     if decoder.stdout is None or decoder.stderr is None or encoder.stdin is None or encoder.stderr is None:
         cleanup_stream_processes(decoder, encoder)
         raise RuntimeError("FFmpeg 管道初始化失败")
+    _attach_stderr_drain(decoder)
+    _attach_stderr_drain(encoder)
     return decoder, encoder
 
 
@@ -207,10 +244,10 @@ def extract_frame(
 
 
 def finalize_stream_processes(decoder: object, encoder: object) -> None:
-    decoder_stderr = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
-    encoder_stderr = encoder.stderr.read().decode("utf-8", errors="replace") if encoder.stderr else ""
     decoder_return_code = decoder.wait()
     encoder_return_code = encoder.wait()
+    decoder_stderr = _stderr_text(decoder)
+    encoder_stderr = _stderr_text(encoder)
     if decoder_return_code != 0:
         raise RuntimeError(decoder_stderr.strip() or "FFmpeg 解码失败")
     if encoder_return_code != 0:
@@ -230,3 +267,26 @@ def cleanup_stream_processes(decoder: object, encoder: object) -> None:
         decoder.kill()
     if encoder.poll() is None:
         encoder.kill()
+
+
+def _attach_stderr_drain(process: object) -> None:
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return
+    try:
+        setattr(process, "_clearvid_stderr_drain", _StderrDrain(stream))
+    except Exception:
+        return
+
+
+def _stderr_text(process: object) -> str:
+    drain = getattr(process, "_clearvid_stderr_drain", None)
+    if drain is not None:
+        return drain.text()
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return ""
+    data = stream.read()
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)

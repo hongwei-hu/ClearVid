@@ -4,12 +4,16 @@ from collections.abc import Callable
 from pathlib import Path
 
 from clearvid.app.export_control import ExportControl
-from clearvid.app.models.realesrgan_runner import enhance_single_frame, extract_frame, run_realesrgan_video
 from clearvid.app.io.probe import probe_video
+from clearvid.app.models.realesrgan_runner import (
+    enhance_single_frame,
+    extract_frame,
+    run_realesrgan_video,
+)
 from clearvid.app.pipeline import build_execution_plan, resolve_output_size
 from clearvid.app.schemas.models import BatchResult, EnhancementConfig
 from clearvid.app.task_queue import discover_video_files
-from clearvid.app.utils.subprocess_utils import run_command, run_ffmpeg_with_progress
+from clearvid.app.utils.subprocess_utils import run_ffmpeg_with_progress
 
 
 class Orchestrator:
@@ -17,19 +21,27 @@ class Orchestrator:
         self,
         config: EnhancementConfig,
         timestamp_sec: float = 0.0,
+        control: ExportControl | None = None,
     ) -> tuple:
         """Extract and enhance a single frame for Before/After preview.
 
         Returns ``(original_bgr, enhanced_bgr, metadata)`` numpy arrays.
         """
-        import numpy as np
 
+        if control is not None:
+            control.check()
         metadata = probe_video(config.input_path)
+        if control is not None:
+            control.check()
         original = extract_frame(config.input_path, timestamp_sec, width=metadata.width, height=metadata.height)
+        if control is not None:
+            control.check()
         output_width, output_height = resolve_output_size(
             metadata.width, metadata.height, config.target_profile,
         )
         enhanced = enhance_single_frame(original, config, metadata, output_width, output_height)
+        if control is not None:
+            control.check()
         return original, enhanced, metadata
 
     def run_single(

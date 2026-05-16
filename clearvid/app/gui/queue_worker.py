@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
+from clearvid.app.export_control import ExportCancelled, ExportControl
 from clearvid.app.orchestrator import Orchestrator
 from clearvid.app.schemas.models import EnhancementConfig
 
@@ -54,10 +54,13 @@ class QueueWorker(QThread):
         self._jobs = jobs
         self._cancel_requested = False
         self._current_job_id: int | None = None
+        self._current_control: ExportControl | None = None
 
     def cancel(self) -> None:
-        """Request cancellation. Current job finishes, remaining are skipped."""
+        """Request cancellation. Current job is interrupted and remaining jobs are skipped."""
         self._cancel_requested = True
+        if self._current_control is not None:
+            self._current_control.cancel()
 
     @property
     def current_job_id(self) -> int | None:
@@ -72,6 +75,7 @@ class QueueWorker(QThread):
 
             job.status = JobStatus.RUNNING
             self._current_job_id = job.id
+            self._current_control = ExportControl()
             self.job_started.emit(job.id)
 
             start = time.monotonic()
@@ -79,6 +83,7 @@ class QueueWorker(QThread):
                 result = orch.run_single(
                     job.config,
                     progress_callback=lambda pct, msg, _id=job.id: self._on_progress(_id, pct, msg),
+                    control=self._current_control,
                 )
                 job.elapsed_sec = time.monotonic() - start
                 out_path = Path(job.config.output_path)
@@ -86,11 +91,18 @@ class QueueWorker(QThread):
                 job.status = JobStatus.COMPLETED
                 job.progress = 100
                 self.job_completed.emit(job.id, result.model_dump_json(indent=2))
+            except ExportCancelled as exc:
+                job.elapsed_sec = time.monotonic() - start
+                job.status = JobStatus.CANCELLED
+                job.message = str(exc)
+                self._cancel_requested = True
             except Exception as exc:  # noqa: BLE001
                 job.elapsed_sec = time.monotonic() - start
                 job.status = JobStatus.FAILED
                 job.message = str(exc)
                 self.job_failed.emit(job.id, str(exc))
+            finally:
+                self._current_control = None
 
         self._current_job_id = None
         self.queue_finished.emit()

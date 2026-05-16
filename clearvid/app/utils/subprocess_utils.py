@@ -41,7 +41,7 @@ def run_ffmpeg_with_progress(
         effective_command,
         cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -69,11 +69,10 @@ def run_ffmpeg_with_progress(
             progress_end=progress_end,
         )
 
-    stderr_text = process.stderr.read() if process.stderr else ""
     return_code = process.wait()
     stdout_text = "".join(stdout_chunks)
     if return_code != 0:
-        raise ProcessError(stderr_text.strip() or stdout_text.strip() or "Command failed")
+        raise ProcessError(stdout_text.strip() or "Command failed")
 
     if progress_callback:
         progress_callback(progress_end, progress_message)
@@ -82,7 +81,7 @@ def run_ffmpeg_with_progress(
         args=effective_command,
         returncode=return_code,
         stdout=stdout_text,
-        stderr=stderr_text,
+        stderr="",
     )
 
 

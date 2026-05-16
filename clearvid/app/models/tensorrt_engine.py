@@ -694,6 +694,7 @@ def _get_or_build_engine(
             timeout=timeout,
             progress_callback=progress_callback,
             low_load=low_load,
+            heavy_model=param_count > 10_000_000,
         )
     except Exception as exc:
         _write_failed_marker(failed_path, str(exc))
@@ -788,7 +789,13 @@ def trt_profile_fallbacks(tile_size: int, batch_size: int) -> list[tuple[int, in
     return unique
 
 
-def _trt_build_modes(low_load: bool) -> list[dict[str, int | str]]:
+def _trt_build_modes(
+    low_load: bool,
+    *,
+    heavy_model: bool = False,
+    tile_size: int = 0,
+    batch_size: int = 1,
+) -> list[dict[str, int | str]]:
     """Return build strategies to try within a single tile/batch profile."""
     if low_load:
         return [
@@ -799,7 +806,7 @@ def _trt_build_modes(low_load: bool) -> list[dict[str, int | str]]:
                 "max_aux_streams": 1,
             }
         ]
-    return [
+    modes = [
         {
             "label": "standard",
             "workspace_mb": 1024,
@@ -819,6 +826,31 @@ def _trt_build_modes(low_load: bool) -> list[dict[str, int | str]]:
             "max_aux_streams": 1,
         },
     ]
+
+    if heavy_model and tile_size >= 768 and batch_size <= 4:
+        narrow_min_hw = max(32, tile_size // 2)
+        modes.extend([
+            {
+                "label": "rescue-narrow-profile",
+                "workspace_mb": 4096,
+                "opt_level": 0,
+                "max_aux_streams": 0,
+                "profile_min_hw": narrow_min_hw,
+                "profile_opt_hw": tile_size,
+                "profile_max_hw": tile_size + 32,
+            },
+            {
+                "label": "rescue-high-workspace",
+                "workspace_mb": 8192,
+                "opt_level": 0,
+                "max_aux_streams": 0,
+                "profile_min_hw": narrow_min_hw,
+                "profile_opt_hw": tile_size,
+                "profile_max_hw": tile_size + 32,
+            },
+        ])
+
+    return modes
 
 
 # -- Self-contained build script executed in subprocess ---------------------
@@ -860,9 +892,6 @@ def make_config(mode):
 
 tile = args["tile_size"]
 batch = args["batch_size"]
-
-min_hw = max(32, tile // 4)
-max_hw = tile + 32
 max_batch = min(batch, 16)
 
 build_modes = args.get("build_modes") or [
@@ -875,17 +904,23 @@ for mode in build_modes:
     mode_label = str(mode.get("label", "custom"))
     last_label = mode_label
     config = make_config(mode)
+    min_hw = int(mode.get("profile_min_hw", max(32, tile // 4)))
+    opt_hw = int(mode.get("profile_opt_hw", tile))
+    max_hw = int(mode.get("profile_max_hw", tile + 32))
+    min_hw = max(32, min_hw)
+    max_hw = max(min_hw, max_hw)
+    opt_hw = min(max(opt_hw, min_hw), max_hw)
     profile = builder.create_optimization_profile()
     profile.set_shape(
         "input",
         min=(1, 3, min_hw, min_hw),
-        opt=(batch, 3, tile, tile),
+        opt=(batch, 3, opt_hw, opt_hw),
         max=(max_batch, 3, max_hw, max_hw),
     )
     config.add_optimization_profile(profile)
 
     print(
-        f"Building TRT engine ({mode_label}): opt=({batch},3,{tile},{tile}) "
+        f"Building TRT engine ({mode_label}): opt=({batch},3,{opt_hw},{opt_hw}) "
         f"range=[{min_hw}..{max_hw}] max_batch={max_batch} "
         f"workspace={mode.get('workspace_mb', 'n/a')}MB",
         flush=True,
@@ -916,6 +951,7 @@ def _build_trt_engine_subprocess(
     timeout: int = 600,
     progress_callback: Callable[[int, str], None] | None = None,
     low_load: bool = True,
+    heavy_model: bool = False,
 ) -> None:
     """Build TRT engine in an isolated subprocess.
 
@@ -929,7 +965,12 @@ def _build_trt_engine_subprocess(
         "tile_size": tile_size,
         "batch_size": batch_size,
         "low_load": low_load,
-        "build_modes": _trt_build_modes(low_load),
+        "build_modes": _trt_build_modes(
+            low_load,
+            heavy_model=heavy_model,
+            tile_size=tile_size,
+            batch_size=batch_size,
+        ),
     })
 
     proc = subprocess.Popen(

@@ -2,21 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 import sys
 import time
-import yaml
 from pathlib import Path
 
-from clearvid.app.bootstrap.paths import APP_ROOT, OUTPUTS_DIR
-from clearvid.app.bootstrap.weight_manager import (
-    download_weight,
-    missing_weights_for_export,
-)
-from clearvid.app.export_control import ExportControl
-
+import yaml
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -24,28 +16,33 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QSplitter,
-    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
+from clearvid.app.bootstrap.paths import APP_ROOT, OUTPUTS_DIR
+from clearvid.app.bootstrap.weight_manager import (
+    missing_weights_for_export,
+)
+from clearvid.app.export_control import ExportControl
 from clearvid.app.gui._helpers import coerce_enum
 from clearvid.app.gui.crash_logging import open_log_dir, setup_gui_crash_logging
 from clearvid.app.gui.estimation import format_duration
 from clearvid.app.gui.export_panel import ExportPanel
 from clearvid.app.gui.file_panel import FilePanel
-from clearvid.app.gui.history_dialog import HistoryRecord, append_history, HistoryDialog
+from clearvid.app.gui.history_dialog import HistoryDialog, HistoryRecord, append_history
 from clearvid.app.gui.naming import DEFAULT_TEMPLATE, render_output_name
 from clearvid.app.gui.preset_cards import BUILTIN_PRESETS
 from clearvid.app.gui.preview_panel import PreviewPanel
-from clearvid.app.gui.queue_worker import ExportJob, JobStatus, QueueWorker
+from clearvid.app.gui.queue_worker import ExportJob, QueueWorker
 from clearvid.app.gui.safety_checks import check_disk_space, check_overwrite
 from clearvid.app.gui.settings_dialog import SettingsDialog
 from clearvid.app.gui.theme import get_dark_theme
 from clearvid.app.gui.user_settings import UserSettings
-from clearvid.app.gui.workers import PreviewWorker, Worker
+from clearvid.app.gui.workers import PreviewWorker, WeightDownloadWorker, Worker
 from clearvid.app.io.probe import collect_environment_info, probe_video
 from clearvid.app.recommend import recommend
 from clearvid.app.schemas.models import TargetProfile
@@ -62,6 +59,7 @@ class MainWindow(QMainWindow):
         self._worker: Worker | None = None
         self._queue_worker: QueueWorker | None = None
         self._preview_worker: PreviewWorker | None = None
+        self._weight_worker: WeightDownloadWorker | None = None
         self._last_progress_message = ""
         self._environment = collect_environment_info()
         self._settings = UserSettings()
@@ -303,7 +301,8 @@ class MainWindow(QMainWindow):
             return
 
         # Cancel any in-flight preview to avoid dangling QThread crash.
-        self._cancel_preview_worker()
+        if not self._cancel_preview_worker():
+            return
 
         config = self._export_panel.build_preview_config(input_path)
 
@@ -313,25 +312,28 @@ class MainWindow(QMainWindow):
         self._preview_worker = PreviewWorker(config, timestamp)
         self._preview_worker.finished.connect(self._on_preview_finished)
         self._preview_worker.failed.connect(self._on_preview_failed)
+        self._preview_worker.cancelled.connect(self._on_preview_cancelled)
         self._preview_worker.start()
 
-    def _cancel_preview_worker(self) -> None:
+    def _cancel_preview_worker(self) -> bool:
         """Safely stop and dispose of any running PreviewWorker."""
         worker = self._preview_worker
         if worker is None:
-            return
+            return True
         try:
             worker.finished.disconnect()
             worker.failed.disconnect()
+            worker.cancelled.disconnect()
         except (RuntimeError, TypeError):
             pass
         if worker.isRunning():
-            worker.quit()
+            worker.cancel()
             worker.wait(3000)  # wait up to 3 s
             if worker.isRunning():
-                worker.terminate()
-                worker.wait(1000)
+                self._log_message("预览任务仍在停止中，请稍候再试")
+                return False
         self._preview_worker = None
+        return True
 
     def _on_preview_finished(self, original: object, enhanced: object) -> None:
         self._preview_panel.set_preview_loading(False)
@@ -341,6 +343,10 @@ class MainWindow(QMainWindow):
     def _on_preview_failed(self, message: str) -> None:
         self._preview_panel.set_preview_loading(False)
         self._log_message(f"预览失败: {message}")
+
+    def _on_preview_cancelled(self) -> None:
+        self._preview_panel.set_preview_loading(False)
+        self._log_message("预览已取消")
 
     # ==================================================================
     # Smart recommendation
@@ -395,17 +401,66 @@ class MainWindow(QMainWindow):
             return False
 
         self._log_message(f"开始下载 {len(missing)} 个模型权重...")
-        for spec in missing:
-            self._log_message(f"  下载: {spec.name} ({spec.size_mb} MB)...")
-            QApplication.processEvents()
-            ok = download_weight(spec)
-            if not ok:
-                QMessageBox.critical(self, "下载失败", f"未能下载 {spec.name}。\n请检查网络连接后重试。")
-                return False
-            self._log_message(f"  ✅ {spec.name} 下载完成")
+        dialog = QProgressDialog("正在准备模型权重...", "取消", 0, 100, self)
+        dialog.setWindowTitle("下载模型权重")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
 
-        self._log_message("所有权重文件准备就绪")
-        return True
+        result = {"ready": False, "cancelled": False, "error": ""}
+        self._weight_worker = WeightDownloadWorker(missing)
+
+        def _on_progress(percent: int, message: str) -> None:
+            dialog.setValue(max(0, min(100, percent)))
+            dialog.setLabelText(message)
+            self._log_message(message)
+
+        def _on_completed() -> None:
+            result["ready"] = True
+            dialog.setValue(100)
+            dialog.accept()
+
+        def _on_cancelled() -> None:
+            result["cancelled"] = True
+            dialog.reject()
+
+        def _on_failed(message: str) -> None:
+            result["error"] = message
+            dialog.reject()
+
+        self._weight_worker.progress.connect(_on_progress)
+        self._weight_worker.completed.connect(_on_completed)
+        self._weight_worker.cancelled.connect(_on_cancelled)
+        self._weight_worker.failed.connect(_on_failed)
+        dialog.canceled.connect(self._weight_worker.cancel)
+        self._weight_worker.start()
+        dialog.exec()
+
+        if self._weight_worker.isRunning():
+            self._weight_worker.cancel()
+            self._weight_worker.wait(3000)
+            if self._weight_worker.isRunning():
+                QMessageBox.warning(
+                    self,
+                    "下载仍在停止中",
+                    "模型权重下载任务尚未完全退出，请稍候后重试导出。",
+                )
+                return False
+        self._weight_worker = None
+
+        if result["ready"]:
+            self._log_message("所有权重文件准备就绪")
+            return True
+        if result["cancelled"]:
+            self._log_message("模型权重下载已取消")
+            return False
+        QMessageBox.critical(
+            self,
+            "下载失败",
+            f"{result['error'] or '模型权重下载失败'}。\n请检查网络连接后重试。",
+        )
+        return False
 
     def _run_job(self) -> None:
         input_path = self._file_panel.input_path
@@ -628,8 +683,8 @@ class MainWindow(QMainWindow):
         if not self._settings.notify_on_complete():
             return
         try:
-            from PySide6.QtWidgets import QSystemTrayIcon
             from PySide6.QtGui import QIcon
+            from PySide6.QtWidgets import QSystemTrayIcon
 
             if not hasattr(self, "_tray_icon"):
                 self._tray_icon = QSystemTrayIcon(self)
@@ -878,8 +933,11 @@ class MainWindow(QMainWindow):
                 self._log_message("任务取消中…")
                 self._cancel_request_logged = True
         elif self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.requestInterruption()
+            self._preview_worker.cancel()
             self._log_message("预览取消中…")
+        elif self._weight_worker and self._weight_worker.isRunning():
+            self._weight_worker.cancel()
+            self._log_message("模型权重下载取消中…")
 
     def _toggle_pause(self) -> None:
         """Toggle pause/resume for the current export."""
@@ -978,11 +1036,68 @@ class MainWindow(QMainWindow):
             self._export_panel.naming_edit.setText(saved_template)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
+        if self._is_trt_deploying():
+            QMessageBox.warning(
+                self,
+                "TensorRT 部署中",
+                "TensorRT 引擎仍在部署中，请等待部署完成后再关闭窗口。",
+            )
+            event.ignore()
+            return
+        if self._has_active_background_tasks():
+            reply = QMessageBox.question(
+                self,
+                "确认关闭",
+                "仍有导出、队列、预览或下载任务在运行。关闭前需要先取消这些任务，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._request_background_stop()
+            if not self._wait_for_background_stop():
+                QMessageBox.warning(
+                    self,
+                    "任务仍在停止中",
+                    "后台任务尚未完全退出，请稍候再关闭窗口。",
+                )
+                event.ignore()
+                return
         self._settings.save_window_geometry(self.saveGeometry())
         self._settings.save_window_state(self.saveState())
         self._settings.save_splitter_sizes(self._splitter.sizes())
         self._settings.set_naming_template(self._export_panel.naming_edit.text())
         super().closeEvent(event)
+
+    def _is_trt_deploying(self) -> bool:
+        return bool(getattr(self._export_panel, "_trt_deploying", False))
+
+    def _has_active_background_tasks(self) -> bool:
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (self._queue_worker, self._worker, self._preview_worker, self._weight_worker)
+        )
+
+    def _request_background_stop(self) -> None:
+        if self._queue_worker and self._queue_worker.isRunning():
+            self._queue_worker.cancel()
+        if self._worker and self._worker.isRunning():
+            if getattr(self, "_export_control", None) is not None:
+                self._export_control.cancel()
+            else:
+                self._worker.requestInterruption()
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._preview_worker.cancel()
+        if self._weight_worker and self._weight_worker.isRunning():
+            self._weight_worker.cancel()
+
+    def _wait_for_background_stop(self) -> bool:
+        ok = True
+        for worker in (self._queue_worker, self._worker, self._preview_worker, self._weight_worker):
+            if worker is not None and worker.isRunning():
+                ok = worker.wait(5000) and ok
+        return ok
 
 
 # ======================================================================

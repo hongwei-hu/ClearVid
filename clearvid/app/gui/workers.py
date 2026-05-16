@@ -9,12 +9,12 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from clearvid.app.bootstrap.paths import REALESRGAN_WEIGHTS_DIR, TRT_CACHE_DIR
+from clearvid.app.bootstrap.weight_manager import WeightSpec, download_weight
 from clearvid.app.export_control import ExportCancelled, ExportControl
 from clearvid.app.models.realesrgan_runner import (
     _MODEL_REGISTRY,
     _build_upsampler,
     ensure_realesrgan_weights,
-    resolve_upscale_model,
 )
 from clearvid.app.models.tensorrt_engine import (
     InferenceAccelerator,
@@ -23,7 +23,7 @@ from clearvid.app.models.tensorrt_engine import (
     trt_profile_fallbacks,
 )
 from clearvid.app.orchestrator import Orchestrator
-from clearvid.app.schemas.models import EnhancementConfig, QualityMode, UpscaleModel
+from clearvid.app.schemas.models import EnhancementConfig
 
 logger = logging.getLogger(__name__)
 
@@ -67,18 +67,80 @@ class PreviewWorker(QThread):
 
     finished = Signal(object, object)  # (original_bgr, enhanced_bgr)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, config: EnhancementConfig, timestamp_sec: float) -> None:
         super().__init__()
         self._config = config
         self._timestamp_sec = timestamp_sec
+        self._control = ExportControl()
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+        self._control.cancel()
 
     def run(self) -> None:
         try:
+            if self.isInterruptionRequested():
+                raise ExportCancelled()
             original, enhanced, _ = Orchestrator().preview_frame(
-                self._config, self._timestamp_sec
+                self._config, self._timestamp_sec, control=self._control,
             )
+            if self.isInterruptionRequested():
+                raise ExportCancelled()
             self.finished.emit(original, enhanced)
+        except ExportCancelled:
+            self.cancelled.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class WeightDownloadWorker(QThread):
+    """Background worker for downloading missing model weights."""
+
+    progress = Signal(int, str)
+    completed = Signal()
+    cancelled = Signal()
+    failed = Signal(str)
+
+    def __init__(self, specs: list[WeightSpec]) -> None:
+        super().__init__()
+        self._specs = specs
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+        self.requestInterruption()
+
+    def run(self) -> None:
+        total = max(1, len(self._specs))
+        try:
+            for index, spec in enumerate(self._specs):
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                base = int(index * 100 / total)
+                span = max(1, int(100 / total))
+                self.progress.emit(base, f"正在下载 {spec.name} ({spec.size_mb} MB)")
+
+                def _on_progress(pct: int, *, _base: int = base, _span: int = span, _name: str = spec.name) -> None:
+                    if self._cancel_requested:
+                        raise ExportCancelled("模型权重下载已取消")
+                    mapped = min(99, _base + int(_span * pct / 100))
+                    self.progress.emit(mapped, f"正在下载 {_name}: {pct}%")
+
+                ok = download_weight(spec, on_progress=_on_progress)
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                if not ok:
+                    self.failed.emit(f"未能下载 {spec.name}")
+                    return
+                self.progress.emit(min(99, base + span), f"{spec.name} 下载完成")
+            self.progress.emit(100, "所有模型权重准备就绪")
+            self.completed.emit()
+        except ExportCancelled:
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -290,7 +352,6 @@ class TrtWarmupWorker(QThread):
     def _should_skip_fallback_profile(self, profile_index: int, message: str) -> bool:
         return (
             self._allow_fallbacks
-            and profile_index > 1
             and self._is_recent_failed_status(message)
             and not self._is_retryable_failed_status(message)
         )
@@ -305,7 +366,7 @@ class TrtWarmupWorker(QThread):
         profile_index: int,
         profile_count: int,
     ) -> bool:
-        reason = f"跳过近期失败记录 ({message})"
+        reason = f"近期明确失败，直接降档 ({message})"
         logger.info(
             "Skipping recently failed TRT fallback profile: model=%s tile=%d batch=%d status=%s",
             model_key, tile_size, batch_size, message,

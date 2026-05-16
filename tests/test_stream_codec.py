@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
+
+import pytest
 
 from clearvid.app.models import stream_codec
 from clearvid.app.schemas.models import EnhancementConfig, VideoMetadata
@@ -84,3 +87,25 @@ def test_mux_preview_returns_false_on_ffmpeg_error(tmp_path: Path) -> None:
     )
 
     assert ok is False
+
+
+class _FakeProcess:
+    stdout = None
+    stdin = None
+
+    def __init__(self, return_code: int, stderr_text: str) -> None:
+        self._return_code = return_code
+        self.stderr = io.BytesIO(stderr_text.encode("utf-8"))
+
+    def wait(self) -> int:
+        return self._return_code
+
+
+def test_finalize_stream_processes_uses_drained_stderr_tail() -> None:
+    decoder = _FakeProcess(1, "decoder exploded\n")
+    encoder = _FakeProcess(0, "")
+    stream_codec._attach_stderr_drain(decoder)
+    stream_codec._attach_stderr_drain(encoder)
+
+    with pytest.raises(RuntimeError, match="decoder exploded"):
+        stream_codec.finalize_stream_processes(decoder, encoder)
